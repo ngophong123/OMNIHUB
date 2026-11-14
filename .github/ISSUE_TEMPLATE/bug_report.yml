@@ -1,0 +1,73 @@
+name: Bug Report
+description: Report a reproducible defect in OMNIHUB API, Web, KDS PWA, database invariants, or documentation.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting an issue. Please **never** include `.env` contents, passwords, bearer tokens, session cookies, or customer data in bug reports.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected Area
+      options:
+        - POS & Order Lifecycle
+        - Kitchen Display (KDS / Offline PWA)
+        - Inventory & Recipes
+        - Payments, Splits, Refunds & Cash Shifts
+        - QR Table Ordering & Guest Tracking
+        - Realtime (Worker / Redis / Socket.IO)
+        - Admin, Invitations & Device Management
+        - Deployment / Backup / DR Scripts
+        - Documentation / CI
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: Bug Description
+      description: Clear summary of what happened and why it violates expected domain or UI behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      placeholder: |
+        1. Seed local database and start API, worker, and web...
+        2. Send POST /orders or click...
+        3. Observe status/output...
+    validations:
+      required: true
+  - type: textarea
+    id: expected_actual
+    attributes:
+      label: Expected vs Actual Behavior
+      description: Compare against documented lifecycle or authorization rules when applicable.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: |
+        - OS:
+        - Node / pnpm version:
+        - PostgreSQL / Redis setup (Docker Compose / embedded / CI):
+        - Commit SHA / Branch:
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted Logs or Error Codes
+      description: Paste relevant HTTP status, `code`, `correlationId`, or test failure output. Redact any credentials or capability tokens.
+      render: shell
+  - type: checkboxes
+    id: security_ack
+    attributes:
+      label: Safety Confirmation
+      options:
+        - label: I confirm this report contains no secrets, real passwords, bearer tokens, or private infrastructure details.
+          required: true
