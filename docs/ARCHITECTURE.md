@@ -1,0 +1,15 @@
+# Architecture
+
+pnpm workspace: apps/web (Next.js App Router), apps/api (NestJS REST + Socket.io), packages/contracts (Zod request/event contracts), prisma (schema/migrations/fixtures). The backend is a modular monolith. A separate worker entrypoint uses the same database and domain code.
+
+PostgreSQL is authoritative. Serializable Prisma transactions with bounded P2034 retry and deterministic ingredient ordering protect inventory and multi-ingredient atomicity. No network calls occur inside business transactions. Constraints defend against invalid writes. Retry exhaustion returns 409; clients can retry the same command key.
+
+Transactional outbox rows commit with mutations. Worker polls undelivered events and publishes to Redis with at-least-once semantics; API subscriber broadcasts only to authenticated tenant/store rooms. A crash after publish and before marking delivered can duplicate events. Realtime events invalidate caches; REST always re-fetches authoritative state on reconnect and periodically. Redis Pub/Sub is not an acknowledgement that a browser saw an event. Redis failure leaves events undelivered; API business writes remain available. Failed broadcasts never undo committed orders. Outbox delivery age needs monitoring before pilot.
+
+Auth uses Node scrypt with a random salt and bounded fixed parameters; opaque 256-bit session tokens are hashed in PostgreSQL, eight-hour expiry, HttpOnly SameSite=Strict cookie and Secure outside local development. Every request checks active user and current membership. Mutating browser requests require exact configured Origin; no wildcard credentialed CORS. Login is rate-limited. No long-lived browser token storage. Logout revokes server-side session. WebSocket connection and subscriptions validate session and Origin; periodic expiry/membership checks disconnect revoked users.
+
+Technology choice: Prisma 6.19 provides familiar schema-based generation and PostgreSQL interactive serializable transactions on Node 22. Upgrade to newer major versions is deferred until adapter/migration changes are evaluated; this is an explicit substitution from newest-major selection. Next/Nest versions are registry-resolved and locked. No Turborepo until orchestration warrants it. Redis direct outbox publisher is sufficient for this slice; BullMQ for scheduled integrations/notifications is deferred rather than an unused dependency.
+
+Local Compose exposes PostgreSQL and Redis on loopback only. Production TLS, backups, secret provisioning, metrics, migration rollout and resource limits are later readiness requirements. No production availability, security certification or recovery claim is made.
+
+Primary references: https://www.prisma.io/docs/orm/v6/prisma-client/queries/transactions and https://nextjs.org/docs/app/getting-started/installation . Package lock records exact installed versions; Node 22.14 meets Next 16 minimum Node 20.9.

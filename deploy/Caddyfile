@@ -1,0 +1,25 @@
+{
+  admin off
+  auto_https disable_redirects
+}
+https://localhost:8443 {
+  tls internal
+  header Strict-Transport-Security "max-age=31536000"
+  reverse_proxy web:3000 {
+    header_up X-Forwarded-For {remote_host}
+    header_up X-Forwarded-Proto https
+  }
+}
+https://localhost:8444 {
+  tls internal
+  header Strict-Transport-Security "max-age=31536000"
+  reverse_proxy api:4000 {
+    header_up X-Forwarded-For {remote_host}
+    header_up X-Forwarded-Proto https
+  }
+}
+http://localhost:8080 {
+  redir https://localhost:8443{uri} 308
+}
+# Access logs deliberately disabled: QR/invitation capability paths and query
+# values must not enter proxy logs. The API emits redacted structured access logs.

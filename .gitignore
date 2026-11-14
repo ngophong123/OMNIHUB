@@ -1,0 +1,17 @@
+node_modules/
+.next/
+dist/
+coverage/
+test-results/
+playwright-report/
+.env
+.env.*
+!.env.example
+*.tsbuildinfo
+.local/
+pnpm-debug.log
+.tmp/
+pnpm-debug.log*
+.eslintcache
+.DS_Store
+Thumbs.db

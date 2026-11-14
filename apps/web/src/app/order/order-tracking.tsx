@@ -1,0 +1,19 @@
+'use client';
+import { useCallback, useEffect, useState } from 'react';
+import { io } from 'socket.io-client';
+
+const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000';
+type Tracking = { id: string; status: string; restaurant: string; table: string | null; createdAt: string; items: { name: string; status: string }[] };
+const statusText = { vi: { ACCEPTED: 'Đã nhận đơn', PREPARING: 'Đang chuẩn bị', READY: 'Món đã sẵn sàng', SERVED: 'Đã phục vụ', CANCELLED: 'Đơn đã hủy', PENDING: 'Đang chờ bếp', HANDED_OFF: 'Đã giao' }, en: { ACCEPTED: 'Order accepted', PREPARING: 'Preparing', READY: 'Ready to serve', SERVED: 'Served', CANCELLED: 'Order cancelled', PENDING: 'Waiting for kitchen', HANDED_OFF: 'Served' } } as const;
+const steps = ['ACCEPTED', 'PREPARING', 'READY', 'SERVED'];
+
+export default function OrderTracking({ token }: { token: string }) {
+  const [locale, setLocale] = useState<'vi'|'en'>('vi'); const [order, setOrder] = useState<Tracking | null>(null); const [error, setError] = useState(''); const [connected, setConnected] = useState(false);
+  const load = useCallback(async () => { try { const res = await fetch(`${API}/public/order-status/${token}`, { cache: 'no-store' }); if (!res.ok) throw new Error('TRACKING_NOT_FOUND'); setOrder(await res.json()); setError(''); } catch { setError(locale === 'vi' ? 'Không tìm thấy thông tin đơn hàng.' : 'Order tracking could not be found.'); } }, [token, locale]);
+  useEffect(() => { const saved = localStorage.getItem('omnihub.locale'); if (saved === 'en') setLocale('en'); }, []);
+  useEffect(() => { void load(); const socket = io(API, { auth: { trackingToken: token }, reconnection: true, transports: ['websocket', 'polling'] }); socket.on('connect', () => setConnected(true)); socket.on('disconnect', () => setConnected(false)); socket.on('customer.order.updated', () => { void load(); }); const timer = setInterval(() => void load(), 12_000); return () => { clearInterval(timer); socket.disconnect(); }; }, [load, token]);
+  const t = locale === 'vi' ? statusText.vi : statusText.en;
+  if (!order) return <main className="customerTrack"><a className="trackBrand" href="/">OMNIHUB</a><p role={error ? 'alert' : 'status'}>{error || (locale === 'vi' ? 'Đang tải trạng thái…' : 'Loading order status…')}</p></main>;
+  const progress = steps.indexOf(order.status);
+  return <main className="customerTrack"><a className="trackBrand" href="/">OMNIHUB</a><p className="customerKicker">{order.restaurant}{order.table ? ` · ${locale === 'vi' ? 'Bàn' : 'Table'} ${order.table}` : ''}</p><h1>{locale === 'vi' ? 'Theo dõi đơn hàng' : 'Track your order'}</h1><p className="trackOrderId">#{order.id.slice(0, 8).toUpperCase()}</p><section className={`trackStatus ${order.status.toLowerCase()}`}><span className="trackPulse"/><strong>{t[order.status as keyof typeof t] ?? order.status}</strong><small>{connected ? (locale === 'vi' ? 'Cập nhật trực tiếp' : 'Live updates') : (locale === 'vi' ? 'Đang tự làm mới trạng thái' : 'Status refreshes automatically')}</small></section>{order.status !== 'CANCELLED' && <div className="trackSteps">{steps.map((step, i) => <div key={step} className={i <= progress ? 'done' : ''}><span>{i < progress ? '✓' : i + 1}</span><small>{t[step as keyof typeof t]}</small></div>)}</div>}<section className="trackItems"><h2>{locale === 'vi' ? 'Món đã đặt' : 'Your items'}</h2>{order.items.map((item, i) => <div key={`${item.name}-${i}`}><strong>{item.name}</strong><small>{t[item.status as keyof typeof t] ?? item.status}</small></div>)}</section><p className="trackPrivacy">{locale === 'vi' ? 'Liên kết này chỉ hiển thị trạng thái của đơn hàng này.' : 'This private link only shows the status of this order.'}</p><button className="customerLangButton" onClick={() => { const next = locale === 'vi' ? 'en' : 'vi'; setLocale(next); localStorage.setItem('omnihub.locale', next); }}>{locale === 'vi' ? 'English' : 'Tiếng Việt'}</button></main>;
+}

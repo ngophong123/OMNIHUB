@@ -1,0 +1,45 @@
+{
+  "name": "omnihub",
+  "private": true,
+  "packageManager": "pnpm@12.4.1",
+  "engines": {
+    "node": ">=22.14.0"
+  },
+  "scripts": {
+    "dev": "concurrently -k -n api,web \"pnpm --filter @omnihub/api dev\" \"pnpm --filter @omnihub/web dev\"",
+    "build": "pnpm --filter @omnihub/contracts build && pnpm --filter @omnihub/api build && pnpm --filter @omnihub/web build",
+    "typecheck": "pnpm -r typecheck && tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run --exclude tests/integration/** --exclude tests/e2e/** --exclude tests/redis/**",
+    "test:integration": "vitest run tests/integration",
+    "test:redis": "vitest run tests/redis",
+    "test:e2e": "playwright test",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate deploy",
+    "db:seed": "tsx prisma/seed.ts",
+    "infra:up": "docker compose up -d --wait",
+    "infra:down": "docker compose down",
+    "db:local": "tsx scripts/local-postgres.ts",
+    "worker": "pnpm --filter @omnihub/api worker"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.56.0",
+    "@types/node": "^22.0.0",
+    "concurrently": "^9.2.0",
+    "embedded-postgres": "18.4.0-beta.17",
+    "eslint": "^10.13.0",
+    "prisma": "6.19.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "typescript-eslint": "^8.72.0",
+    "vitest": "^4.1.12"
+  },
+  "dependencies": {
+    "@prisma/client": "6.19.0",
+    "dotenv": "^17.2.0"
+  }
+}
