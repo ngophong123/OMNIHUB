@@ -4,17 +4,23 @@ import path from 'node:path';
 
 const API_PORT = process.env.PORT ?? '4000';
 const READY_URL = process.env.API_READY_URL ?? `http://127.0.0.1:${API_PORT}/ready`;
-const WEB_BASE = process.env.E2E_WEB_ORIGIN ?? 'http://localhost:3000';
+const WEB_PORT = process.env.WEB_PORT ?? '3000';
+const WEB_BASE = process.env.E2E_WEB_ORIGIN ?? `http://localhost:${WEB_PORT}`;
 const pnpmCmd = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm';
 const require = createRequire(import.meta.url);
 const nextBin = require.resolve('next/dist/bin/next', { paths: [path.resolve('apps/web')] });
 
-type ManagedService = { name: string; child: ChildProcess; exitInfo?: string };
+type ManagedService = { name: string; child: ChildProcess; exitInfo?: string; recentErr: string[] };
 
-function prefixLines(name: string, chunk: Buffer, stream: NodeJS.WriteStream) {
+function prefixLines(service: ManagedService, chunk: Buffer, stream: NodeJS.WriteStream, isErr: boolean) {
   const text = chunk.toString('utf8');
   for (const line of text.split(/\r?\n/)) {
-    if (line.length > 0) stream.write(`[${name}] ${line}\n`);
+    if (line.length === 0) continue;
+    stream.write(`[${service.name}] ${line}\n`);
+    if (isErr) {
+      service.recentErr.push(line);
+      if (service.recentErr.length > 5) service.recentErr.shift();
+    }
   }
 }
 
@@ -25,9 +31,9 @@ function startService(name: string, command: string, args: string[], cwd?: strin
     env: process.env,
     detached: process.platform !== 'win32',
   });
-  const service: ManagedService = { name, child };
-  child.stdout?.on('data', chunk => prefixLines(name, chunk, process.stdout));
-  child.stderr?.on('data', chunk => prefixLines(name, chunk, process.stderr));
+  const service: ManagedService = { name, child, recentErr: [] };
+  child.stdout?.on('data', chunk => prefixLines(service, chunk, process.stdout, false));
+  child.stderr?.on('data', chunk => prefixLines(service, chunk, process.stderr, true));
   child.on('exit', (code, signal) => {
     service.exitInfo = `${name} exited unexpectedly (code=${code ?? 'null'}, signal=${signal ?? 'null'})`;
   });
@@ -36,19 +42,23 @@ function startService(name: string, command: string, args: string[], cwd?: strin
 
 async function waitForHttpReady(url: string, services: ManagedService[], timeoutMs = 60_000) {
   const deadline = Date.now() + timeoutMs;
+  let lastStatus: number | undefined;
+  let lastError: string | undefined;
   while (Date.now() < deadline) {
     for (const service of services) {
-      if (service.exitInfo) throw new Error(service.exitInfo);
+      if (service.exitInfo) throw new Error(`${service.exitInfo} stderr=[${service.recentErr.join(' | ')}]`);
     }
     try {
       const response = await fetch(url, { signal: AbortSignal.timeout(2000) });
+      lastStatus = response.status;
       if (response.status === 200) return;
-    } catch {
-      // Service still booting; retry until deadline.
+    } catch (error) {
+      lastError = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
     }
     await new Promise(resolve => setTimeout(resolve, 500));
   }
-  throw new Error(`Timed out waiting for readiness check at ${url}`);
+  const errTail = services.map(s => (s.recentErr.length ? `${s.name}:[${s.recentErr.join(' | ')}]` : '')).filter(Boolean).join('; ');
+  throw new Error(`Timed out waiting for readiness check at ${url} (lastStatus=${lastStatus ?? 'none'}, lastError=${lastError ?? 'none'}${errTail ? `, stderr=${errTail}` : ''})`);
 }
 
 function signalProcessTree(child: ChildProcess, signal: NodeJS.Signals) {
@@ -117,7 +127,7 @@ async function main() {
     console.log('[e2e-ci] Starting api, worker, and web services...');
     services.push(startService('api', process.execPath, ['apps/api/dist/main.js']));
     services.push(startService('worker', process.execPath, ['apps/api/dist/worker.js']));
-    services.push(startService('web', process.execPath, [nextBin, 'start', '--hostname', '0.0.0.0'], path.resolve('apps/web')));
+    services.push(startService('web', process.execPath, [nextBin, 'start', '--port', WEB_PORT], path.resolve('apps/web')));
 
     await waitForHttpReady(READY_URL, services);
     await waitForHttpReady(WEB_BASE, services);
@@ -133,6 +143,10 @@ async function main() {
 }
 
 void main().catch(error => {
-  console.error(error instanceof Error ? error.message : String(error));
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(message);
+  if (process.env.GITHUB_ACTIONS === 'true') {
+    console.log(`::error::${message.replace(/\r?\n/g, ' ')}`);
+  }
   process.exitCode = 1;
 });
