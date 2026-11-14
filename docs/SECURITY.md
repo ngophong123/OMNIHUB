@@ -10,6 +10,14 @@
 - Public/auth rate limits use Redis atomic Lua counters shared across replicas and fail closed on Redis loss. Raw client addresses and request bodies are not logged. Token-bearing QR, order-status and invitation paths are redacted in structured access logs.
 - Payment/stock/order operations use integer VND and transactional conflict controls; historical order prices and recipe snapshots are retained.
 
+## Automated CI/CD, Supply-Chain & Hygiene Controls (Milestone 0.2)
+
+- **Workflow Least Privilege:** Both `.github/workflows/ci.yml` and `.github/workflows/security.yml` declare `permissions: contents: read` at workflow level, granting write/read scopes only to the specific jobs that require them (`security-events: write` and `actions: read` for `codeql`; `pull-requests: read` for `dependency-review`).
+- **Blocking Dependency Audit:** `pnpm audit --prod --audit-level high` gates every push, pull request, and weekly schedule (`cron: '0 3 * * 1'`), backed by explicit `pnpm-workspace.yaml` transitive overrides and `zod ^4.6.7`.
+- **Static CodeQL Analysis:** GitHub CodeQL (`github/codeql-action@v4`, `javascript-typescript`, `security-extended` query suite) scans backend, shared contract, script, and frontend TypeScript/JavaScript sources.
+- **Pull Request Dependency & License Review:** `actions/dependency-review-action@v4` checks dependency diffs on `pull_request` events (`fail-on-severity: high`, denying `GPL-2.0`, `GPL-3.0`, and `AGPL-3.0` licenses).
+- **Repository Hygiene & Shell Validation:** `pnpm security:hygiene` (`scripts/check-security-hygiene.ts`) scans all git-tracked files to block committed `.env*` secrets (except `.env.example`), PEM private key headers, certificate/key bundles, runtime/artifact directories (`.local/`, `.tmp/`, `coverage/`, `playwright-report/`, `test-results/`), high-confidence token prefixes, and non-local embedded DB/Redis credential URIs; `sh -n` validates syntax across all tracked POSIX `.sh` scripts. CI failure logs and Playwright annotation summaries explicitly sanitize line output and retain diagnostic artifacts only on failure.
+
 ## Deployment responsibilities
 
 Use TLS, least-privilege PostgreSQL credentials, Redis ACLs/private networking, secret-manager injection, exact proxy CIDRs, backups, monitoring, patching and restricted operator access as described in [DEPLOYMENT.md](DEPLOYMENT.md). No production deployment or live payment-provider integration is included.

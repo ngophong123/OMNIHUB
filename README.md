@@ -1,6 +1,7 @@
 # OMNIHUB
 
 [![checks](https://github.com/ngophong123/OMNIHUB/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ngophong123/OMNIHUB/actions/workflows/ci.yml)
+[![security](https://github.com/ngophong123/OMNIHUB/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/ngophong123/OMNIHUB/actions/workflows/security.yml)
 
 **Enterprise Restaurant Operations Management Platform** built as a strict TypeScript monorepo with Next.js App Router, NestJS, PostgreSQL/Prisma, and Redis.
 
@@ -115,12 +116,12 @@ Detailed architectural references:
 | Layer | Technology & Version | Source |
 |---|---|---|
 | **Runtime & Package Manager** | Node.js `>=22.14.0`, pnpm `12.4.1` (workspace monorepo) | [package.json](package.json), [pnpm-workspace.yaml](pnpm-workspace.yaml) |
-| **Language & Shared Contracts** | TypeScript `^5.9.0` (`strict`, `noUncheckedIndexedAccess`), Zod `^3.25.0` | [tsconfig.base.json](tsconfig.base.json), [packages/contracts/package.json](packages/contracts/package.json) |
+| **Language & Shared Contracts** | TypeScript `^5.9.0` (`strict`, `noUncheckedIndexedAccess`), Zod `^4.6.7` | [tsconfig.base.json](tsconfig.base.json), [packages/contracts/package.json](packages/contracts/package.json) |
 | **Frontend** | Next.js `16.4.2` (App Router, webpack build), React `^19.2.0`, `socket.io-client ^4.8.1` | [apps/web/package.json](apps/web/package.json) |
 | **Backend & Worker** | NestJS `12.2.0`, Express `^5.1.0`, Helmet `^8.1.0`, `express-rate-limit ^8.1.0`, `socket.io ^4.8.1`, `qrcode 1.5.4` | [apps/api/package.json](apps/api/package.json) |
 | **Database & ORM** | PostgreSQL `17-alpine` (Compose/CI) / optional `18`, Prisma `6.19.0`, `embedded-postgres 18.4.0-beta.17` | [docker-compose.yml](docker-compose.yml), [prisma/schema.prisma](prisma/schema.prisma) |
 | **Cache & Realtime Broker** | Redis `7-alpine`, `ioredis ^5.8.0` | [docker-compose.yml](docker-compose.yml), [apps/api/package.json](apps/api/package.json) |
-| **Testing & Quality** | Vitest `^4.1.12`, Playwright `^1.56.0`, ESLint `^10.13.0` (`typescript-eslint ^8.72.0`) | [package.json](package.json), [eslint.config.mjs](eslint.config.mjs), [playwright.config.ts](playwright.config.ts) |
+| **Testing & Quality** | Vitest `^4.1.12`, `@vitest/coverage-v8 4.1.12`, Playwright `^1.56.0`, ESLint `^10.13.0`, CodeQL `v4` | [package.json](package.json), [vitest.config.ts](vitest.config.ts), [playwright.config.ts](playwright.config.ts) |
 | **Staging & Backup Tooling** | Docker Compose, Caddy (local internal CA), Restic (`postgres:18-alpine`) | [deploy/compose.staging.yml](deploy/compose.staging.yml), [deploy/backup/Dockerfile](deploy/backup/Dockerfile) |
 
 ---
@@ -131,7 +132,7 @@ Detailed architectural references:
 OMNIHUB/
 ├── .github/
 │   ├── ISSUE_TEMPLATE/          # Bug report and feature request YAML forms
-│   ├── workflows/ci.yml         # Hosted CI (Postgres 17 + Redis 7 services)
+│   ├── workflows/               # Hosted CI (`ci.yml`) & security (`security.yml`) pipelines
 │   └── pull_request_template.md
 ├── apps/
 │   ├── api/                     # NestJS REST API, Socket.IO gateway, outbox worker
@@ -147,12 +148,12 @@ OMNIHUB/
 │   ├── Caddyfile                # Local staging TLS proxy config
 │   ├── compose.staging.yml      # Hardened local staging Compose definition
 │   └── Dockerfile               # Multi-stage API & web container builds
-├── scripts/                     # Local embedded Postgres, staging secret/TLS/backup drills
+├── scripts/                     # Local embedded Postgres, CI E2E runner, security hygiene & staging drills
 ├── tests/
-│   ├── unit/                    # Pure domain, rate-limit & deployment-security tests (27)
+│   ├── unit/                    # Pure domain, auth/commands, rate-limit & deployment-security tests (34)
 │   ├── integration/             # Real PostgreSQL transactional & isolation tests (27)
 │   ├── redis/                   # Redis Lua & multi-process API rate-limit tests (2)
-│   ├── e2e/                     # Playwright browser workflow tests (9)
+│   ├── e2e/                     # Playwright browser workflow tests (10)
 │   └── backup/                  # Disposable fake/stale archive test fixtures
 ├── docs/                        # 22 architecture, lifecycle, security, testing & status docs
 ├── CONTRIBUTING.md
@@ -237,27 +238,39 @@ OMNIHUB separates fast deterministic checks from database, Redis, browser, and D
 | Suite | Command | Cases | Dependencies & Scope |
 |---|---|---|---|
 | **Static Checks** | `pnpm typecheck`, `pnpm lint`, `pnpm build` | — | Strict TypeScript across packages, ESLint (no explicit `any`), production compilation. |
-| **Unit Tests** | `pnpm test` | 27 tests (3 files) | Pure domain math/permissions, deployment security validator, mock rate-limit atomicity ([tests/unit/](tests/unit/domain.test.ts)). |
+| **Unit Tests & Coverage** | `pnpm test`, `pnpm test:coverage` | 34 tests (4 files) | Pure domain math/permissions, auth/command-receipt boundary logic, deployment security validator, mock rate-limit atomicity ([tests/unit/](tests/unit/domain.test.ts)), enforcing per-module V8 floors in [vitest.config.ts](vitest.config.ts). |
 | **PostgreSQL Integration** | `pnpm test:integration` | 27 tests (1 file) | Real migrated Postgres database: stock races, rollback, idempotency, splits, refunds, cash shifts, tenant isolation ([tests/integration/operations.test.ts](tests/integration/operations.test.ts)). |
 | **Redis Integration** | `pnpm test:redis` | 2 tests (2 files) | Real Redis (`REDIS_URL`) + two spawned built API processes verifying atomic Lua limits across replicas ([tests/redis/](tests/redis/api-replicas.test.ts)). |
-| **Playwright E2E** | `pnpm test:e2e` | 9 workflows (1 file) | Built `web` + `api` + `worker` + Postgres + Redis + Chromium: POS, cash shifts, two-browser Socket.IO reconnect, offline KDS conflict, QR mobile order, device revocation ([tests/e2e/workflow.spec.ts](tests/e2e/workflow.spec.ts)). |
+| **Playwright E2E** | `pnpm test:e2e`, `pnpm test:e2e:ci` | 10 workflows (1 file) | Built `web` + `api` + `worker` + Postgres + Redis + Chromium: POS, cash shifts, two-browser Socket.IO reconnect, offline KDS conflict, QR mobile order, device revocation, auth/store-boundary & inventory ledger ([tests/e2e/workflow.spec.ts](tests/e2e/workflow.spec.ts)). |
+| **Security & Hygiene Scans** | `pnpm audit --prod --audit-level high`, `pnpm security:hygiene`, `sh -n` | Automated | Production dependency audit, tracked-file secret/path hygiene ([scripts/check-security-hygiene.ts](scripts/check-security-hygiene.ts)), POSIX shell syntax, CodeQL `v4` (`security-extended`), and PR `dependency-review` ([.github/workflows/security.yml](.github/workflows/security.yml)). |
 | **Backup & DR Probes** | `scripts/verify-*.ts`, `deploy/backup/test-*.sh` | Manual / Staging | Custom `pg_dump` + SHA-256 + Restic decryption, schema/migration/integrity checks on isolated restore DBs ([docs/BACKUP_AND_RECOVERY.md](docs/BACKUP_AND_RECOVERY.md)). |
 
 > [!NOTE]
-> **CI Coverage Disclosure:** The current GitHub Actions workflow ([.github/workflows/ci.yml](.github/workflows/ci.yml)) executes `db:generate`, `db:migrate`, `contracts build`, `typecheck`, `lint`, unit `test`, PostgreSQL `test:integration`, and `build` against Postgres 17. It **does not yet execute `pnpm test:redis` (Redis integration tests), `pnpm test:e2e` (Playwright browser tests), or backup/security scans**.
+> **Hosted CI Coverage & Remaining Scope:** On branch pushes and pull requests, [.github/workflows/ci.yml](.github/workflows/ci.yml) (`checks`: `verify` + `e2e`) and [.github/workflows/security.yml](.github/workflows/security.yml) (`security`: `audit` + `codeql`, plus PR-only `dependency-review`) provision PostgreSQL 17 and Redis 7 containers, enforce global and per-file V8 coverage floors (`pnpm test:coverage:ci`), run `pnpm test:redis`, execute all `10` Playwright workflows (`pnpm test:e2e:ci`), and enforce security/hygiene gates. Containerized backup/DR restore drills, off-machine backup verification, external penetration testing, and physical hardware/staff UAT remain **outside hosted CI**.
 
 ---
 
 ## 11. Current Implementation Status
 
-### Latest Verified Automated Execution (`8913a09`, 2026-11-14)
+### Latest Verified Automated Execution (`f9c8741` on `engineering/m02-quality-foundation`, 2026-11-14)
 
-- **GitHub Actions CI (`checks` Run `#43535373056` on `main`):** **PASSED** (`pnpm install --frozen-lockfile`, `db:generate`, `db:migrate`, `contracts build`, `typecheck`, `lint`, unit `test`, `test:integration`, `build`).
-- **Local Baseline Verification (`8913a09`):** `pnpm.cmd typecheck`, `pnpm.cmd lint`, `pnpm.cmd test` (`27/27` unit tests), `@omnihub/contracts build`, and `@omnihub/api build` passed. Local `@omnihub/web build` exited `1` due to a Windows file ACL `EPERM` when unlinking a pre-existing untracked `apps/web/.next/server/app/index.html` cache artifact (Linux CI `pnpm build` passed).
+- **GitHub Actions CI (`checks` Run `#43585662222`):** **PASSED**
+  - `verify`: `pnpm install --frozen-lockfile`, `db:generate`, `db:migrate`, `contracts build`, `typecheck`, `lint`, `build`, `test:coverage:ci` (`34` unit + `27` PostgreSQL integration tests; V8 backend totals `Stmts 49.33% (897/1818)`, `Branches 51.66% (653/1264)`, `Funcs 49.51% (206/416)`, `Lines 58.3% (695/1192)` meeting both per-file and `ci`-scoped global thresholds), `pnpm test:redis` (`2/2`), and `backend-coverage` artifact upload (`118,603` bytes).
+  - `e2e`: `pnpm test:e2e:ci` against real built `api`, `worker`, `web`, Postgres 17, Redis 7, and headless Chromium — all `10/10` Playwright workflows **PASSED**.
+- **GitHub Actions Security (`security` Run `#43585662264`):** **PASSED** — `audit` (`pnpm audit --prod --audit-level high`: `No known vulnerabilities found`, `pnpm security:hygiene`, `sh -n` on tracked `.sh` scripts) and `codeql` (`github/codeql-action@v4`, `security-extended`); `dependency-review` is scoped to `pull_request` events (`skipped` on branch push).
+- **Local Host Verification (`engineering/m02-quality-foundation`):** `pnpm.cmd typecheck`, `pnpm.cmd lint`, `pnpm.cmd test:coverage` (`34/34` unit tests), `pnpm.cmd audit --prod --audit-level high`, `pnpm.cmd security:hygiene` (`142` tracked files, `0` violations), `@omnihub/contracts build`, and `@omnihub/api build` **PASSED**. Note: local Windows `@omnihub/web build` previously hit file ACL `EPERM` on untracked `.next` cache files while Linux CI `pnpm build` passes cleanly; full Docker/Playwright runs on `main` baseline `8aee7c0` + `8913a09` (`checks` Run `#43535373056`) remain preserved in history.
+
+| Area | Classification | Current Evidence / Gap |
+|---|---|---|
+| CI/CD (`verify` + `e2e` + `security`) | **VERIFIED** | Green on `engineering/m02-quality-foundation` (`f9c8741`); pending PR review/merge to `main`. |
+| PR Dependency Review Gate | **PARTIALLY VERIFIED** | Configured on `pull_request` in [.github/workflows/security.yml](.github/workflows/security.yml); `skipped` on branch push until PR execution. |
+| Off-Machine DR & 900s RPO Gate | **BLOCKED / FAILED** | Latest host outage drills measured `35,797 s` / `212,374 s` RPO age; off-machine Restic storage and alert endpoints remain unprovisioned. |
+| Physical Device & Operator UAT | **UNVERIFIED** | Hardware, LAN/TLS cutover, and restaurant staff UAT ([docs/PILOT_UAT.md](docs/PILOT_UAT.md)) have not been executed. |
+| Live Card Acquiring & WAL PITR | **NOT IMPLEMENTED** | `LabeledCardSandboxAdapter` is sandbox-only (`SANDBOX_ONLY`); backup strategy uses 300s logical `pg_dump` without PostgreSQL WAL archiving. |
 
 ### Historical Local & Staging Verification (`2026-10-23` to `2026-10-26`)
 
-Not rerun in the current baseline/documentation milestone; retained as historical evidence in [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md) and [docs/TESTING.md](docs/TESTING.md):
+Retained as historical pre-release evidence in [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md) and [docs/TESTING.md](docs/TESTING.md):
 - Isolated local HTTPS Docker staging: `9/9` Playwright E2E workflows passed twice on `2026-10-23` and `2026-10-24` after POS fix; `2/2` Redis tests passed in staging network.
 - Isolated backup & DR tooling drills (`2026-10-24` to `2026-10-26`): verified encrypted Restic snapshots restored into retained isolated databases (`37` PostgreSQL tables, `13` migrations, zero integrity violations) and passed disposable container DR monitor/offsite negative probes.
 
@@ -274,9 +287,9 @@ Public restaurant deployment remains **NO-GO** per [docs/PILOT_READINESS_CHECKLI
 Planned evolution tracked in [docs/PRODUCT_REQUIREMENTS.md](docs/PRODUCT_REQUIREMENTS.md) and [docs/PILOT_READINESS_CHECKLIST.md](docs/PILOT_READINESS_CHECKLIST.md):
 
 1. **Multi-Branch & Multi-Warehouse Operations (Next Engineering Sprint):** Runtime store/branch switching within a tenant, multi-warehouse inventory balances, inter-warehouse stock transfers, and cross-branch reporting.
-2. **CI Pipeline Expansion:** Wire `pnpm test:redis`, `pnpm test:e2e`, dependency/secret scanning, and backup shell fixture validation into `.github/workflows/ci.yml`.
+2. **Backup Probe CI & Observability:** Add containerized backup/DR smoke fixtures to CI (core Redis E2E, CodeQL, dependency audit, and V8 coverage gates completed in Milestone 0.2 on `engineering/m02-quality-foundation`) plus Prometheus/OpenTelemetry metrics and alerting.
 3. **Payment Provider & Webhook Integration:** Replace `LabeledCardSandboxAdapter` with an authorized payment provider adapter, signed webhook verification, replay protection, and automated non-cash refund reconciliation.
-4. **Commercial Operations & Integrations:** Tax/discount/service-fee rules with order-level allocation snapshots, per-station kitchen ACLs, Telegram/external delivery channel connectors (e.g., GrabFood, ShopeeFood), and metrics/alerting.
+4. **Commercial Operations & Integrations:** Tax/discount/service-fee rules with order-level allocation snapshots, per-station kitchen ACLs, Telegram/external delivery channel connectors (e.g., GrabFood, ShopeeFood), and reporting exports.
 5. **Pilot Operational Readiness:** Off-machine Restic repository + independent external DR monitor, sustained 15-minute RPO proof, target LAN/TLS/printer setup, and physical UAT sign-off.
 
 ---
@@ -286,9 +299,10 @@ Planned evolution tracked in [docs/PRODUCT_REQUIREMENTS.md](docs/PRODUCT_REQUIRE
 Detailed controls and operator responsibilities are documented in [docs/SECURITY.md](docs/SECURITY.md) and [docs/QR_ORDERING_SECURITY.md](docs/QR_ORDERING_SECURITY.md):
 
 - **Authentication & Sessions:** Node `scrypt` per-user salted password hashing; 256-bit opaque session tokens hashed in PostgreSQL (8h expiry, `HttpOnly`, `SameSite=Strict`, `Secure` when `SESSION_SECURE=true`); active user/membership revalidated on requests and periodic WebSocket checks.
-- **Origin, Headers & Rate Limiting:** Exact `WEB_ORIGIN` validation on mutating requests (no wildcard credentialed CORS), Helmet headers, configurable `TRUSTED_PROXY_CIDRS`, and shared Redis Lua rate counters that fail closed (`503`) on Redis unavailability.
+- **Origin, Headers & Rate Limiting:** Exact `WEB_ORIGIN` enforcement on mutating requests (no wildcard credentialed CORS), Helmet headers, configurable `TRUSTED_PROXY_CIDRS`, and shared Redis Lua rate counters that fail closed (`503`) on Redis unavailability (`AUTH_LOGIN_RATE_LIMIT=10` preserved in runtime and CI E2E).
 - **Capability Redaction & Data Minimization:** QR, table session, tracking, and invitation tokens are stored as SHA-256 digests; structured API access logs redact capability path parameters and drop query strings; KDS IndexedDB never stores session cookies or financial records.
-- **Remaining Security Boundaries:** Unsalted SHA-256 client-IP rate-limit digests prevent cleartext IP keys in Redis without formal anonymization guarantees; webhook endpoints and live card acquiring remain unimplemented; npm advisory audits, host/network firewalls, and penetration testing are required before production exposure.
+- **Automated Supply-Chain & Static Analysis Gates:** [.github/workflows/security.yml](.github/workflows/security.yml) enforces `pnpm audit --prod --audit-level high`, tracked-file secret/path hygiene (`pnpm security:hygiene`), POSIX `.sh` syntax checks (`sh -n`), CodeQL `v4` (`security-extended`), PR `dependency-review`, and least-privilege `permissions`.
+- **Remaining Security Boundaries:** Unsalted SHA-256 client-IP rate-limit digests prevent cleartext IP keys in Redis without formal anonymization guarantees; webhook endpoints and live card acquiring remain unimplemented; host/network firewalls, container scanning, and external penetration testing are required before production exposure.
 
 ---
 

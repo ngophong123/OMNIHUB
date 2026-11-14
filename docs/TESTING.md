@@ -1,5 +1,19 @@
 # Testing strategy
 
+## Milestone 0.2 CI/CD, E2E, Coverage & Security Gate Verification — 2026-11-14
+
+Verified on branch `engineering/m02-quality-foundation` (`f9c8741`, **Pilot remains NO-GO**):
+
+| Check | Status | Current result |
+|---|---|---|
+| Hosted CI (`checks` Run `#43585662222`, job `verify`) | VERIFIED | Postgres 17 + Redis 7 services passed `pnpm install --frozen-lockfile`, `db:generate`, `db:migrate`, `@omnihub/contracts build`, `typecheck`, `lint`, `build`, `pnpm test:coverage:ci` (`34` unit + `27` PostgreSQL integration tests; V8 backend totals `Stmts 49.33% (897/1818)`, `Branches 51.66% (653/1264)`, `Funcs 49.51% (206/416)`, `Lines 58.3% (695/1192)` meeting both per-file and `ci`-scoped global thresholds), `pnpm test:redis` (`2/2`), and `backend-coverage` artifact upload (`118,603` bytes). |
+| Hosted CI (`checks` Run `#43585662222`, job `e2e`) | VERIFIED | `pnpm test:e2e:ci` (`scripts/run-e2e-ci.ts`) launched real built `api`, `worker`, Next.js `web`, Postgres 17, Redis 7, and Chromium; all `10/10` Playwright workflows passed without weakening `AUTH_LOGIN_RATE_LIMIT=10` (bounded client retry helper handles intentional 429 limits across sequential logins). |
+| Hosted Security (`security` Run `#43585662264`, jobs `audit`, `codeql`) | VERIFIED | `pnpm audit --prod --audit-level high` reported zero high/critical production advisories; `pnpm security:hygiene` scanned `142` tracked files with `0` violations; `sh -n` validated all tracked POSIX shell scripts; CodeQL (`github/codeql-action@v4`, `javascript-typescript`, `security-extended`) succeeded. |
+| PR dependency & license review (`security`, job `dependency-review`) | PARTIALLY VERIFIED | Configured in `.github/workflows/security.yml` (`actions/dependency-review-action@v4`, `fail-on-severity: high`, `GPL-2.0`/`GPL-3.0`/`AGPL-3.0` denied); `skipped` on branch push until executed on a `pull_request` event. |
+| Local Windows static & unit verification | PARTIALLY VERIFIED | `pnpm.cmd typecheck`, `pnpm.cmd lint`, `pnpm.cmd test:coverage` (`34/34` unit tests), `pnpm.cmd audit --prod --audit-level high`, `pnpm.cmd security:hygiene`, `@omnihub/contracts build`, and `@omnihub/api build` pass locally; local `@omnihub/web` production build remains blocked by a Windows ACL `EPERM` on `.next` cache files (`Linux CI build PASS`). |
+| Backup/DR container probes in hosted CI | NOT IMPLEMENTED | Containerized Restic/offsite DR drills (`deploy/backup/`) run in Docker/staging manually and are not wired into hosted GitHub Actions. |
+| Off-machine DR, 900s RPO & physical UAT | BLOCKED / UNVERIFIED | Prior host outage drills failed the 900s RPO gate (`212,374 s` on `2026-10-26`); independent storage, monitor host, alert recipient, and physical restaurant UAT remain unprovisioned/unverified. |
+
 ## DR continuation — 2026-10-26
 
 | Check | Status | Current result |
@@ -127,7 +141,7 @@ Required coverage is specified in lifecycle documents. Evidence and limits are r
 
 Local tests leave isolated fixture tenants and explicit demo transactions for auditability. Re-running browser tests adds sales/reservations to demo data. Reports assert coherent totals, not an assumed empty database. The append-only ledger intentionally disallows ad hoc cleanup. Use a separately named development database for a fresh environment rather than truncating existing data.
 
-CI workflow (`.github/workflows/ci.yml`, workflow `checks`, job `verify`) prepares PostgreSQL 17/Redis and runs generate/migrate/contracts-build/typecheck/lint/unit/PostgreSQL-integration/build. Hosted GitHub Actions `checks` execution was verified successful on baseline commit `8913a09` (Run `#43535373056` on `main`). However, Redis integration tests (`pnpm test:redis`) and Playwright browser E2E (`pnpm test:e2e`) are not yet included in hosted CI and remain unexecuted in CI. Local checks passed historically on both the PostgreSQL 18 optional developer binary and a separate PostgreSQL 17 Docker instance.
+CI workflow (`.github/workflows/ci.yml`, workflow `checks`) now executes two jobs against PostgreSQL 17 and Redis 7 containers: `verify` (generate, migrate, contracts build, typecheck, lint, full build, `pnpm test:coverage:ci` enforcing global and per-file V8 coverage floors across unit and PostgreSQL integration suites, `pnpm test:redis`, and `backend-coverage` artifact upload) and `e2e` (`db:seed`, build, Chromium install, and `pnpm test:e2e:ci` running all 10 Playwright workflows against live built `api`, `worker`, and `web`, uploading failure traces/screenshots only on failure). Security workflow (`.github/workflows/security.yml`, workflow `security`) executes `pnpm audit --prod --audit-level high`, `pnpm security:hygiene`, `sh -n`, CodeQL `v4` (`security-extended`), and PR-only `dependency-review`. Both `checks` (Run `#43585662222`) and `security` (Run `#43585662264`) passed on branch `engineering/m02-quality-foundation` (`f9c8741`), extending the earlier baseline CI verification on `main` (`8913a09`, Run `#43535373056`). Local checks passed historically on both the PostgreSQL 18 optional developer binary and a separate PostgreSQL 17 Docker instance.
 
 ## Latest QR milestone evidence (2026-10-22)
 
