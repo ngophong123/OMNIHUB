@@ -286,8 +286,13 @@ test('offline kitchen: cached ticket and durable ordered commands reconcile afte
   const offlineTicket = kitchen.getByRole('article').filter({ hasText: `#${order.id.slice(0, 8)}` });
   await offlineTicket.getByRole('button', { name: 'Bắt đầu làm', exact: true }).click();
   await expect(offlineTicket).toContainText('Đang chế biến'); await expect(offlineTicket).toContainText('Đã lưu trên thiết bị, chờ đồng bộ');
-  await offlineTicket.getByRole('button', { name: 'Đã xong', exact: true }).click(); await expect(offlineTicket).toContainText('Đã xong');
-  await kitchen.reload(); await expect(kitchen.getByRole('article').filter({ hasText: `#${order.id.slice(0, 8)}` })).toContainText('Đã xong');
+  await offlineTicket.getByRole('button', { name: 'Đã xong', exact: true }).click();
+  await expect(offlineTicket.getByRole('button', { name: 'Đã xong', exact: true })).toHaveCount(0);
+  await expect(offlineTicket).toContainText('· Đã xong');
+  await kitchen.reload();
+  const reloadedTicket = kitchen.getByRole('article').filter({ hasText: `#${order.id.slice(0, 8)}` });
+  await expect(reloadedTicket).toContainText('· Đã xong');
+  await expect(reloadedTicket.getByRole('button', { name: 'Đã xong', exact: true })).toHaveCount(0);
   let replayBody: unknown; kitchen.on('request', req => { if (req.url().endsWith('/kitchen/sync') && req.method() === 'POST') replayBody = req.postDataJSON(); });
   await kitchenContext.setOffline(false); await expect(kitchen.getByText('Bếp trực tuyến', { exact: true })).toBeVisible({ timeout: 15000 });
   await expect(kitchen.getByText('Đã đồng bộ', { exact: true })).toBeVisible({ timeout: 15000 });
@@ -313,7 +318,7 @@ test('offline kitchen: a competing server update blocks dependent local commands
   const accepted = await request.post(api('/orders'), { headers: { Origin: WEB_ORIGIN, 'Idempotency-Key': crypto.randomUUID() }, data: { lines: [{ productId: product.id, quantity: 1 }] } }); expect(accepted.ok()).toBe(true); const created = await accepted.json() as { id: string };
   await page.getByRole('button', { name: 'Đồng bộ lại', exact: true }).click(); const ticket = page.getByRole('article').filter({ hasText: `#${created.id.slice(0, 8)}` }); await expect(ticket).toBeVisible();
   const currentOrders = await (await request.get(api('/orders'))).json() as { id: string; version: number; items: { id: string }[] }[]; const order = currentOrders.find(row => row.id === created.id)!; const itemId = order.items[0]!.id;
-  await context.setOffline(true); await expect(page.getByText('Ngoại tuyến', { exact: true })).toBeVisible(); await ticket.getByRole('button', { name: 'Bắt đầu làm', exact: true }).click(); await ticket.getByRole('button', { name: 'Đã xong', exact: true }).click(); await expect(ticket).toContainText('Đã xong');
+  await context.setOffline(true); await expect(page.getByText('Ngoại tuyến', { exact: true })).toBeVisible(); await ticket.getByRole('button', { name: 'Bắt đầu làm', exact: true }).click(); await ticket.getByRole('button', { name: 'Đã xong', exact: true }).click(); await expect(ticket.getByRole('button', { name: 'Đã xong', exact: true })).toHaveCount(0); await expect(ticket).toContainText('· Đã xong');
   const remote = await request.post(api(`/items/${itemId}/commands`), { headers: { Origin: WEB_ORIGIN, 'Idempotency-Key': crypto.randomUUID() }, data: { action: 'START', expectedVersion: order.version } }); expect(remote.status()).toBe(201);
   await context.setOffline(false); await expect(page.getByRole('heading', { name: /Cần xem lại thao tác ngoại tuyến/ })).toBeVisible({ timeout: 15000 });
   await expect(page.getByText(/PREVIOUS_COMMAND_CONFLICT|STALE_OR_TERMINAL_ORDER/).first()).toBeVisible();
@@ -533,7 +538,7 @@ test('auth boundary and inventory: rejects wrong-store login and records stock a
   await page.getByLabel('Mật khẩu', { exact: true }).fill(process.env.DEMO_PASSWORD);
   await page.getByLabel('Mã cửa hàng', { exact: true }).fill(wrongStoreId);
   await submitLogin(page);
-  await expect(page.getByRole('alert')).toContainText('Thông tin đăng nhập hoặc cửa hàng không đúng.');
+  await expect(page.locator('p.error[role="alert"]')).toContainText('Thông tin đăng nhập hoặc cửa hàng không đúng.');
   expect((await page.request.get(api('/auth/me'))).status()).toBe(401);
 
   await page.getByLabel('Mã cửa hàng', { exact: true }).fill(storeId);

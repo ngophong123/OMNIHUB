@@ -76,6 +76,9 @@ jobs:
           if (process.env.GITHUB_STEP_SUMMARY) {
             fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${out}\n`);
           }
+          if (process.env.GITHUB_ACTIONS === 'true') {
+            console.log(`::notice title=Backend V8 Coverage::Stmts ${t.statements.pct}% (${t.statements.covered}/${t.statements.total}), Branches ${t.branches.pct}% (${t.branches.covered}/${t.branches.total}), Funcs ${t.functions.pct}% (${t.functions.covered}/${t.functions.total}), Lines ${t.lines.pct}% (${t.lines.covered}/${t.lines.total})`);
+          }
           console.log(out);
           EOF
       - name: Upload coverage artifacts
