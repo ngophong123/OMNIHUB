@@ -9,6 +9,9 @@ export default defineConfig({
       include: ['apps/api/src/**/*.ts', 'packages/contracts/src/**/*.ts'],
       exclude: ['**/*.d.ts'],
       thresholds: {
+        ...(process.env.OMNIHUB_COVERAGE_SCOPE === 'ci'
+          ? { lines: 55, statements: 45, branches: 48, functions: 45 }
+          : {}),
         'apps/api/src/auth.ts': { lines: 95, statements: 95, functions: 95, branches: 90 },
         'apps/api/src/card-provider.ts': { lines: 95, statements: 95, functions: 95, branches: 95 },
         'apps/api/src/catalog-domain.ts': { lines: 90, statements: 90, functions: 85, branches: 90 },

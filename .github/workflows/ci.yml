@@ -51,6 +51,8 @@ jobs:
       - run: pnpm lint
       - run: pnpm build
       - run: pnpm test:coverage:ci
+        env:
+          OMNIHUB_COVERAGE_SCOPE: ci
       - run: pnpm test:redis
       - name: Publish backend coverage summary
         if: always()
