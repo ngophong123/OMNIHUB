@@ -13,5 +13,7 @@ export default defineConfig({
     // Trust only this rehearsal certificate's public key, never all certificates.
     launchOptions: { args: process.env.E2E_TLS_SPKI ? [`--ignore-certificate-errors-spki-list=${process.env.E2E_TLS_SPKI}`] : [] },
   },
-  reporter: process.env.CI ? [['list'], ['html', { open: 'never' }]] : 'list',
+  reporter: process.env.CI
+    ? [['list'], ['html', { open: 'never' }], ['json', { outputFile: 'test-results/results.json' }]]
+    : 'list',
 });

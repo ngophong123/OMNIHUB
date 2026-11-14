@@ -1,6 +1,8 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
+import { stripVTControlCharacters } from 'node:util';
 
 const API_PORT = process.env.PORT ?? '4000';
 const READY_URL = process.env.API_READY_URL ?? `http://127.0.0.1:${API_PORT}/ready`;
@@ -121,6 +123,49 @@ async function runPlaywright(): Promise<number> {
   });
 }
 
+type JsonSuite = {
+  title?: string;
+  specs?: {
+    title?: string;
+    ok?: boolean;
+    tests?: { results?: { status?: string; error?: { message?: string; stack?: string } }[] }[];
+  }[];
+  suites?: JsonSuite[];
+};
+
+function sanitizeMessage(text: string): string {
+  const secret = process.env.DEMO_PASSWORD;
+  const redacted = secret ? text.split(secret).join('[REDACTED]') : text;
+  return stripVTControlCharacters(redacted).replace(/\r?\n+/g, ' ').trim().slice(0, 350);
+}
+
+function reportPlaywrightFailures() {
+  const reportPath = path.resolve('test-results/results.json');
+  if (!existsSync(reportPath)) return;
+  try {
+    const parsed = JSON.parse(readFileSync(reportPath, 'utf8')) as { suites?: JsonSuite[] };
+    const walk = (suites: JsonSuite[], prefix: string[]) => {
+      for (const suite of suites) {
+        const nextPrefix = suite.title ? [...prefix, suite.title] : prefix;
+        for (const spec of suite.specs ?? []) {
+          if (spec.ok) continue;
+          const failedResult = spec.tests?.flatMap(t => t.results ?? []).find(r => r.status && r.status !== 'passed' && r.status !== 'skipped');
+          const raw = failedResult?.error?.message ?? failedResult?.error?.stack ?? `status=${failedResult?.status ?? 'failed'}`;
+          const line = `[Playwright FAILED] ${[...nextPrefix, spec.title ?? 'unknown'].join(' > ')}: ${sanitizeMessage(raw)}`;
+          console.error(line);
+          if (process.env.GITHUB_ACTIONS === 'true') {
+            console.log(`::error::${line}`);
+          }
+        }
+        if (suite.suites?.length) walk(suite.suites, nextPrefix);
+      }
+    };
+    walk(parsed.suites ?? [], []);
+  } catch (error) {
+    console.error('Could not parse Playwright JSON report:', error instanceof Error ? error.message : String(error));
+  }
+}
+
 async function main() {
   const services: ManagedService[] = [];
   try {
@@ -135,6 +180,7 @@ async function main() {
 
     const exitCode = await runPlaywright();
     console.log(`[e2e-ci] Playwright exited with code ${exitCode}.`);
+    if (exitCode !== 0) reportPlaywrightFailures();
     process.exitCode = exitCode;
   } finally {
     await stopServices(services);
