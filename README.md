@@ -1,4 +1,4 @@
-﻿# OMNIHUB
+# OMNIHUB
 
 [![checks](https://github.com/ngophong123/OMNIHUB/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ngophong123/OMNIHUB/actions/workflows/ci.yml)
 
@@ -59,7 +59,7 @@ Status tags below distinguish verified code from environment-gated or future cap
 | Employee invitations, device binding & revocation | **Implemented** | Single-use 24h store invites, kitchen device station assignment, audit history, socket disconnect on revoke. |
 | Bilingual UI (`vi` / `en`) & responsive views | **Implemented** | Vietnamese default with English toggle across POS, KDS, admin, cash, and QR mobile order routes. |
 | Local staging TLS/proxy & encrypted Restic backup tooling | **Implemented (Local Staging Only)** | Caddy internal CA, Docker `/run/secrets`, `omnihub_app`/`omnihub_owner`/`omnihub_backup` PostgreSQL roles, encrypted Restic drills ([docs/DEPLOYMENT.md](docs/DEPLOYMENT.md), [docs/BACKUP_AND_RECOVERY.md](docs/BACKUP_AND_RECOVERY.md)). |
-| Off-machine DR, automated paging & live restaurant rollout | **Blocked (Pilot NO-GO)** | Tooling prepared (`offsite.sh`, `monitor.sh`), but no approved remote repository, alert endpoint, public PKI, or physical site UAT exists. |
+| Off-machine DR, automated paging & live restaurant rollout | **Blocked (Pilot NO-GO)** | Tooling prepared (`offsite.sh`, `monitor.sh`), but no approved off-site backup repository, alert endpoint, public PKI, or physical site UAT exists. |
 | Card acquiring & signed provider webhooks | **Disabled (`SANDBOX_ONLY`)** | `LabeledCardSandboxAdapter` always rejects card authorization; webhook endpoints and signature verification are not implemented ([docs/PAYMENT_RULES.md](docs/PAYMENT_RULES.md)). |
 | Multi-branch runtime switching & multi-warehouse transfers | **Planned** | Schema is tenant/store-scoped, but current auth sessions bind to one selected `storeId`; no runtime store switcher or inter-warehouse stock transfer exists yet. |
 | Tax/discounts, delivery channels (GrabFood/ShopeeFood), Telegram | **Planned** | Retained in [docs/PRODUCT_REQUIREMENTS.md](docs/PRODUCT_REQUIREMENTS.md) and [docs/ORIGINAL_REQUIREMENTS.md](docs/ORIGINAL_REQUIREMENTS.md); not implemented. |
