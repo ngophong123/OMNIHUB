@@ -1,0 +1,54 @@
+name: Feature Request
+description: Propose a focused enhancement, domain capability, or engineering improvement for OMNIHUB.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please align feature proposals with `docs/PRODUCT_REQUIREMENTS.md` and `docs/DOMAIN_MODEL.md`. Keep proposals scoped and concrete.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Target Surface
+      options:
+        - Multi-Branch & Multi-Warehouse
+        - POS & Order Lifecycle
+        - Kitchen Display (KDS / Offline PWA)
+        - Inventory & Procurement
+        - Payments, Tax/Discounts & Financial Reporting
+        - QR Table Ordering & External Channels
+        - Security, Observability & CI/CD
+        - Documentation & Developer Experience
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement
+      description: What operational or architectural gap does this proposal address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Solution & Scope
+      description: Describe the API, UI, schema, or workflow changes proposed, including explicit out-of-scope boundaries.
+    validations:
+      required: true
+  - type: textarea
+    id: invariants
+    attributes:
+      label: Domain, Multi-Tenant & Security Impact
+      description: Note required Prisma migrations, tenant/store isolation rules, authorization updates, idempotency, or outbox considerations.
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria & Verification Plan
+      placeholder: |
+        - Unit tests:
+        - PostgreSQL integration tests:
+        - Redis / Playwright E2E tests:
+        - Documentation updates:
+    validations:
+      required: true

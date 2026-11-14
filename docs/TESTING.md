@@ -127,7 +127,7 @@ Required coverage is specified in lifecycle documents. Evidence and limits are r
 
 Local tests leave isolated fixture tenants and explicit demo transactions for auditability. Re-running browser tests adds sales/reservations to demo data. Reports assert coherent totals, not an assumed empty database. The append-only ledger intentionally disallows ad hoc cleanup. Use a separately named development database for a fresh environment rather than truncating existing data.
 
-CI workflow prepares PostgreSQL 17/Redis and runs generate/migrate/lint/typecheck/unit/integration/build. Hosted CI execution and automated browser startup in CI remain unverified. Local checks passed on both PostgreSQL 18 optional developer binary and a separate PostgreSQL 17 Docker instance.
+CI workflow (`.github/workflows/ci.yml`, workflow `checks`, job `verify`) prepares PostgreSQL 17/Redis and runs generate/migrate/contracts-build/typecheck/lint/unit/PostgreSQL-integration/build. Hosted GitHub Actions `checks` execution was verified successful on baseline commit `8913a09` (Run `#43535373056` on `main`). However, Redis integration tests (`pnpm test:redis`) and Playwright browser E2E (`pnpm test:e2e`) are not yet included in hosted CI and remain unexecuted in CI. Local checks passed historically on both the PostgreSQL 18 optional developer binary and a separate PostgreSQL 17 Docker instance.
 
 ## Latest QR milestone evidence (2026-10-22)
 
