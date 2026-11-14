@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { allowed, allocateVnd, businessDate, cashExpected, convertUnit, digest, hashPassword, totalDue, transition, verifyPassword } from '../../apps/api/src/domain';
-import { cashSchema, commandSchema, orderSchema, kitchenReplaySchema } from '../../packages/contracts/src';
+import { cashSchema, commandSchema, orderSchema, kitchenReplaySchema, productSchema, quantitySchema, recipeSchema, billSplitSchema, eventSchema } from '../../packages/contracts/src';
 import { composeRecipe, normalizeRecipe, selectionPrice } from '../../apps/api/src/catalog-domain';
 import { LabeledCardSandboxAdapter } from '../../apps/api/src/card-provider';
 
@@ -85,5 +85,37 @@ describe('domain policies', () => {
     expect(orderSchema.safeParse({ lines: [{ productId: '00000000-0000-4000-8000-000000000001', quantity: 1 }], total: 0 }).success).toBe(false);
     expect(cashSchema.safeParse({ expectedVersion: 1, tendered: 0.01 }).success).toBe(false);
     expect(commandSchema.safeParse({ expectedVersion: -1, action: 'READY' }).success).toBe(false);
+  });
+  it('enforces edge-case domain arithmetic, password format validation, and transition boundaries', () => {
+    expect(verifyPassword('pw', 'invalid-no-colon')).toBe(false);
+    expect(verifyPassword('pw', 'salt:short')).toBe(false);
+    expect(allocateVnd(0, [{ id: 'a', weight: 10 }])).toEqual({ a: 0 });
+    expect(() => allocateVnd(-1, [{ id: 'a', weight: 1 }])).toThrow('INVALID_ALLOCATION');
+    expect(() => allocateVnd(10, [{ id: 'a', weight: 0 }])).toThrow('INVALID_ALLOCATION');
+    expect(() => cashExpected(0, 0, [{ kind: 'INVALID_KIND', amount: 10 }])).toThrow('INVALID_CASH_MOVEMENT');
+    expect(() => businessDate(new Date(), -1, 'Asia/Ho_Chi_Minh')).toThrow('UNSUPPORTED_BUSINESS_CLOCK');
+    expect(() => businessDate(new Date(), 1440, 'Asia/Ho_Chi_Minh')).toThrow('UNSUPPORTED_BUSINESS_CLOCK');
+    expect(transition('PENDING', 'HANDOFF')).toBeNull();
+    expect(transition('PENDING', 'CANCEL')).toBe('CANCELLED');
+    expect(convertUnit('3', 'piece', 'piece')).toBe('3.000');
+    expect(() => convertUnit('-1', 'g', 'g')).toThrow('INVALID_QUANTITY');
+    expect(() => convertUnit('1.2345', 'g', 'g')).toThrow('INVALID_QUANTITY');
+  });
+  it('rejects invalid recipes, multipliers, and unsafe contract inputs', () => {
+    const inactive = [{ id: 'coffee', unit: 'g', active: false, deletedAt: null }];
+    expect(() => normalizeRecipe([{ ingredientId: 'coffee', quantity: '10', unit: 'g' }], inactive)).toThrow('INGREDIENT_UNAVAILABLE');
+    expect(() => normalizeRecipe([{ ingredientId: 'coffee', quantity: '0', unit: 'g' }], [{ id: 'coffee', unit: 'g', active: true, deletedAt: null }])).toThrow('INVALID_QUANTITY');
+    expect(() => composeRecipe([{ ingredientId: 'coffee', quantity: '1.000' }], '-0.1', [])).toThrow('INVALID_MULTIPLIER');
+    expect(() => composeRecipe([{ ingredientId: 'coffee', quantity: '1.000' }], '1000.001', [])).toThrow('INVALID_MULTIPLIER');
+    expect(() => composeRecipe([{ ingredientId: 'coffee', quantity: '0.001' }], '0.500', [])).toThrow('RECIPE_PRECISION_OR_RANGE');
+    expect(() => selectionPrice(-1, undefined, [])).toThrow('INVALID_MONEY');
+    expect(quantitySchema.safeParse('0').success).toBe(false);
+    expect(quantitySchema.safeParse('12.345').success).toBe(true);
+    const id = '00000000-0000-4000-8000-000000000001';
+    expect(recipeSchema.safeParse([{ ingredientId: id, quantity: '1', unit: 'g' }, { ingredientId: id, quantity: '2', unit: 'g' }]).success).toBe(false);
+    expect(productSchema.safeParse({ name: 'Latte', active: true, description: '', imageUrl: 'http://insecure.example/img.png', price: 30000, stationId: id, categoryId: null, manualAvailable: true, recipe: [{ ingredientId: id, quantity: '1', unit: 'g' }] }).success).toBe(false);
+    expect(billSplitSchema.safeParse({ label: 'Split' }).success).toBe(false);
+    expect(billSplitSchema.safeParse({ label: 'Split', amount: 1000, itemIds: [id] }).success).toBe(false);
+    expect(eventSchema.safeParse({ eventId: id, schemaVersion: 1, tenantId: id, storeId: id, type: 'order.accepted', aggregateId: id, version: 1, occurredAt: '2026-10-22T00:00:00.000Z' }).success).toBe(true);
   });
 });

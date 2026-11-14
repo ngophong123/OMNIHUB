@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { expect, test, type Page, type WebSocketRoute } from '@playwright/test';
+import { expect, test, type APIRequestContext, type Page, type WebSocketRoute } from '@playwright/test';
 
 const WEB_ORIGIN = process.env.E2E_WEB_ORIGIN ?? 'http://localhost:3000';
 const API_BASE = process.env.API_BASE_URL ?? 'http://localhost:4000';
@@ -17,6 +17,17 @@ async function submitLogin(page: Page) {
     const seconds = Number(response.headers()['retry-after']);
     if (!Number.isInteger(seconds) || seconds < 1 || seconds > 3600) throw new Error('INVALID_LOGIN_RATE_LIMIT_RESET');
     await page.waitForTimeout(seconds * 1000 + 300);
+  }
+  throw new Error('LOGIN_RATE_LIMIT_DID_NOT_RESET');
+}
+
+async function apiLoginWithRateLimitRetry(request: APIRequestContext, data: Record<string, unknown>) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const response = await request.post(api('/auth/login'), { headers: { Origin: WEB_ORIGIN }, data });
+    if (response.status() !== 429) return response;
+    const seconds = Number(response.headers()['retry-after']);
+    if (!Number.isInteger(seconds) || seconds < 1 || seconds > 3600) throw new Error('INVALID_LOGIN_RATE_LIMIT_RESET');
+    await new Promise(resolve => setTimeout(resolve, seconds * 1000 + 300));
   }
   throw new Error('LOGIN_RATE_LIMIT_DID_NOT_RESET');
 }
@@ -266,7 +277,7 @@ test('offline kitchen: cached ticket and durable ordered commands reconcile afte
   await kitchen.getByLabel('Mật khẩu', { exact: true }).fill(process.env.DEMO_PASSWORD); await kitchen.getByLabel('Mã cửa hàng', { exact: true }).fill(storeId);
   await submitLogin(kitchen); await expect(kitchen.getByRole('heading', { name: 'Bếp', exact: true })).toBeVisible();
   const ready = await kitchen.evaluate(async () => { await navigator.serviceWorker.ready; return true; }); expect(ready).toBe(true);
-  const auth = await request.post(api('/auth/login'), { headers: { Origin: WEB_ORIGIN }, data: { email: 'cashier@local.omnihub.test', password: process.env.DEMO_PASSWORD, storeId } }); expect(auth.ok()).toBe(true);
+  const auth = await apiLoginWithRateLimitRetry(request, { email: 'cashier@local.omnihub.test', password: process.env.DEMO_PASSWORD, storeId }); expect(auth.ok()).toBe(true);
   const products = await (await request.get(api('/catalog'))).json() as { id: string }[];
   const accepted = await request.post(api('/orders'), { headers: { Origin: WEB_ORIGIN, 'Idempotency-Key': crypto.randomUUID() }, data: { lines: [{ productId: products[0]!.id, quantity: 1 }] } }); expect(accepted.ok()).toBe(true);
   const order = await accepted.json() as { id: string }; const ticket = kitchen.getByRole('article').filter({ hasText: `#${order.id.slice(0, 8)}` }); await kitchen.getByRole('button', { name: 'Đồng bộ lại', exact: true }).click(); await expect(ticket).toBeVisible({ timeout: 8000 });
@@ -297,7 +308,7 @@ test('offline kitchen: a competing server update blocks dependent local commands
   const storeId = '22222222-2222-4222-8222-222222222222'; const context = await browser.newContext(); const page = await context.newPage();
   await page.goto('/'); await page.getByLabel('Email', { exact: true }).fill('kitchen@local.omnihub.test'); await page.getByLabel('Mật khẩu', { exact: true }).fill(process.env.DEMO_PASSWORD); await page.getByLabel('Mã cửa hàng', { exact: true }).fill(storeId); await submitLogin(page);
   await expect(page.getByRole('heading', { name: 'Bếp', exact: true })).toBeVisible();
-  const ownerLogin = await request.post(api('/auth/login'), { headers: { Origin: WEB_ORIGIN }, data: { email: 'owner@local.omnihub.test', password: process.env.DEMO_PASSWORD, storeId } }); expect(ownerLogin.ok()).toBe(true);
+  const ownerLogin = await apiLoginWithRateLimitRetry(request, { email: 'owner@local.omnihub.test', password: process.env.DEMO_PASSWORD, storeId }); expect(ownerLogin.ok()).toBe(true);
   const products = await (await request.get(api('/catalog'))).json() as { id: string; available?: boolean }[]; const product = products.find(row => row.available) ?? products[0]!;
   const accepted = await request.post(api('/orders'), { headers: { Origin: WEB_ORIGIN, 'Idempotency-Key': crypto.randomUUID() }, data: { lines: [{ productId: product.id, quantity: 1 }] } }); expect(accepted.ok()).toBe(true); const created = await accepted.json() as { id: string };
   await page.getByRole('button', { name: 'Đồng bộ lại', exact: true }).click(); const ticket = page.getByRole('article').filter({ hasText: `#${created.id.slice(0, 8)}` }); await expect(ticket).toBeVisible();
@@ -315,7 +326,7 @@ test('offline kitchen: a competing server update blocks dependent local commands
 test('HTTP origin enforcement, anonymous access and validation', async ({ request }) => {
   expect((await request.get(api('/orders'))).status()).toBe(401);
   expect((await request.post(api('/orders'), { data: {} })).status()).toBe(403);
-  expect((await request.post(api('/auth/login'), { headers: { Origin: WEB_ORIGIN }, data: { email: 'wrong' } })).status()).toBe(400);
+  expect((await apiLoginWithRateLimitRetry(request, { email: 'wrong' })).status()).toBe(400);
 });
 
 test('owner: manages category, station, ingredient, receipt, recipe, variants and modifiers through admin UI', async ({ page }) => {
@@ -511,5 +522,42 @@ test('pilot admin: invite kitchen employee, assign a device station and block it
   const afterRejectedReplay = await (await page.request.get(api('/orders'))).json() as { id: string; version: number; items: { status: string }[] }[];
   expect(afterRejectedReplay.find(order => order.id === createdOrder.id)).toMatchObject({ version: createdOrderRow!.version, items: [{ status: 'PENDING' }] });
   await kitchenContext.close();
+});
+
+test('auth boundary and inventory: rejects wrong-store login and records stock adjustment in ledger', async ({ page }) => {
+  if (!process.env.DEMO_PASSWORD) throw new Error('DEMO_PASSWORD required; seed local fixtures first');
+  const storeId = '22222222-2222-4222-8222-222222222222';
+  const wrongStoreId = '99999999-9999-4999-8999-999999999999';
+  await page.goto('/');
+  await page.getByLabel('Email', { exact: true }).fill('owner@local.omnihub.test');
+  await page.getByLabel('Mật khẩu', { exact: true }).fill(process.env.DEMO_PASSWORD);
+  await page.getByLabel('Mã cửa hàng', { exact: true }).fill(wrongStoreId);
+  await submitLogin(page);
+  await expect(page.getByRole('alert')).toContainText('Thông tin đăng nhập hoặc cửa hàng không đúng.');
+  expect((await page.request.get(api('/auth/me'))).status()).toBe(401);
+
+  await page.getByLabel('Mã cửa hàng', { exact: true }).fill(storeId);
+  await submitLogin(page);
+  await page.getByRole('button', { name: /Kho nguyên liệu/ }).click();
+  await expect(page.getByRole('heading', { name: 'Kho nguyên liệu', exact: true })).toBeVisible();
+
+  const stockTable = page.locator('table').first();
+  await expect(stockTable).toContainText('Cà phê');
+  const coffeeRow = stockTable.locator('tbody tr', { hasText: 'Cà phê' });
+  const initialAvailable = Number((await coffeeRow.locator('td').nth(4).textContent())?.trim());
+
+  const form = page.locator('.adjustForm');
+  const reason = `E2E restock ${crypto.randomUUID().slice(0, 8)}`;
+  await form.getByLabel('Lượng tăng/giảm').fill('50');
+  await form.getByLabel('Lý do (ít nhất 5 ký tự)').fill(reason);
+  const adjusted = page.waitForResponse(r => r.url().endsWith('/inventory/adjustments') && r.request().method() === 'POST');
+  await form.getByRole('button', { name: 'Ghi nhận điều chỉnh', exact: true }).click();
+  expect((await adjusted).status()).toBe(201);
+
+  await expect(page.getByRole('status')).toContainText('Đã ghi nhận trên máy chủ.');
+  await expect.poll(async () => Number((await coffeeRow.locator('td').nth(4).textContent())?.trim())).toBeCloseTo(initialAvailable + 50, 3);
+  const ledgerTable = page.locator('table').nth(1);
+  await expect(ledgerTable.locator('tbody tr').first()).toContainText('Cà phê');
+  await expect(ledgerTable.locator('tbody tr').first()).toContainText(/50(?:\.000)?/);
 });
 
