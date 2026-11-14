@@ -548,6 +548,7 @@ test('auth boundary and inventory: rejects wrong-store login and records stock a
 
   const form = page.locator('.adjustForm');
   const reason = `E2E restock ${crypto.randomUUID().slice(0, 8)}`;
+  await form.locator('select[name="ingredientId"]').selectOption({ label: 'Cà phê' });
   await form.getByLabel('Lượng tăng/giảm').fill('50');
   await form.getByLabel('Lý do (ít nhất 5 ký tự)').fill(reason);
   const adjusted = page.waitForResponse(r => r.url().endsWith('/inventory/adjustments') && r.request().method() === 'POST');
