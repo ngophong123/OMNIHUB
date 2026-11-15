@@ -217,7 +217,7 @@ export async function processOutboxBatch(options: OutboxBatchOptions): Promise<O
         workerLogger.ops('error', 'OUTBOX_EVENT_INVALID', {
           component: 'outbox-worker',
           eventId: row.id,
-          correlationId: row.correlationId,
+          ...(row.correlationId ? { correlationId: row.correlationId } : {}),
         });
         continue;
       }
@@ -239,7 +239,7 @@ export async function processOutboxBatch(options: OutboxBatchOptions): Promise<O
           action: 'outbox.published',
           eventId: row.id,
           eventType: parsed.data.type,
-          correlationId: row.correlationId,
+          ...(row.correlationId ? { correlationId: row.correlationId } : {}),
         });
       } catch (err) {
         if (err instanceof PublishTimeoutError && err.reason === 'batch_budget') {

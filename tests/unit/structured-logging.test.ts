@@ -1,5 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { authEmailHmacPrefix } from '../../apps/api/src/auth';
+import { digest } from '../../apps/api/src/domain';
 import { Errors } from '../../apps/api/src/errors';
 import { createHttpSecurityLoggingMiddleware } from '../../apps/api/src/observability/http-middleware';
 import {
@@ -481,5 +483,152 @@ describe('structured logging architecture (M2-T01)', () => {
       code: 'ORIGIN_DENIED',
       correlationId: res2.headers['x-correlation-id'],
     });
+  });
+
+  it('uses keyed HMAC rather than plain SHA-256 for failed-login email identifiers', () => {
+    const email = 'owner@restaurant.test';
+    const plainDigestPrefix = digest(email).slice(0, 16);
+    const prevLogHmac = process.env.LOG_HMAC_SECRET;
+    try {
+      delete process.env.LOG_HMAC_SECRET;
+      const ephemeralHmac = authEmailHmacPrefix(email);
+      expect(ephemeralHmac).toMatch(/^[a-f0-9]{16}$/);
+      expect(ephemeralHmac).not.toBe(plainDigestPrefix);
+
+      process.env.LOG_HMAC_SECRET = 'test-log-hmac-secret-key-at-least-32-chars';
+      const firstKeyed = authEmailHmacPrefix(email);
+      const secondKeyed = authEmailHmacPrefix(email);
+      expect(firstKeyed).toBe(secondKeyed);
+      expect(firstKeyed).not.toBe(plainDigestPrefix);
+      expect(firstKeyed).not.toBe(ephemeralHmac);
+    } finally {
+      if (prevLogHmac === undefined) delete process.env.LOG_HMAC_SECRET;
+      else process.env.LOG_HMAC_SECRET = prevLogHmac;
+    }
+  });
+
+  it('scrubs full URL credentials, username-less Redis URLs, Basic auth, sensitive query params, binaries, and blocks prototype keys', () => {
+    const { entries, sink } = createMemorySink();
+    const logger = createStructuredLogger({ service: 'omnihub-api', sink });
+
+    const fakeQrSecret = 'c'.repeat(64);
+    const fullQrUrl = ['https://', 'admin:topsecret', '@api.omnihub.test/public/qr/', fakeQrSecret, '/orders?token=shorttok&ok=1'].join('');
+    const redisNoUserUrl = ['redis://', ':redispass123', '@redis.internal:6379/0'].join('');
+    const protoPayload = JSON.parse('{"__proto__":{"polluted":true},"nested":{"constructor":{"bad":1}},"safe":"ok"}') as Record<string, unknown>;
+
+    logger.info('BYPASS_REGRESSION_CHECK', {
+      url: fullQrUrl,
+      target: redisNoUserUrl,
+      header: 'Basic dXNlcjpwYXNzMTIz',
+      queryNote: 'callback https://host.test/cb?signature=sig123&x-qr-token=qtok',
+      rawPayloadBuf: Buffer.from('raw-secret-bytes'),
+      cvc: '842',
+      protoPayload,
+    });
+
+    expect(entries).toHaveLength(1);
+    const serialized = mustAt(entries, 0).serialized;
+    const parsed = mustAt(entries, 0).parsed;
+    expect(serialized).not.toContain('topsecret');
+    expect(serialized).not.toContain('redispass123');
+    expect(serialized).not.toContain('dXNlcjpwYXNzMTIz');
+    expect(serialized).not.toContain('shorttok');
+    expect(serialized).not.toContain('sig123');
+    expect(serialized).not.toContain('qtok');
+    expect(serialized).not.toContain(fakeQrSecret);
+    expect(parsed.url).toBe(`https://${REDACTED_VALUE}:${REDACTED_VALUE}@api.omnihub.test/public/qr/:credential/orders`);
+    expect(parsed.rawPayloadBuf).toBe('[Binary Redacted]');
+    expect(parsed.cvc).toBe(REDACTED_VALUE);
+    expect(({} as { polluted?: unknown }).polluted).toBeUndefined();
+    expect((parsed.protoPayload as Record<string, unknown>).safe).toBe('ok');
+  });
+
+  it('prevents untrusted payload fields from overwriting AsyncLocalStorage tenant/user/batch or injecting malformed correlationId', () => {
+    const { entries, sink } = createMemorySink();
+    const logger = createStructuredLogger({
+      service: 'omnihub-api',
+      allowedFields: new Set(['action']),
+      sink,
+    });
+
+    runWithLogContext(
+      {
+        correlationId: 'ctx-corr-valid-01',
+        service: 'omnihub-api',
+        component: 'http',
+        tenantId: 'tenant-real',
+        storeId: 'store-real',
+        userId: 'user-real',
+        jobName: 'job-real',
+        batchId: 'batch-real',
+      },
+      () => {
+        logger.info('SPOOF_ATTEMPT', {
+          action: 'update',
+          tenantId: 'tenant-victim',
+          storeId: 'store-victim',
+          userId: 'user-victim',
+          jobName: 'job-victim',
+          batchId: 'batch-victim',
+          correlationId: '',
+          unapproved: 'drop-me',
+        });
+        logger.info('SPOOF_CRLF_CORRELATION', {
+          action: 'retry',
+          correlationId: 'evil\r\nid-value',
+        });
+      },
+    );
+
+    expect(entries).toHaveLength(2);
+    for (const entry of entries) {
+      expect(entry.parsed).toMatchObject({
+        correlationId: 'ctx-corr-valid-01',
+        tenantId: 'tenant-real',
+        storeId: 'store-real',
+        userId: 'user-real',
+        jobName: 'job-real',
+        batchId: 'batch-real',
+      });
+      expect(entry.parsed).not.toHaveProperty('unapproved');
+    }
+  });
+
+  it('deduplicates concurrent close(), enforces async write backpressure cap, and bounds flush on stalled sinks', async () => {
+    let sinkCloseCalls = 0;
+    const errors: unknown[] = [];
+    const gates: Array<() => void> = [];
+    const logger = createStructuredLogger({
+      service: 'omnihub-worker',
+      maxPendingWrites: 2,
+      flushTimeoutMs: 40,
+      onWriteError: err => errors.push(err),
+      sink: {
+        write() {
+          return new Promise<void>(resolve => {
+            gates.push(resolve);
+          });
+        },
+        async close() {
+          sinkCloseCalls++;
+        },
+      },
+    });
+
+    // Two async writes enter queue; third hits maxPendingWrites=2 backpressure limit.
+    logger.info('QUEUED_1');
+    logger.info('QUEUED_2');
+    logger.info('DROPPED_BACKPRESSURE');
+    expect(logger.getFailureCount()).toBe(1);
+    expect(errors).toHaveLength(1);
+
+    // Concurrent close() calls share one lifecycle and reject new mid-flush writes.
+    const closing = Promise.all([logger.close(), logger.close()]);
+    logger.info('IGNORED_WHILE_CLOSING');
+    await closing;
+
+    expect(sinkCloseCalls).toBe(1);
+    expect(gates).toHaveLength(2);
+    for (const release of gates) release();
   });
 });

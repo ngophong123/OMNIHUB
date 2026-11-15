@@ -17,6 +17,11 @@ export type ExecutionContext = {
 const SAFE_CORRELATION_ID_RE = /^[A-Za-z0-9._-]{8,64}$/;
 const contextStorage = new AsyncLocalStorage<ExecutionContext>();
 
+/** Returns true when raw is a bounded, single-line correlation identifier safe for logs and headers. */
+export function isValidCorrelationId(raw: unknown): raw is string {
+  return typeof raw === 'string' && SAFE_CORRELATION_ID_RE.test(raw.trim());
+}
+
 /** Validates client/proxy correlation IDs and falls back to a fresh UUID v4 to block log injection. */
 export function resolveCorrelationId(raw?: unknown): string {
   if (typeof raw === 'string') {

@@ -52,10 +52,15 @@ async function main() {
     // disconnection with active HTTP transactions. app.close drains HTTP first.
     const deadline = setTimeout(() => process.exit(1), 25_000); deadline.unref();
     void closeRealtime().then(() => app.close()).then(() => limiterRedis.quit().catch(() => limiterRedis.disconnect())).then(() => db.$disconnect())
-      .then(async () => { clearTimeout(deadline); apiLogger.ops('info', 'API_STOPPED', { component: 'bootstrap', signal }); await apiLogger.close(); })
+      .then(async () => {
+        apiLogger.ops('info', 'API_STOPPED', { component: 'bootstrap', signal });
+        await apiLogger.close();
+        clearTimeout(deadline);
+      })
       .catch(async (err: unknown) => {
         apiLogger.ops('error', 'API_SHUTDOWN_FAILED', { component: 'bootstrap', signal, errorType: err instanceof Error ? err.name : typeof err });
         await apiLogger.close();
+        clearTimeout(deadline);
         process.exitCode = 1;
       });
   });

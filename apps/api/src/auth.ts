@@ -1,10 +1,22 @@
 import { ForbiddenException, UnauthorizedException } from '@nestjs/common';
-import { randomBytes } from 'node:crypto';
+import { createHmac, randomBytes } from 'node:crypto';
 import { Prisma, PrismaClient } from '@prisma/client';
 import type { Role } from '@omnihub/contracts';
 import { digest, verifyPassword } from './domain';
 import { apiLogger } from './observability/logger';
 import { getLogContext, updateLogContext } from './observability/request-context';
+
+const EPHEMERAL_LOG_HMAC_KEY = randomBytes(32);
+
+/** Computes a domain-separated keyed HMAC prefix so failed-login correlation never uses unsalted email hashes. */
+export function authEmailHmacPrefix(normalizedEmail: string): string {
+  const configuredSecret = process.env.LOG_HMAC_SECRET || process.env.QR_TOKEN_SECRET;
+  const key = configuredSecret ? configuredSecret : EPHEMERAL_LOG_HMAC_KEY;
+  return createHmac('sha256', key)
+    .update(`omnihub:auth-login-email:v1:${normalizedEmail}`)
+    .digest('hex')
+    .slice(0, 16);
+}
 
 export type Context = { tenantId: string; storeId: string; userId: string; role: Role; tokenHash: string; expiresAt: Date; correlationId: string };
 export async function authenticate(client: PrismaClient, token: string | undefined, correlationId = ''): Promise<Context> {
@@ -56,7 +68,7 @@ export async function login(client: PrismaClient, email: string, password: strin
   const fallback = '0'.repeat(32) + ':' + '0'.repeat(128);
   const valid = verifyPassword(password, user?.passwordHash ?? fallback);
   if (!user || !user.active || !valid) {
-    apiLogger.security('warn', 'AUTH_LOGIN_FAILED', { component: 'auth', storeId, emailHashPrefix: digest(normalizedEmail).slice(0, 16), reason: 'BAD_CREDENTIALS_OR_INACTIVE' });
+    apiLogger.security('warn', 'AUTH_LOGIN_FAILED', { component: 'auth', storeId, accountTag: authEmailHmacPrefix(normalizedEmail), reason: 'BAD_CREDENTIALS_OR_INACTIVE' });
     throw new UnauthorizedException('INVALID_CREDENTIALS');
   }
   const membership = await client.membership.findUnique({ where: { userId_storeId: { userId: user.id, storeId } } });

@@ -12,6 +12,8 @@ export const LOG_LEVEL_WEIGHT: Readonly<Record<LogLevel, number>> = {
 };
 
 export const REDACTED_VALUE = '[REDACTED]';
+export const DEFAULT_MAX_PENDING_WRITES = 1000;
+export const DEFAULT_FLUSH_TIMEOUT_MS = 5000;
 
 /** Standard envelope keys preserved regardless of optional caller allowlists. */
 export const STANDARD_ENVELOPE_KEYS: ReadonlySet<string> = new Set([
@@ -29,9 +31,25 @@ export const STANDARD_ENVELOPE_KEYS: ReadonlySet<string> = new Set([
   'batchId',
 ]);
 
+const PROTECTED_FIELD_KEYS = new Set([
+  'timestamp',
+  'level',
+  'category',
+  'service',
+  'code',
+  'component',
+  '__proto__',
+  'constructor',
+  'prototype',
+]);
+
+const UNSAFE_OBJECT_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+const FIELD_CORRELATION_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
+
 const SENSITIVE_KEY_FRAGMENTS = [
   'password',
   'passwd',
+  'passphrase',
   'secret',
   'token',
   'cookie',
@@ -42,7 +60,14 @@ const SENSITIVE_KEY_FRAGMENTS = [
   'signature',
   'hmac',
   'cvv',
+  'cvc',
   'cardnumber',
+  'bankaccount',
+  'routingnumber',
+  'iban',
+  'sessionid',
+  'xkitchendevice',
+  'xqrtoken',
   'connectionstring',
   'databaseurl',
   'redisurl',
@@ -59,11 +84,11 @@ const EXACT_SENSITIVE_KEYS = new Set([
   'key',
 ]);
 
-const URL_CREDENTIALS_RE = /((?:postgres(?:ql)?|rediss?|https?):\/\/)([^:@/\s]+):([^@/\s]+)@/gi;
-const BEARER_RE = /\bBearer\s+[A-Za-z0-9._~+/=-]{6,}/gi;
-const COOKIE_PAIR_RE = /\b(session|token|refresh_token|access_token|id_token)=([^;\s,]+)/gi;
+const URL_CREDENTIALS_RE = /((?:postgres(?:ql)?|rediss?|https?|wss?|amqp|mysql|mongodb):\/\/)([^:@/\s]*):([^@/\s]+)@/gi;
+const BEARER_RE = /\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{6,}/gi;
+const SENSITIVE_KV_RE = /\b([a-z0-9_.-]*(?:session|token|secret|password|passwd|auth|jwt|csrf|sid|signature|hmac|apikey|api_key|credential))=([^;\s,&]+)/gi;
 const HEX64_RE = /\b[a-f0-9]{64}\b/gi;
-const HIGH_CONFIDENCE_SECRET_RE = /\b(?:ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|sk_live_[0-9a-zA-Z]{16,})\b/g;
+const HIGH_CONFIDENCE_SECRET_RE = /\b(?:ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|sk_live_[0-9a-zA-Z]{16,}|xox[baprs]-[A-Za-z0-9-]{10,})\b/g;
 const PEM_HEADER_RE = /-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----/g;
 
 export type LogRecord = {
@@ -89,6 +114,8 @@ export type StructuredLoggerOptions = {
   allowedFields?: ReadonlySet<string>;
   sink?: LogSink;
   onWriteError?: (error: unknown) => void;
+  maxPendingWrites?: number;
+  flushTimeoutMs?: number;
 };
 
 /** Resolves a valid LogLevel from environment or defaults safely to 'info'. */
@@ -107,21 +134,36 @@ export function isSensitiveFieldName(key: string): boolean {
   return SENSITIVE_KEY_FRAGMENTS.some(fragment => normalized.includes(fragment));
 }
 
+function normalizeUrlOrPath(value: string): string {
+  try {
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) {
+      const parsed = new URL(value);
+      const auth = parsed.username || parsed.password ? `${REDACTED_VALUE}:${REDACTED_VALUE}@` : '';
+      const normalizedPath = accessLogPath(parsed.pathname);
+      return `${parsed.protocol}//${auth}${parsed.host}${normalizedPath}`;
+    }
+  } catch {
+    // Fall through to relative path normalization and pattern scrubbing.
+  }
+  return accessLogPath(value);
+}
+
 export function scrubSensitiveString(value: string, fieldName?: string): string {
   const lowerField = fieldName?.toLowerCase();
-  if (lowerField === 'path' || lowerField === 'url' || lowerField === 'originalurl') {
-    return accessLogPath(value);
-  }
-  return value
+  const base =
+    lowerField === 'path' || lowerField === 'url' || lowerField === 'originalurl'
+      ? normalizeUrlOrPath(value)
+      : value;
+  return base
     .replace(URL_CREDENTIALS_RE, `$1${REDACTED_VALUE}:${REDACTED_VALUE}@`)
-    .replace(BEARER_RE, `Bearer ${REDACTED_VALUE}`)
-    .replace(COOKIE_PAIR_RE, `$1=${REDACTED_VALUE}`)
+    .replace(BEARER_RE, match => `${match.split(/\s+/)[0]} ${REDACTED_VALUE}`)
+    .replace(SENSITIVE_KV_RE, `$1=${REDACTED_VALUE}`)
     .replace(HEX64_RE, REDACTED_VALUE)
     .replace(HIGH_CONFIDENCE_SECRET_RE, REDACTED_VALUE)
     .replace(PEM_HEADER_RE, REDACTED_VALUE);
 }
 
-/** Recursively redacts sensitive keys, capability paths, URL credentials, and circular references. */
+/** Recursively redacts sensitive keys, capability paths, URL credentials, binaries, and circular references. */
 export function sanitizeLogValue(
   value: unknown,
   fieldName?: string,
@@ -144,6 +186,12 @@ export function sanitizeLogValue(
   if (value instanceof Error) {
     return { errorType: value.name };
   }
+  if (Buffer.isBuffer(value) || ArrayBuffer.isView(value)) {
+    return '[Binary Redacted]';
+  }
+  if (value instanceof URL || value instanceof URLSearchParams) {
+    return scrubSensitiveString(value.toString(), 'url');
+  }
   if (depth >= 6) {
     return '[MaxDepth]';
   }
@@ -155,10 +203,15 @@ export function sanitizeLogValue(
       if (Array.isArray(value)) {
         return value.map(item => sanitizeLogValue(item, undefined, depth + 1, seen));
       }
-      const out: Record<string, unknown> = {};
+      const out: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
       for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-        if (v === undefined) continue;
-        out[k] = sanitizeLogValue(v, k, depth + 1, seen);
+        if (v === undefined || UNSAFE_OBJECT_KEYS.has(k)) continue;
+        Object.defineProperty(out, k, {
+          value: sanitizeLogValue(v, k, depth + 1, seen),
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        });
       }
       return out;
     } finally {
@@ -190,7 +243,11 @@ export class StructuredLogger {
   private readonly allowedFields?: ReadonlySet<string>;
   private readonly sink: LogSink;
   private readonly onWriteError?: (error: unknown) => void;
+  private readonly maxPendingWrites: number;
+  private readonly flushTimeoutMs: number;
+  private closing = false;
   private closed = false;
+  private closePromise?: Promise<void>;
   private writeFailures = 0;
   private readonly pendingWrites = new Set<Promise<void>>();
 
@@ -207,6 +264,12 @@ export class StructuredLogger {
     this.allowedFields = options.allowedFields;
     this.sink = options.sink ?? defaultConsoleSink;
     this.onWriteError = options.onWriteError;
+    this.maxPendingWrites = Number.isInteger(options.maxPendingWrites) && (options.maxPendingWrites as number) > 0
+      ? (options.maxPendingWrites as number)
+      : DEFAULT_MAX_PENDING_WRITES;
+    this.flushTimeoutMs = Number.isInteger(options.flushTimeoutMs) && (options.flushTimeoutMs as number) > 0
+      ? (options.flushTimeoutMs as number)
+      : DEFAULT_FLUSH_TIMEOUT_MS;
   }
 
   isLevelEnabled(level: LogLevel): boolean {
@@ -226,6 +289,8 @@ export class StructuredLogger {
       allowedFields: overrides.allowedFields ?? this.allowedFields,
       sink: this.sink,
       onWriteError: this.onWriteError,
+      maxPendingWrites: this.maxPendingWrites,
+      flushTimeoutMs: this.flushTimeoutMs,
     });
   }
 
@@ -262,7 +327,7 @@ export class StructuredLogger {
   }
 
   log(level: LogLevel, category: LogCategory, code: string, fields?: Record<string, unknown>): void {
-    if (this.closed || !this.isLevelEnabled(level)) return;
+    if (this.closing || this.closed || !this.isLevelEnabled(level)) return;
 
     try {
       const ctx = getLogContext();
@@ -287,17 +352,42 @@ export class StructuredLogger {
 
       if (fields) {
         for (const [key, rawValue] of Object.entries(fields)) {
-          if (rawValue === undefined || key === 'timestamp' || key === 'level' || key === 'category' || key === 'service' || key === 'code' || key === 'component') {
+          if (rawValue === undefined || PROTECTED_FIELD_KEYS.has(key)) {
             continue;
           }
-          if (this.allowedFields && !STANDARD_ENVELOPE_KEYS.has(key) && !this.allowedFields.has(key)) {
+          // Never let payload fields overwrite established execution-context metadata.
+          if (
+            (key === 'tenantId' && ctx?.tenantId !== undefined) ||
+            (key === 'storeId' && ctx?.storeId !== undefined) ||
+            (key === 'userId' && ctx?.userId !== undefined) ||
+            (key === 'jobName' && ctx?.jobName !== undefined) ||
+            (key === 'batchId' && ctx?.batchId !== undefined)
+          ) {
             continue;
           }
-          record[key] = sanitizeLogValue(rawValue, key);
+          if (key === 'correlationId') {
+            if (typeof rawValue === 'string' && FIELD_CORRELATION_ID_RE.test(rawValue.trim())) {
+              record.correlationId = rawValue.trim();
+            }
+            continue;
+          }
+          if (this.allowedFields && !this.allowedFields.has(key)) {
+            continue;
+          }
+          Object.defineProperty(record, key, {
+            value: sanitizeLogValue(rawValue, key),
+            enumerable: true,
+            writable: true,
+            configurable: true,
+          });
         }
       }
 
       const serialized = JSON.stringify(record);
+      if (this.pendingWrites.size >= this.maxPendingWrites) {
+        this.handleWriteFailure(new Error('LOG_BACKPRESSURE_LIMIT'));
+        return;
+      }
       const result = this.sink.write(level, serialized);
       if (result && typeof (result as Promise<void>).then === 'function') {
         const tracked = Promise.resolve(result)
@@ -313,21 +403,43 @@ export class StructuredLogger {
   }
 
   async flush(): Promise<void> {
+    const runBounded = async (op: Promise<unknown>) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          op,
+          new Promise<void>(resolve => {
+            timer = setTimeout(resolve, this.flushTimeoutMs);
+            timer.unref?.();
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
+
     if (this.pendingWrites.size > 0) {
-      await Promise.allSettled([...this.pendingWrites]);
+      await runBounded(Promise.allSettled([...this.pendingWrites]));
     }
     if (this.sink.flush) {
-      await this.sink.flush().catch(err => this.handleWriteFailure(err));
+      await runBounded(this.sink.flush().catch(err => this.handleWriteFailure(err)));
     }
   }
 
   async close(): Promise<void> {
-    if (this.closed) return;
-    await this.flush();
-    this.closed = true;
-    if (this.sink.close) {
-      await this.sink.close().catch(err => this.handleWriteFailure(err));
-    }
+    if (this.closePromise) return this.closePromise;
+    this.closing = true;
+    this.closePromise = (async () => {
+      try {
+        await this.flush();
+      } finally {
+        this.closed = true;
+        if (this.sink.close) {
+          await this.sink.close().catch(err => this.handleWriteFailure(err));
+        }
+      }
+    })();
+    return this.closePromise;
   }
 
   private handleWriteFailure(error: unknown): void {

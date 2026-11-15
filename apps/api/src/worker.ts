@@ -28,15 +28,24 @@ let stopping = false;
 async function shutdown(): Promise<void> {
   if (stopping) return;
   stopping = true;
-  await loop.stop(10_000);
-  await Promise.race([
-    redis.quit().catch(() => undefined),
-    new Promise<void>(resolve => setTimeout(resolve, 1_000)),
-  ]);
-  redis.disconnect();
-  await db.$disconnect();
-  workerLogger.ops('info', 'OUTBOX_STOPPED', { component: 'outbox-worker' });
-  await workerLogger.close();
+  try {
+    await loop.stop(10_000);
+    await Promise.race([
+      redis.quit().catch(() => undefined),
+      new Promise<void>(resolve => setTimeout(resolve, 1_000)),
+    ]);
+    redis.disconnect();
+    await db.$disconnect();
+    workerLogger.ops('info', 'OUTBOX_STOPPED', { component: 'outbox-worker' });
+  } catch (err: unknown) {
+    workerLogger.ops('error', 'OUTBOX_SHUTDOWN_FAILED', {
+      component: 'outbox-worker',
+      errorType: err instanceof Error ? err.name : typeof err,
+    });
+    process.exitCode = 1;
+  } finally {
+    await workerLogger.close();
+  }
 }
 
 for (const signal of ['SIGTERM', 'SIGINT'] as const) {

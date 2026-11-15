@@ -78,7 +78,7 @@ class ApiController {
     const bearer = req.get('Authorization')?.match(/^Bearer ([a-f0-9]{64})$/i)?.[1];
     if (!bearer) throw new ForbiddenException('TABLE_SESSION_REQUIRED');
     const session = await qrOrdering.validateCustomerSession(bearer);
-    const ctx = { tenantId: session.tenantId, storeId: session.storeId, userId: session.id, role: 'CASHIER' as const, tokenHash: session.sessionTokenHash, expiresAt: session.expiresAt, correlationId: String(req.res?.getHeader('x-correlation-id') ?? '') };
+    const ctx = { tenantId: session.tenantId, storeId: session.storeId, userId: session.id, role: 'CASHIER' as const, tokenHash: session.sessionTokenHash, expiresAt: session.expiresAt, correlationId: String(req.res?.getHeader('x-correlation-id') ?? getLogContext()?.correlationId ?? '') };
     return ops.acceptFromTable(ctx, key(req), parse(orderSchema, body), session.id);
   }
   @Post('public/invitations/:token/accept') async acceptInvitation(@Req() req: Request, @Param('token') token: string, @Body() body: unknown) {
