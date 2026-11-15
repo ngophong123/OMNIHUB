@@ -1,5 +1,15 @@
 # Implementation status
 
+## Milestone 2 — Task 01: Unified Structured Logging & Correlation Context (2026-11-15)
+
+Branch `feat/m2-structured-logging` implements `M2-T01` (from [`M2_BACKEND_AUDIT.md`](M2_BACKEND_AUDIT.md) and [`M2_IMPLEMENTATION_PLAN.md`](M2_IMPLEMENTATION_PLAN.md)) and reconciles M2 roadmap/baseline documentation (**Pilot remains NO-GO** pending remaining M2 P0/P1/ops gates):
+
+| Workstream / Gate | Status | Evidence & Scope Boundary |
+|---|---|---|
+| Core observability & `AsyncLocalStorage` context (`apps/api/src/observability/`) | VERIFIED | Implemented `request-context.ts` (`resolveCorrelationId`, `runWithLogContext`, `getLogContext`, `updateLogContext`), `logger.ts` (`StructuredLogger`, `LOG_LEVEL`, `application`/`security`/`operational` categories, denylist + optional `allowedFields` + regex scrubbing, safe sink error handling, async `flush`/`close`, `apiLogger`/`workerLogger`), and `http-middleware.ts` (`createHttpSecurityLoggingMiddleware`). See [`LOGGING_ARCHITECTURE.md`](LOGGING_ARCHITECTURE.md). |
+| Service-wide `console.*` migration & correlation wiring | VERIFIED | Integrated `apiLogger`/`workerLogger` across `http-app.ts`, `errors.ts`, `rate-limit.ts`, `auth.ts` (`updateLogContext` + non-reversible `emailHashPrefix`), `pilot-admin.ts` (`acceptInvitation` correlation fallback + invitation security events), `http.ts`, `outbox.ts` (`runWithLogContext` per batch + originating `row.correlationId`), `realtime.ts`, `main.ts`, and `worker.ts` (graceful logger `close()`). |
+| `M2-T01` unit verification & static gates | VERIFIED | `59/59` unit tests (`7` files including `9` new tests in `tests/unit/structured-logging.test.ts`), `pnpm.cmd typecheck`, `pnpm.cmd lint`, `pnpm.cmd security:hygiene`, and `pnpm.cmd build` verified after final edits; M2 audit baseline count (`50` executed vs `41` static declarations) and P0 wave ordering (`M2-T09`/`M2-T10` promoted right after `M2-T01`/`M2-T02`) reconciled in M2 planning docs. |
+
 ## Milestone 1 — Backend Stabilization, Realtime/Outbox Hardening & Security (2026-11-15)
 
 **Pilot NO-GO.** Milestone 1 resolved backend stability, exception sanitization, transactional outbox concurrency/retry isolation, Socket.IO N+1 query scaling & room enforcement, RBAC/reauthorization consistency, HTTP/QR header hardening, and inactive-station/category catalog filtering on branch `fix/m1-backend-stabilization` without modifying frontend UI or adding unapproved schema migrations.

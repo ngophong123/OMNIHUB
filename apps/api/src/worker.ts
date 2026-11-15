@@ -3,11 +3,24 @@ import Redis from 'ioredis';
 import { db } from './database';
 import { validateDeployment } from './deployment-security';
 import { createOutboxWorkerLoop } from './outbox';
+import { workerLogger } from './observability/logger';
 
 validateDeployment();
 
 const redis = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', { maxRetriesPerRequest: 1 });
-redis.on('error', () => undefined);
+let redisConnected = false;
+let redisFailed = false;
+redis.on('ready', () => {
+  if (!redisConnected) workerLogger.ops('info', 'OUTBOX_REDIS_READY', { component: 'outbox-worker' });
+  redisConnected = true;
+});
+redis.on('error', error => {
+  if (redisConnected || !redisFailed) {
+    workerLogger.ops('warn', 'OUTBOX_REDIS_UNAVAILABLE', { component: 'outbox-worker', errorType: error.name });
+  }
+  redisConnected = false;
+  redisFailed = true;
+});
 
 const loop = createOutboxWorkerLoop({ db, redis });
 let stopping = false;
@@ -22,7 +35,8 @@ async function shutdown(): Promise<void> {
   ]);
   redis.disconnect();
   await db.$disconnect();
-  console.log(JSON.stringify({ level: 'info', component: 'outbox-worker', code: 'OUTBOX_STOPPED' }));
+  workerLogger.ops('info', 'OUTBOX_STOPPED', { component: 'outbox-worker' });
+  await workerLogger.close();
 }
 
 for (const signal of ['SIGTERM', 'SIGINT'] as const) {
@@ -31,7 +45,11 @@ for (const signal of ['SIGTERM', 'SIGINT'] as const) {
   });
 }
 
-void loop.run().catch(() => {
-  console.error(JSON.stringify({ level: 'error', component: 'outbox-worker', code: 'OUTBOX_WORKER_FAILED' }));
+void loop.run().catch(async (err: unknown) => {
+  workerLogger.ops('fatal', 'OUTBOX_WORKER_FAILED', {
+    component: 'outbox-worker',
+    errorType: err instanceof Error ? err.name : typeof err,
+  });
+  await workerLogger.close();
   process.exitCode = 1;
 });
