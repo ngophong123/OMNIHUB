@@ -1,7 +1,12 @@
 import type { PrismaClient } from '@prisma/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { digest } from '../../apps/api/src/domain';
-import { computeBackoffMs, createOutboxWorkerLoop, processOutboxBatch } from '../../apps/api/src/outbox';
+import {
+  computeBackoffMs,
+  createOutboxWorkerLoop,
+  processOutboxBatch,
+  resolveOutboxTiming,
+} from '../../apps/api/src/outbox';
 import {
   broadcastOperationalEvent,
   extractCookieValue,
@@ -274,6 +279,11 @@ describe('Outbox batch processing, poison isolation, backoff, and clean shutdown
     expect(updatedIds).toEqual([[idOk1]]);
   });
 
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
   it('logs recovery after transient Redis errors and stops cleanly during backoff sleep', async () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
@@ -315,5 +325,243 @@ describe('Outbox batch processing, poison isolation, backoff, and clean shutdown
     await loop.stop(1_000);
     await runPromise;
     expect(Date.now() - startedAt).toBeLessThan(1_000);
+  });
+
+  it('resolves default batch time budget inside the transaction deadline with commit headroom', () => {
+    expect(resolveOutboxTiming({})).toEqual({
+      publishTimeoutMs: 5_000,
+      batchTimeBudgetMs: 10_000,
+      transactionTimeoutMs: 15_000,
+    });
+    expect(resolveOutboxTiming({ batchTimeBudgetMs: 2_000, transactionTimeoutMs: 600 })).toEqual({
+      publishTimeoutMs: 5_000,
+      batchTimeBudgetMs: 400,
+      transactionTimeoutMs: 600,
+    });
+    expect(resolveOutboxTiming({ publishTimeoutMs: 12_000 })).toEqual({
+      publishTimeoutMs: 12_000,
+      batchTimeBudgetMs: 12_000,
+      transactionTimeoutMs: 17_000,
+    });
+  });
+
+  it('commits slow sub-timeout publishes before transaction deadline and leaves remaining rows pending', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    const rowIds = [
+      '10000000-0000-4000-8000-000000000001',
+      '10000000-0000-4000-8000-000000000002',
+      '10000000-0000-4000-8000-000000000003',
+      '10000000-0000-4000-8000-000000000004',
+      '10000000-0000-4000-8000-000000000005',
+    ];
+    let pending = rowIds.map((id, idx) => ({
+      id,
+      tenantId: TENANT_ID,
+      storeId: STORE_ID,
+      type: 'order.accepted',
+      aggregateId: ORDER_ID,
+      version: 1,
+      correlationId: `slow-${idx}`,
+      createdAt: new Date(1_700_000_000_000 + idx * 1_000),
+    }));
+
+    const txTimeouts: number[] = [];
+    const committedBatches: string[][] = [];
+    const fakeDb = {
+      $transaction: async (
+        fn: (tx: unknown) => Promise<unknown>,
+        opts?: { timeout?: number },
+      ) => {
+        if (opts?.timeout !== undefined) txTimeouts.push(opts.timeout);
+        return fn({
+          $queryRaw: vi.fn(async () => pending.slice()),
+          outbox: {
+            updateMany: vi.fn(async ({ where }: { where: { id: { in: string[] } } }) => {
+              committedBatches.push(where.id.in);
+              const deliveredSet = new Set(where.id.in);
+              pending = pending.filter(row => !deliveredSet.has(row.id));
+              return { count: where.id.in.length };
+            }),
+          },
+        });
+      },
+    } as unknown as PrismaClient;
+
+    let virtualNowMs = 0;
+    const publishedIds: string[] = [];
+    const slowPublisher = {
+      publish: vi.fn(async (_channel: string, payload: string) => {
+        // Each publish stays below the 5_000 ms per-event timeout while 5 events would exceed 15_000 ms total.
+        virtualNowMs += 4_000;
+        const parsed = JSON.parse(payload) as { eventId: string };
+        publishedIds.push(parsed.eventId);
+        return 1;
+      }),
+    };
+
+    const batch1 = await processOutboxBatch({
+      db: fakeDb,
+      redis: slowPublisher,
+      now: () => virtualNowMs,
+    });
+
+    expect(txTimeouts).toEqual([15_000]);
+    expect(batch1.claimed).toBe(5);
+    expect(batch1.delivered).toBe(3);
+    expect(batch1.budgetExceeded).toBe(true);
+    expect(batch1.error).toBeUndefined();
+    expect(committedBatches).toEqual([rowIds.slice(0, 3)]);
+    expect(pending.map(row => row.id)).toEqual(rowIds.slice(3));
+
+    const batch2 = await processOutboxBatch({
+      db: fakeDb,
+      redis: slowPublisher,
+      now: () => virtualNowMs,
+    });
+
+    expect(batch2).toEqual({ claimed: 2, delivered: 2, quarantined: 0 });
+    expect(pending).toEqual([]);
+    expect(publishedIds).toEqual(rowIds);
+  });
+
+  it('caps stalled publish timeout by remaining batch budget so delivered rows commit before tx deadline', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    const id1 = '20000000-0000-4000-8000-000000000001';
+    const id2 = '20000000-0000-4000-8000-000000000002';
+    const createdAt = new Date(1_700_000_000_000);
+    let pending = [
+      { id: id1, tenantId: TENANT_ID, storeId: STORE_ID, type: 'order.accepted', aggregateId: ORDER_ID, version: 1, correlationId: 'cap-1', createdAt },
+      { id: id2, tenantId: TENANT_ID, storeId: STORE_ID, type: 'kitchen.item.ready', aggregateId: ORDER_ID, version: 1, correlationId: 'cap-2', createdAt },
+    ];
+    const committed: string[][] = [];
+
+    const fakeDb = {
+      $transaction: async (
+        fn: (tx: unknown) => Promise<unknown>,
+        opts?: { timeout?: number },
+      ) => {
+        const startedAt = Date.now();
+        const res = await fn({
+          $queryRaw: vi.fn(async () => pending.slice()),
+          outbox: {
+            updateMany: vi.fn(async ({ where }: { where: { id: { in: string[] } } }) => {
+              committed.push(where.id.in);
+              const set = new Set(where.id.in);
+              pending = pending.filter(row => !set.has(row.id));
+              return { count: where.id.in.length };
+            }),
+          },
+        });
+        expect(Date.now() - startedAt).toBeLessThan(opts?.timeout ?? 0);
+        return res;
+      },
+    } as unknown as PrismaClient;
+
+    let call = 0;
+    const stallingRedis = {
+      publish: vi.fn(
+        () =>
+          new Promise<number>(resolve => {
+            call++;
+            setTimeout(() => resolve(1), call === 1 ? 80 : 2_000);
+          }),
+      ),
+    };
+
+    const batchPromise = processOutboxBatch({
+      db: fakeDb,
+      redis: stallingRedis,
+      publishTimeoutMs: 5_000,
+      batchTimeBudgetMs: 120,
+      transactionTimeoutMs: 400,
+    });
+
+    await vi.advanceTimersByTimeAsync(120);
+    const result = await batchPromise;
+
+    expect(result.claimed).toBe(2);
+    expect(result.delivered).toBe(1);
+    expect(result.budgetExceeded).toBe(true);
+    expect(result.error).toBeUndefined();
+    expect(committed).toEqual([[id1]]);
+    expect(pending.map(row => row.id)).toEqual([id2]);
+  });
+
+  it('drains partial-budget backlog immediately when progress occurs and backs off on zero-progress budget expiry', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    let scenario: 'progress' | 'stalled' = 'progress';
+    let clockMs = 0;
+    const rows = [
+      {
+        id: '30000000-0000-4000-8000-000000000001',
+        tenantId: TENANT_ID,
+        storeId: STORE_ID,
+        type: 'order.accepted',
+        aggregateId: ORDER_ID,
+        version: 1,
+        correlationId: 'loop-1',
+        createdAt: new Date(1_700_000_000_000),
+      },
+      {
+        id: '30000000-0000-4000-8000-000000000002',
+        tenantId: TENANT_ID,
+        storeId: STORE_ID,
+        type: 'kitchen.item.ready',
+        aggregateId: ORDER_ID,
+        version: 1,
+        correlationId: 'loop-2',
+        createdAt: new Date(1_700_000_001_000),
+      },
+    ];
+
+    const fakeDb = {
+      $transaction: async (fn: (tx: unknown) => Promise<unknown>) => {
+        const result = await fn({
+          $queryRaw: vi.fn(async () => {
+            if (scenario === 'stalled') {
+              // Simulate slow SELECT consuming the entire batch budget before event 1 starts.
+              clockMs += 200;
+            }
+            return rows.slice();
+          }),
+          outbox: { updateMany: vi.fn(async () => ({ count: 1 })) },
+        });
+        return result;
+      },
+    } as unknown as PrismaClient;
+
+    const loop = createOutboxWorkerLoop({
+      db: fakeDb,
+      redis: {
+        publish: vi.fn(async () => {
+          clockMs += 150;
+          return 1;
+        }),
+      },
+      batchSize: 10,
+      pollIntervalMs: 5_000,
+      baseBackoffMs: 100,
+      maxBackoffMs: 200,
+      batchTimeBudgetMs: 100,
+      transactionTimeoutMs: 500,
+      now: () => clockMs,
+    });
+
+    // Event 1 completes (+150ms > 100ms budget), so event 2 pauses under budget and drains at delay 0.
+    const progressDelay = await loop.step();
+    expect(progressDelay).toBe(0);
+    expect(warnSpy).not.toHaveBeenCalled();
+
+    // When zero events finish before budget expiry, worker backs off rather than tight-looping at 0 ms.
+    scenario = 'stalled';
+    const stalledDelay = await loop.step();
+    expect(stalledDelay).toBeGreaterThanOrEqual(75);
+    expect(stalledDelay).toBeLessThanOrEqual(200);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
   });
 });

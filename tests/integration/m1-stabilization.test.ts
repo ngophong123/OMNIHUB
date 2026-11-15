@@ -440,6 +440,76 @@ let app: ConfiguredHttpApp;
     await db.outbox.deleteMany({ where: { id: { in: [invalidId] } } });
   });
 
+  it('commits delivered outbox rows before Prisma transaction expiration under sustained slow Redis responses and drains remaining rows', async () => {
+    const slowIds = Array.from({ length: 5 }, () => randomUUID());
+    await db.outbox.createMany({
+      data: slowIds.map((id, idx) => ({
+        id,
+        tenantId: tenantA,
+        storeId: storeA,
+        type: 'order.accepted',
+        aggregateId: trackedOrderId,
+        version: 1,
+        correlationId: `budget-${idx}`,
+        createdAt: new Date(`2000-01-01T00:03:00.${String(idx + 1).padStart(3, '0')}Z`),
+      })),
+    });
+
+    let attempt = 0;
+    const firstBatch = await processOutboxBatch({
+      db: workerDb1,
+      batchSize: 5,
+      tenantIds: [tenantA],
+      publishTimeoutMs: 5_000,
+      batchTimeBudgetMs: 250,
+      transactionTimeoutMs: 3_000,
+      redis: {
+        publish: async () => {
+          attempt++;
+          // First event finishes cleanly; subsequent slow response (< 5s per-event timeout) hits batch budget well before tx timeout.
+          const delayMs = attempt === 1 ? 15 : 350;
+          await new Promise(resolve => setTimeout(resolve, delayMs));
+          return 1;
+        },
+      },
+    });
+
+    expect(firstBatch.claimed).toBe(5);
+    expect(firstBatch.delivered).toBe(1);
+    expect(firstBatch.quarantined).toBe(0);
+    expect(firstBatch.budgetExceeded).toBe(true);
+    expect(firstBatch.error).toBeUndefined();
+
+    const rowsAfterFirst = await db.outbox.findMany({
+      where: { id: { in: slowIds } },
+      orderBy: { createdAt: 'asc' },
+    });
+    expect(rowsAfterFirst[0]?.deliveredAt).not.toBeNull();
+    expect(rowsAfterFirst.slice(1).every(row => row.deliveredAt === null)).toBe(true);
+
+    // Concurrent workers drain the remaining pending rows via FOR UPDATE SKIP LOCKED without duplicating the committed row.
+    const worker1Ids: string[] = [];
+    const worker2Ids: string[] = [];
+    const collectPublisher = (target: string[]) => ({
+      publish: async (_channel: string, payload: string) => {
+        const event = JSON.parse(payload) as { eventId: string };
+        await new Promise(resolve => setTimeout(resolve, 25));
+        target.push(event.eventId);
+        return 1;
+      },
+    });
+
+    const [drain1, drain2] = await Promise.all([
+      processOutboxBatch({ db: workerDb1, batchSize: 2, tenantIds: [tenantA], redis: collectPublisher(worker1Ids) }),
+      processOutboxBatch({ db: workerDb2, batchSize: 2, tenantIds: [tenantA], redis: collectPublisher(worker2Ids) }),
+    ]);
+
+    expect(drain1).toMatchObject({ claimed: 2, delivered: 2, quarantined: 0 });
+    expect(drain2).toMatchObject({ claimed: 2, delivered: 2, quarantined: 0 });
+    expect(new Set([...worker1Ids, ...worker2Ids])).toEqual(new Set(slowIds.slice(1)));
+    expect(await db.outbox.count({ where: { id: { in: slowIds }, deliveredAt: null } })).toBe(0);
+  });
+
   it('enforces HTTP security headers, CSRF origin check, sanitized error envelopes, RBAC, QR hardening, and active-station filtering', async () => {
     const evilOriginRes = await httpRequest(apiBaseUrl, 'GET', '/health', { Origin: 'http://evil.example' });
     expect(evilOriginRes.status).toBe(403);

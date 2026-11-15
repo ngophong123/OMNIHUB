@@ -5,6 +5,9 @@ import { eventSchema } from '@omnihub/contracts';
 export const OUTBOX_CHANNEL = 'omnihub.events';
 export const DEFAULT_BATCH_SIZE = 100;
 export const DEFAULT_PUBLISH_TIMEOUT_MS = 5_000;
+export const DEFAULT_BATCH_TIME_BUDGET_MS = 10_000;
+export const DEFAULT_TX_COMMIT_HEADROOM_MS = 5_000;
+export const DEFAULT_TX_TIMEOUT_MS = 15_000;
 export const DEFAULT_BASE_BACKOFF_MS = 500;
 export const DEFAULT_MAX_BACKOFF_MS = 15_000;
 export const DEFAULT_POLL_INTERVAL_MS = 1_000;
@@ -33,6 +36,9 @@ export type OutboxBatchOptions = {
   channel?: string;
   batchSize?: number;
   publishTimeoutMs?: number;
+  batchTimeBudgetMs?: number;
+  transactionTimeoutMs?: number;
+  now?: () => number;
   quarantinedIds?: Set<string>;
   tenantIds?: readonly string[];
   shouldContinue?: () => boolean;
@@ -42,8 +48,51 @@ export type OutboxBatchResult = {
   claimed: number;
   delivered: number;
   quarantined: number;
+  budgetExceeded?: boolean;
   error?: Error;
 };
+
+class PublishTimeoutError extends Error {
+  constructor(public readonly reason: 'publish_timeout' | 'batch_budget') {
+    super(reason === 'batch_budget' ? 'OUTBOX_BATCH_BUDGET_EXCEEDED' : 'OUTBOX_PUBLISH_TIMEOUT');
+    this.name = 'PublishTimeoutError';
+  }
+}
+
+/** Resolves per-event publish timeout, bounded batch time budget, and Prisma tx deadline with commit headroom. */
+export function resolveOutboxTiming(options: {
+  publishTimeoutMs?: number;
+  batchTimeBudgetMs?: number;
+  transactionTimeoutMs?: number;
+}): {
+  publishTimeoutMs: number;
+  batchTimeBudgetMs: number;
+  transactionTimeoutMs: number;
+} {
+  const publishTimeoutMs = Math.max(1, options.publishTimeoutMs ?? DEFAULT_PUBLISH_TIMEOUT_MS);
+  const requestedBudget = options.batchTimeBudgetMs;
+  const defaultBudget = Math.max(DEFAULT_BATCH_TIME_BUDGET_MS, publishTimeoutMs);
+
+  const transactionTimeoutMs =
+    options.transactionTimeoutMs !== undefined
+      ? Math.max(10, options.transactionTimeoutMs)
+      : Math.max(
+          DEFAULT_TX_TIMEOUT_MS,
+          (requestedBudget ?? defaultBudget) + DEFAULT_TX_COMMIT_HEADROOM_MS,
+        );
+
+  const commitHeadroomMs = Math.min(
+    DEFAULT_TX_COMMIT_HEADROOM_MS,
+    Math.max(1, Math.floor(transactionTimeoutMs / 3)),
+  );
+  const maxSafeBudgetMs = Math.max(1, transactionTimeoutMs - commitHeadroomMs);
+  const batchTimeBudgetMs = Math.max(
+    1,
+    Math.min(requestedBudget ?? defaultBudget, maxSafeBudgetMs),
+  );
+
+  return { publishTimeoutMs, batchTimeBudgetMs, transactionTimeoutMs };
+}
 
 /** Computes bounded exponential backoff with jitter across consecutive transient worker failures. */
 export function computeBackoffMs(
@@ -72,13 +121,14 @@ async function publishWithTimeout(
   channel: string,
   payload: string,
   timeoutMs: number,
+  reason: 'publish_timeout' | 'batch_budget' = 'publish_timeout',
 ): Promise<void> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     await Promise.race([
       publisher.publish(channel, payload),
       new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error('OUTBOX_PUBLISH_TIMEOUT')), timeoutMs);
+        timer = setTimeout(() => reject(new PublishTimeoutError(reason)), timeoutMs);
       }),
     ]);
   } finally {
@@ -88,8 +138,9 @@ async function publishWithTimeout(
 
 /**
  * Atomically claims undelivered Outbox records using PostgreSQL FOR UPDATE SKIP LOCKED,
- * validates event schemas, publishes to Redis, and marks only published events delivered
- * so concurrent workers never duplicate batches and transient outages retain pending rows.
+ * validates event schemas, publishes to Redis within a bounded batch time budget, and
+ * commits delivered rows before the Prisma transaction deadline so unprocessed events
+ * remain pending for subsequent batches under at-least-once delivery semantics.
  */
 export async function processOutboxBatch(options: OutboxBatchOptions): Promise<OutboxBatchResult> {
   const {
@@ -97,13 +148,18 @@ export async function processOutboxBatch(options: OutboxBatchOptions): Promise<O
     redis,
     channel = OUTBOX_CHANNEL,
     batchSize = DEFAULT_BATCH_SIZE,
-    publishTimeoutMs = DEFAULT_PUBLISH_TIMEOUT_MS,
+    publishTimeoutMs,
+    batchTimeBudgetMs,
+    transactionTimeoutMs,
+    now = Date.now,
     quarantinedIds = new Set<string>(),
     tenantIds,
     shouldContinue = () => true,
   } = options;
+  const timing = resolveOutboxTiming({ publishTimeoutMs, batchTimeBudgetMs, transactionTimeoutMs });
 
   return db.$transaction(async tx => {
+    const batchDeadlineMs = now() + timing.batchTimeBudgetMs;
     const excluded = [...quarantinedIds].filter(id => UUID_RE.test(id));
     const exclusionSql = excluded.length
       ? Prisma.sql`AND id NOT IN (${Prisma.join(excluded.map(id => Prisma.sql`${id}::uuid`))})`
@@ -126,10 +182,20 @@ export async function processOutboxBatch(options: OutboxBatchOptions): Promise<O
 
     const deliveredIds: string[] = [];
     let quarantined = 0;
+    let budgetExceeded = false;
     let error: Error | undefined;
 
     for (const row of batch) {
       if (!shouldContinue()) break;
+
+      const remainingBudgetMs = batchDeadlineMs - now();
+      if (remainingBudgetMs <= 0) {
+        budgetExceeded = true;
+        if (deliveredIds.length === 0 && quarantined === 0) {
+          error = new PublishTimeoutError('batch_budget');
+        }
+        break;
+      }
 
       const candidate = {
         eventId: row.id,
@@ -155,8 +221,17 @@ export async function processOutboxBatch(options: OutboxBatchOptions): Promise<O
         continue;
       }
 
+      const budgetCapped = remainingBudgetMs < timing.publishTimeoutMs;
+      const attemptTimeoutMs = Math.min(timing.publishTimeoutMs, remainingBudgetMs);
+
       try {
-        await publishWithTimeout(redis, channel, JSON.stringify(parsed.data), publishTimeoutMs);
+        await publishWithTimeout(
+          redis,
+          channel,
+          JSON.stringify(parsed.data),
+          attemptTimeoutMs,
+          budgetCapped ? 'batch_budget' : 'publish_timeout',
+        );
         deliveredIds.push(row.id);
         console.log(JSON.stringify({
           level: 'info',
@@ -165,6 +240,13 @@ export async function processOutboxBatch(options: OutboxBatchOptions): Promise<O
           correlationId: row.correlationId,
         }));
       } catch (err) {
+        if (err instanceof PublishTimeoutError && err.reason === 'batch_budget') {
+          budgetExceeded = true;
+          if (deliveredIds.length === 0 && quarantined === 0) {
+            error = err;
+          }
+          break;
+        }
         error = err instanceof Error ? err : new Error('OUTBOX_PUBLISH_FAILED');
         break;
       }
@@ -181,9 +263,10 @@ export async function processOutboxBatch(options: OutboxBatchOptions): Promise<O
       claimed: batch.length,
       delivered: deliveredIds.length,
       quarantined,
+      ...(budgetExceeded ? { budgetExceeded: true } : {}),
       ...(error ? { error } : {}),
     };
-  }, { timeout: Math.max(15_000, publishTimeoutMs + 5_000) });
+  }, { timeout: timing.transactionTimeoutMs });
 }
 
 export type WorkerLoopOptions = {
@@ -194,6 +277,9 @@ export type WorkerLoopOptions = {
   baseBackoffMs?: number;
   maxBackoffMs?: number;
   publishTimeoutMs?: number;
+  batchTimeBudgetMs?: number;
+  transactionTimeoutMs?: number;
+  now?: () => number;
   heartbeatFile?: string;
 };
 
@@ -209,7 +295,10 @@ export function createOutboxWorkerLoop(options: WorkerLoopOptions) {
     pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
     baseBackoffMs = DEFAULT_BASE_BACKOFF_MS,
     maxBackoffMs = DEFAULT_MAX_BACKOFF_MS,
-    publishTimeoutMs = DEFAULT_PUBLISH_TIMEOUT_MS,
+    publishTimeoutMs,
+    batchTimeBudgetMs,
+    transactionTimeoutMs,
+    now,
     heartbeatFile = process.env.WORKER_HEARTBEAT_FILE,
   } = options;
 
@@ -241,6 +330,9 @@ export function createOutboxWorkerLoop(options: WorkerLoopOptions) {
         redis,
         batchSize,
         publishTimeoutMs,
+        batchTimeBudgetMs,
+        transactionTimeoutMs,
+        now,
         quarantinedIds,
         shouldContinue: () => running,
       });
@@ -269,7 +361,9 @@ export function createOutboxWorkerLoop(options: WorkerLoopOptions) {
       }
       degraded = false;
       consecutiveFailures = 0;
-      return result.claimed >= batchSize ? 0 : pollIntervalMs;
+      const madeProgressUnderBudget =
+        Boolean(result.budgetExceeded) && (result.delivered > 0 || result.quarantined > 0);
+      return result.claimed >= batchSize || madeProgressUnderBudget ? 0 : pollIntervalMs;
     } catch (err) {
       consecutiveFailures++;
       if (!degraded) {
