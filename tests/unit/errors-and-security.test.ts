@@ -39,7 +39,7 @@ describe('Errors classification and sanitization', () => {
   });
 
   it('redacts 5xx HttpException internals except explicit safe 503 operational codes', () => {
-    expect(classifyError(new HttpException('Internal SQL connection string postgresql://u:p@host', 500))).toEqual({
+    expect(classifyError(new HttpException('Internal SQL query error on table users', 500))).toEqual({
       status: 500,
       code: 'INTERNAL_SERVER_ERROR',
       errorType: 'HttpException',
@@ -53,7 +53,7 @@ describe('Errors classification and sanitization', () => {
       shouldLog: true,
     });
 
-    expect(classifyError(new HttpException('redis://:secret@redis:6379 ECONNREFUSED', 503))).toEqual({
+    expect(classifyError(new HttpException('Redis socket ECONNREFUSED on internal broker', 503))).toEqual({
       status: 503,
       code: 'SERVICE_UNAVAILABLE',
       errorType: 'HttpException',
@@ -116,7 +116,7 @@ describe('Errors classification and sanitization', () => {
     };
 
     const filter = new Errors();
-    filter.catch(new Error('postgres://admin:supersecret@db:5432/omnihub'), host as never);
+    filter.catch(new Error('Database connection failed with supersecret internal string'), host as never);
 
     expect(statusMock).toHaveBeenCalledWith(500);
     expect(jsonMock).toHaveBeenCalledWith({ code: 'INTERNAL_SERVER_ERROR', correlationId: 'corr-999' });
