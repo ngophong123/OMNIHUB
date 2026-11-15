@@ -1,5 +1,18 @@
 # Implementation status
 
+## Milestone 0.2 — CI/CD, E2E, Coverage & Security Foundation (2026-11-14)
+
+**Pilot NO-GO.** Engineering quality automation, full-stack CI execution, V8 coverage gates, and CI security controls are verified on branch `engineering/m02-quality-foundation` (`f9c8741`, pending PR merge to `main`), while operational DR, offsite storage/monitoring, RPO compliance, and physical pilot UAT remain open blockers.
+
+| Workstream / Gate | Status | Evidence & Scope Boundary |
+|---|---|---|
+| CI build, unit/PG coverage & Redis integration | VERIFIED | GitHub Actions `checks` Run `#43585662222` (`verify`): Postgres 17 + Redis 7 services; `34/34` unit + `27/27` PG integration tests (`Stmts 49.33%`, `Branches 51.66%`, `Funcs 49.51%`, `Lines 58.3%`) meeting per-module and `ci`-scoped global V8 floors; `pnpm test:redis` (`2/2`); `backend-coverage` artifact uploaded. |
+| Headless full-stack Playwright E2E in CI | VERIFIED | GitHub Actions `checks` Run `#43585662222` (`e2e`): `pnpm test:e2e:ci` ran live built `api`, `worker`, `web`, Postgres 17, Redis 7, and Chromium; all `10/10` workflows passed (including auth/store boundary and inventory adjustment/ledger) with `AUTH_LOGIN_RATE_LIMIT=10` preserved. |
+| Production dependency audit, hygiene & CodeQL | VERIFIED | GitHub Actions `security` Run `#43585662264` (`audit`, `codeql`): `pnpm audit --prod --audit-level high` clean, `pnpm security:hygiene` clean (`142` files, `0` violations), `sh -n` clean, CodeQL `v4` (`security-extended`) passed. |
+| PR dependency review & local Windows web build | PARTIALLY VERIFIED | `dependency-review` is wired for `pull_request` events (`skipped` on branch push); local Windows `typecheck`, `lint`, `test:coverage` (`34/34`), `security:hygiene`, `audit`, `contracts build`, and `api build` pass while Windows `@omnihub/web` local build remains blocked on `.next` ACL `EPERM` (`Linux CI build PASS`). |
+| Multi-branch / multi-warehouse & live payments | NOT IMPLEMENTED | Runtime store switching, inter-warehouse transfers, webhook signature verification, live card acquiring (`SANDBOX_ONLY`), tax/discount models, and WAL PITR remain unimplemented. |
+| Off-machine DR, 900s RPO & restaurant UAT | BLOCKED / FAILED | Host outage drills failed 900s RPO (`212,374 s` on `2026-10-26`); independent backup target/monitor/alerts and physical staff UAT ([PILOT_UAT.md](PILOT_UAT.md)) remain unprovisioned/unverified. |
+
 ## DR recovery-point gate — 2026-10-26
 
 **Pilot NO-GO.** On host restart, local monitoring reported a **212,374-second** recovery-point age, failing the 900-second RPO. Docker Engine 29.1.2 was started safely; all databases, volumes, prior backups and historical invalid artifact were retained.

@@ -1,8 +1,17 @@
 name: checks
 on: [push, pull_request]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     services:
       postgres:
         image: postgres:17-alpine
@@ -17,6 +26,9 @@ jobs:
       redis:
         image: redis:7-alpine
         ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
     env:
       DATABASE_URL: postgresql://omnihub:local_only_change_me@localhost:5432/omnihub?schema=public
       REDIS_URL: redis://localhost:6379
@@ -30,12 +42,111 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22.14.0'
+          cache: 'pnpm'
       - run: pnpm install --frozen-lockfile
       - run: pnpm db:generate
       - run: pnpm db:migrate
       - run: pnpm --filter @omnihub/contracts build
       - run: pnpm typecheck
       - run: pnpm lint
-      - run: pnpm test
-      - run: pnpm test:integration
       - run: pnpm build
+      - run: pnpm test:coverage:ci
+        env:
+          OMNIHUB_COVERAGE_SCOPE: ci
+      - run: pnpm test:redis
+      - name: Publish backend coverage summary
+        if: always()
+        run: |
+          if [ ! -f coverage/coverage-summary.json ]; then
+            echo "Coverage summary not generated."
+            exit 0
+          fi
+          node <<'EOF'
+          const fs = require('node:fs');
+          const summary = JSON.parse(fs.readFileSync('coverage/coverage-summary.json', 'utf8'));
+          const t = summary.total;
+          const out = [
+            '### Backend V8 Coverage (Unit + PostgreSQL Integration)',
+            '',
+            '| Metric | Covered / Total | Pct |',
+            '| --- | ---: | ---: |',
+            `| Statements | ${t.statements.covered} / ${t.statements.total} | ${t.statements.pct}% |`,
+            `| Branches | ${t.branches.covered} / ${t.branches.total} | ${t.branches.pct}% |`,
+            `| Functions | ${t.functions.covered} / ${t.functions.total} | ${t.functions.pct}% |`,
+            `| Lines | ${t.lines.covered} / ${t.lines.total} | ${t.lines.pct}% |`,
+          ].join('\n');
+          if (process.env.GITHUB_STEP_SUMMARY) {
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${out}\n`);
+          }
+          if (process.env.GITHUB_ACTIONS === 'true') {
+            console.log(`::notice title=Backend V8 Coverage::Stmts ${t.statements.pct}% (${t.statements.covered}/${t.statements.total}), Branches ${t.branches.pct}% (${t.branches.covered}/${t.branches.total}), Funcs ${t.functions.pct}% (${t.functions.covered}/${t.functions.total}), Lines ${t.lines.pct}% (${t.lines.covered}/${t.lines.total})`);
+          }
+          console.log(out);
+          EOF
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-coverage
+          path: coverage/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  e2e:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: omnihub
+          POSTGRES_PASSWORD: local_only_change_me
+          POSTGRES_DB: omnihub
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U omnihub -d omnihub"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql://omnihub:local_only_change_me@localhost:5432/omnihub?schema=public
+      REDIS_URL: redis://localhost:6379
+      PORT: '4000'
+      API_BASE_URL: http://localhost:4000
+      WEB_ORIGIN: http://localhost:3000
+      E2E_WEB_ORIGIN: http://localhost:3000
+      SESSION_SECURE: 'false'
+      SEED_DEMO: 'true'
+      DEMO_PASSWORD: ci-disposable-demo-password-12
+      QR_TOKEN_SECRET: ci-disposable-qr-secret-32chars!!
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.4.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.14.0'
+          cache: 'pnpm'
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm db:generate
+      - run: pnpm db:migrate
+      - run: pnpm db:seed
+      - run: pnpm build
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm test:e2e:ci
+      - name: Upload Playwright failure artifacts
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-failure-artifacts
+          path: |
+            playwright-report/
+            test-results/
+          if-no-files-found: ignore
+          retention-days: 14
