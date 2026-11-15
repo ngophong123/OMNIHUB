@@ -2,7 +2,7 @@
 import type { CashMovementCommand, CashRegisterInput, CashShiftClose, CashShiftOpen } from '@omnihub/contracts';
 import type { Context } from './auth';
 import { CommandBus, scope, type Result } from './commands';
-import { businessDate, cashExpected } from './domain';
+import { allowed, businessDate, cashExpected } from './domain';
 
 export class CashShifts extends CommandBus {
   async registers(ctx: Context) {
@@ -28,9 +28,9 @@ export class CashShifts extends CommandBus {
       const register = await tx.cashRegister.findFirst({ where: { ...scope(ctx), id: input.registerId, active: true } });
       if (!register) throw new NotFoundException('REGISTER_NOT_FOUND');
       const cashierId = input.cashierId ?? current.userId;
-      if (cashierId !== current.userId && !['OWNER', 'MANAGER'].includes(current.role)) throw new ForbiddenException('CASHIER_ASSIGNMENT_FORBIDDEN');
+      if (cashierId !== current.userId && !allowed(current.role, 'admin')) throw new ForbiddenException('CASHIER_ASSIGNMENT_FORBIDDEN');
       const membership = await tx.membership.findUnique({ where: { userId_storeId: { userId: cashierId, storeId: current.storeId } }, include: { user: { select: { active: true } } } });
-      if (!membership || membership.tenantId !== current.tenantId || !membership.user.active || !['OWNER', 'MANAGER', 'CASHIER'].includes(membership.role)) throw new ForbiddenException('CASHIER_ASSIGNMENT_INVALID');
+      if (!membership || membership.tenantId !== current.tenantId || !membership.user.active || !allowed(membership.role, 'cashShift')) throw new ForbiddenException('CASHIER_ASSIGNMENT_INVALID');
       const store = await tx.store.findFirstOrThrow({ where: { tenantId: ctx.tenantId, id: ctx.storeId } });
       const now = new Date();
       const row = await tx.cashShift.create({ data: { ...scope(ctx), registerId: register.id, cashierId, openingAmount: input.openingAmount, businessDate: businessDate(now, store.dayStart, store.timezone), openedAt: now } });
@@ -41,7 +41,7 @@ export class CashShifts extends CommandBus {
     return this.command(ctx, key, 'cash.movement.recorded', input, async (tx, current) => {
       const shift = await tx.cashShift.findFirst({ where: { ...scope(ctx), id: input.shiftId, status: 'OPEN' } });
       if (!shift) throw new ConflictException('SHIFT_NOT_OPEN');
-      if (shift.cashierId !== current.userId && !['OWNER', 'MANAGER'].includes(current.role)) throw new ForbiddenException('SHIFT_CASHIER_REQUIRED');
+      if (shift.cashierId !== current.userId && !allowed(current.role, 'admin')) throw new ForbiddenException('SHIFT_CASHIER_REQUIRED');
       await tx.$queryRaw`SELECT id FROM "CashShift" WHERE "tenantId" = ${ctx.tenantId}::uuid AND "storeId" = ${ctx.storeId}::uuid AND id = ${shift.id}::uuid FOR UPDATE`;
       const locked = await tx.cashShift.updateMany({ where: { ...scope(ctx), id: shift.id, status: 'OPEN', version: shift.version }, data: { version: { increment: 1 } } });
       if (locked.count !== 1) throw new ConflictException('SHIFT_CLOSE_RACE');
@@ -66,9 +66,9 @@ export class CashShifts extends CommandBus {
     return this.command(ctx, key, 'cash.shift.closing', { shiftId, ...input }, async (tx, current) => {
       const shift = await tx.cashShift.findFirst({ where: { ...scope(ctx), id: shiftId } });
       if (!shift) throw new NotFoundException('SHIFT_NOT_FOUND');
-      if (shift.cashierId !== current.userId && !['OWNER', 'MANAGER'].includes(current.role)) throw new ForbiddenException('SHIFT_CASHIER_REQUIRED');
+      if (shift.cashierId !== current.userId && !allowed(current.role, 'admin')) throw new ForbiddenException('SHIFT_CASHIER_REQUIRED');
       if (shift.status !== 'OPEN' || shift.version !== input.expectedVersion) throw new ConflictException('SHIFT_NOT_OPEN_OR_STALE');
-      await tx.$queryRaw`SELECT id FROM "CashShift" WHERE id = ${shift.id}::uuid FOR UPDATE`;
+      await tx.$queryRaw`SELECT id FROM "CashShift" WHERE "tenantId" = ${ctx.tenantId}::uuid AND "storeId" = ${ctx.storeId}::uuid AND id = ${shift.id}::uuid FOR UPDATE`;
       const payments = await tx.payment.aggregate({ where: { ...scope(ctx), cashShiftId: shift.id }, _sum: { amount: true } });
       const movements = await tx.cashMovement.findMany({ where: { ...scope(ctx), shiftId: shift.id } });
       let expected: number;

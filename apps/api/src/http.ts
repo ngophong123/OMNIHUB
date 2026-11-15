@@ -1,12 +1,12 @@
-import { ArgumentsHost, BadRequestException, Body, Catch, ConflictException, Controller, Delete, ExceptionFilter, Get, HttpException, Module, NotFoundException, Param, Post, Put, Query, Req, Res, ServiceUnavailableException } from '@nestjs/common';
+import { BadRequestException, Body, ConflictException, Controller, Delete, ForbiddenException, Get, HttpException, Module, NotFoundException, Param, Post, Put, Query, Req, Res, ServiceUnavailableException } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import type { Request, Response } from 'express';
 import { cashSchema, cashRegisterSchema, cashShiftOpenSchema, cashShiftCloseSchema, cashMovementSchema, cashApprovalSchema, categoryListSchema, commandSchema, loginSchema, orderSchema, stockSchema, paymentSchema, refundRequestSchema, refundDecisionSchema, billSplitSchema, paymentFailureSchema, orderCancelSchema, kitchenDeviceSchema, kitchenSyncSchema, kitchenDeviceAssignmentSchema, invitationCreateSchema, invitationAcceptSchema } from '@omnihub/contracts';
 import { z } from 'zod';
 import { db } from './database';
-import { authenticate, login } from './auth';
+import { authenticate, login, reauthorize } from './auth';
 import { allowed, digest } from './domain';
-import { ForbiddenException } from '@nestjs/common';
+export { Errors } from './errors';
 import { Operations } from './operations';
 import { CatalogOperations } from './catalog-operations';
 import { CashShifts } from './cash-shifts';
@@ -43,17 +43,7 @@ function parse<S extends z.ZodTypeAny>(schema: S, value: unknown): z.output<S> {
 const context = (req: Request) => authenticate(db, typeof req.cookies?.session === 'string' ? req.cookies.session : undefined, String(req.res?.getHeader('x-correlation-id') ?? ''));
 const key = (req: Request) => req.get('Idempotency-Key') ?? '';
 const uuid = (id: string) => parse(z.string().uuid(), id);
-
-@Catch()
-export class Errors implements ExceptionFilter {
-  catch(error: unknown, host: ArgumentsHost): void {
-    const response = host.switchToHttp().getResponse<Response>();
-    const status = error instanceof HttpException ? error.getStatus() : 503;
-    const code = error instanceof HttpException ? error.message : 'SERVICE_UNAVAILABLE';
-    if (!(error instanceof HttpException)) console.error(JSON.stringify({ level: 'error', code: 'REQUEST_FAILED', errorType: error instanceof Error ? error.name : 'unknown', correlationId: response.getHeader('x-correlation-id') }));
-    response.status(status).json({ code, correlationId: response.getHeader('x-correlation-id') });
-  }
-}
+const HEX64_RE = /^[a-f0-9]{64}$/i;
 
 @Controller()
 class ApiController {
@@ -77,7 +67,7 @@ class ApiController {
   @Post('auth/logout') async logout(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
     const c = await context(req);
     await db.session.deleteMany({ where: { tokenHash: c.tokenHash } });
-    res.clearCookie('session', { path: '/', sameSite: 'strict', secure: process.env.SESSION_SECURE !== 'false' });
+    res.clearCookie('session', { path: '/', httpOnly: true, sameSite: 'strict', secure: process.env.SESSION_SECURE !== 'false' });
     return { ok: true };
   }
   @Get('public/qr/:token/menu') async publicMenu(@Param('token') token: string) { return qrOrdering.publicMenu(token); }
@@ -94,7 +84,7 @@ class ApiController {
   @Get('public/order-status/:token') async publicOrderStatus(@Param('token') token: string) { return qrOrdering.status(token); }
   @Get('catalog') async catalog(@Req() req: Request) {
     const c = await context(req);
-    const rows = await db.product.findMany({ where: { tenantId: c.tenantId, storeId: c.storeId, active: true, deletedAt: null }, include: { recipe: true, variants: { where: { active: true, deletedAt: null } }, modifierGroups: { where: { active: true, deletedAt: null }, include: { options: { where: { active: true, deletedAt: null }, include: { recipe: true } } } } }, orderBy: { name: 'asc' } });
+    const rows = await db.product.findMany({ where: { tenantId: c.tenantId, storeId: c.storeId, active: true, deletedAt: null, station: { active: true, deletedAt: null }, OR: [{ categoryId: null }, { category: { active: true, deletedAt: null } }] }, include: { recipe: true, variants: { where: { active: true, deletedAt: null } }, modifierGroups: { where: { active: true, deletedAt: null }, include: { options: { where: { active: true, deletedAt: null }, include: { recipe: true } } } } }, orderBy: { name: 'asc' } });
     const availability = await catalog.availability(c, rows.map(p => ({ id: p.id, recipe: p.recipe })));
     const variantAvailability = await catalog.availability(c, rows.flatMap(p => p.variants.map(v => ({ id: v.id, recipe: composeRecipe(p.recipe.map(r => ({ ingredientId: r.ingredientId, quantity: r.quantity.toFixed(3) })), v.recipeMultiplier.toFixed(3), []) }))));
     return rows.map(p => ({ ...p, variants: p.variants.map(v => ({ ...v, available: variantAvailability.get(v.id) ?? false })), stockAvailable: availability.get(p.id) ?? false, available: p.manualAvailable && (availability.get(p.id) ?? false) && p.recipe.length > 0 }));
@@ -114,17 +104,26 @@ class ApiController {
   }
   @Post('kitchen/devices/register') async registerKitchenDevice(@Req() req: Request, @Body() body: unknown) {
     const c = await context(req); const { deviceId } = parse(kitchenDeviceSchema, body);
-    if (!['KITCHEN', 'OWNER', 'MANAGER'].includes(c.role)) throw new ForbiddenException('PERMISSION_DENIED');
-    const existing = await db.kitchenDevice.findUnique({ where: { id: deviceId } });
-    if (existing && (existing.tenantId !== c.tenantId || existing.storeId !== c.storeId || existing.userId !== c.userId || existing.revokedAt)) throw new ForbiddenException('KITCHEN_DEVICE_REVOKED_OR_OUT_OF_SCOPE');
-    const device = await db.kitchenDevice.upsert({ where: { id: deviceId }, create: { id: deviceId, tenantId: c.tenantId, storeId: c.storeId, userId: c.userId }, update: { lastSeenAt: new Date() } });
-    if (device.tenantId !== c.tenantId || device.storeId !== c.storeId || device.userId !== c.userId || device.revokedAt) throw new ForbiddenException('KITCHEN_DEVICE_REVOKED_OR_OUT_OF_SCOPE');
-    if (!existing) await auditKitchenDevice(c, deviceId, 'KITCHEN_DEVICE_REGISTERED');
+    if (!allowed(c.role, 'kitchen')) throw new ForbiddenException('PERMISSION_DENIED');
+    await db.$transaction(async tx => {
+      const current = await reauthorize(tx, c);
+      if (!allowed(current.role, 'kitchen')) throw new ForbiddenException('PERMISSION_DENIED');
+      const existing = await tx.kitchenDevice.findUnique({ where: { id: deviceId } });
+      if (existing) {
+        if (existing.tenantId !== current.tenantId || existing.storeId !== current.storeId || existing.userId !== current.userId || existing.revokedAt) {
+          throw new ForbiddenException('KITCHEN_DEVICE_REVOKED_OR_OUT_OF_SCOPE');
+        }
+        await tx.kitchenDevice.update({ where: { id: deviceId }, data: { lastSeenAt: new Date() } });
+        return;
+      }
+      await tx.kitchenDevice.create({ data: { id: deviceId, tenantId: current.tenantId, storeId: current.storeId, userId: current.userId } });
+      await tx.audit.create({ data: { tenantId: current.tenantId, storeId: current.storeId, actorId: current.userId, action: 'KITCHEN_DEVICE_REGISTERED', entityId: deviceId, commandKey: `kitchen-device:KITCHEN_DEVICE_REGISTERED:${randomUUID()}`, correlationId: current.correlationId } });
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
     return { deviceId, authorized: true };
   }
   @Post('kitchen/sync') async syncKitchenCommands(@Req() req: Request, @Body() body: unknown) {
     const c = await context(req); const { commands } = parse(kitchenSyncSchema, body);
-    if (!['KITCHEN', 'OWNER', 'MANAGER'].includes(c.role)) throw new ForbiddenException('PERMISSION_DENIED');
+    if (!allowed(c.role, 'kitchen')) throw new ForbiddenException('PERMISSION_DENIED');
     if (commands.some(command => command.tenantId !== c.tenantId || command.storeId !== c.storeId || command.userId !== c.userId) || new Set(commands.map(command => command.commandId)).size !== commands.length || new Set(commands.map(command => command.sequence)).size !== commands.length || commands.some((command, index) => index > 0 && command.sequence <= commands[index - 1]!.sequence)) throw new BadRequestException('INVALID_REPLAY_SCOPE_OR_ORDER');
     const deviceIds = new Set(commands.map(command => command.deviceId));
     if (deviceIds.size > 1) throw new BadRequestException('MULTIPLE_REPLAY_DEVICES');
@@ -159,24 +158,24 @@ class ApiController {
     return { results };
   }
   @Get('admin/kitchen/devices') async listKitchenDevices(@Req() req: Request) {
-    const c = await context(req); if (!['OWNER', 'MANAGER'].includes(c.role)) throw new ForbiddenException('PERMISSION_DENIED');
+    const c = await context(req); if (!allowed(c.role, 'admin')) throw new ForbiddenException('PERMISSION_DENIED');
     const devices = await db.kitchenDevice.findMany({ where: { tenantId: c.tenantId, storeId: c.storeId }, include: { user: { select: { email: true } }, station: { select: { id: true, name: true } } }, orderBy: { lastSeenAt: 'desc' }, take: 200 });
     const ids = devices.map(device => device.id);
     const [stations, activity, sessions] = await Promise.all([
       db.station.findMany({ where: { tenantId: c.tenantId, storeId: c.storeId, deletedAt: null, active: true }, select: { id: true, name: true }, orderBy: { name: 'asc' } }),
       ids.length ? db.audit.findMany({ where: { tenantId: c.tenantId, storeId: c.storeId, entityId: { in: ids }, action: { startsWith: 'KITCHEN_DEVICE_' } }, orderBy: { createdAt: 'desc' }, take: 500, select: { id: true, entityId: true, action: true, createdAt: true, details: true } }) : Promise.resolve([]),
-      db.session.findMany({ where: { storeId: c.storeId, userId: { in: devices.map(device => device.userId) }, expiresAt: { gt: new Date() } }, orderBy: { expiresAt: 'desc' }, select: { userId: true, expiresAt: true } }),
+      db.session.findMany({ where: { tenantId: c.tenantId, storeId: c.storeId, userId: { in: devices.map(device => device.userId) }, expiresAt: { gt: new Date() } }, orderBy: { expiresAt: 'desc' }, select: { userId: true, expiresAt: true } }),
     ]);
     return { stations, devices: devices.map(device => ({ id: device.id, email: device.user.email, station: device.station, createdAt: device.createdAt, lastSeenAt: device.lastSeenAt, revokedAt: device.revokedAt, sessionExpiresAt: sessions.find(session => session.userId === device.userId)?.expiresAt ?? null, activity: activity.filter(event => event.entityId === device.id).slice(0, 20) })) };
   }
   @Get('admin/pilot-readiness') async pilotReadiness(@Req() req: Request) {
-    const c = await context(req); if (!['OWNER', 'MANAGER'].includes(c.role)) throw new ForbiddenException('PERMISSION_DENIED');
+    const c = await context(req); if (!allowed(c.role, 'admin')) throw new ForbiddenException('PERMISSION_DENIED');
     const store = await db.store.findFirstOrThrow({ where: { id: c.storeId, tenantId: c.tenantId }, select: { name: true, timezone: true, dayStart: true, qrOrderingEnabled: true } });
     const [employees, stations, activeProducts, productsWithRecipes, ingredients, openingBalances, registers, tables, devices] = await Promise.all([
       db.membership.count({ where: { tenantId: c.tenantId, storeId: c.storeId } }),
       db.station.count({ where: { tenantId: c.tenantId, storeId: c.storeId, active: true, deletedAt: null } }),
-      db.product.count({ where: { tenantId: c.tenantId, storeId: c.storeId, active: true, deletedAt: null } }),
-      db.product.count({ where: { tenantId: c.tenantId, storeId: c.storeId, active: true, deletedAt: null, recipe: { some: {} } } }),
+      db.product.count({ where: { tenantId: c.tenantId, storeId: c.storeId, active: true, deletedAt: null, station: { active: true, deletedAt: null }, OR: [{ categoryId: null }, { category: { active: true, deletedAt: null } }] } }),
+      db.product.count({ where: { tenantId: c.tenantId, storeId: c.storeId, active: true, deletedAt: null, station: { active: true, deletedAt: null }, OR: [{ categoryId: null }, { category: { active: true, deletedAt: null } }], recipe: { some: {} } } }),
       db.ingredient.count({ where: { tenantId: c.tenantId, storeId: c.storeId, active: true, deletedAt: null } }),
       db.balance.count({ where: { tenantId: c.tenantId, storeId: c.storeId, onHand: { gt: 0 } } }),
       db.cashRegister.count({ where: { tenantId: c.tenantId, storeId: c.storeId, active: true } }),
@@ -189,29 +188,33 @@ class ApiController {
   @Post('admin/invitations') async createInvitation(@Req() req: Request, @Body() body: unknown) { const c = await context(req); const invitation = parse(invitationCreateSchema, body); return pilotAdmin.createInvitation(c, invitation); }
   @Post('admin/invitations/:id/revoke') async revokeInvitation(@Req() req: Request, @Param('id') id: string) { return pilotAdmin.revokeInvitation(await context(req), uuid(id)); }
   @Put('admin/kitchen/devices/:id/assignment') async assignKitchenDevice(@Req() req: Request, @Param('id') id: string, @Body() body: unknown) {
-    const c = await context(req); if (!['OWNER', 'MANAGER'].includes(c.role)) throw new ForbiddenException('PERMISSION_DENIED');
+    const c = await context(req); if (!allowed(c.role, 'admin')) throw new ForbiddenException('PERMISSION_DENIED');
     const deviceId = uuid(id); const { stationId } = parse(kitchenDeviceAssignmentSchema, body);
-    if (stationId && !await db.station.findFirst({ where: { id: stationId, tenantId: c.tenantId, storeId: c.storeId, active: true, deletedAt: null }, select: { id: true } })) throw new BadRequestException('KITCHEN_STATION_NOT_AVAILABLE');
     return db.$transaction(async tx => {
-      const device = await tx.kitchenDevice.findFirst({ where: { id: deviceId, tenantId: c.tenantId, storeId: c.storeId, revokedAt: null } });
+      const current = await reauthorize(tx, c);
+      if (!allowed(current.role, 'admin')) throw new ForbiddenException('PERMISSION_DENIED');
+      if (stationId && !await tx.station.findFirst({ where: { id: stationId, tenantId: current.tenantId, storeId: current.storeId, active: true, deletedAt: null }, select: { id: true } })) throw new BadRequestException('KITCHEN_STATION_NOT_AVAILABLE');
+      const device = await tx.kitchenDevice.findFirst({ where: { id: deviceId, tenantId: current.tenantId, storeId: current.storeId, revokedAt: null } });
       if (!device) throw new NotFoundException('KITCHEN_DEVICE_NOT_FOUND_OR_REVOKED');
       const updated = await tx.kitchenDevice.update({ where: { id: deviceId }, data: { stationId } });
-      await tx.audit.create({ data: { tenantId: c.tenantId, storeId: c.storeId, actorId: c.userId, action: 'KITCHEN_DEVICE_ASSIGNED', entityId: deviceId, commandKey: `kitchen-device:assignment:${randomUUID()}`, correlationId: c.correlationId, details: { stationId } } });
+      await tx.audit.create({ data: { tenantId: current.tenantId, storeId: current.storeId, actorId: current.userId, action: 'KITCHEN_DEVICE_ASSIGNED', entityId: deviceId, commandKey: `kitchen-device:assignment:${randomUUID()}`, correlationId: current.correlationId, details: { stationId } } });
       return { id: updated.id, stationId: updated.stationId };
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
   }
   @Get('admin/kitchen/devices/:id/activity') async kitchenDeviceActivity(@Req() req: Request, @Param('id') id: string) {
-    const c = await context(req); if (!['OWNER', 'MANAGER'].includes(c.role)) throw new ForbiddenException('PERMISSION_DENIED');
+    const c = await context(req); if (!allowed(c.role, 'admin')) throw new ForbiddenException('PERMISSION_DENIED');
     const deviceId = uuid(id); if (!await db.kitchenDevice.findFirst({ where: { id: deviceId, tenantId: c.tenantId, storeId: c.storeId }, select: { id: true } })) throw new NotFoundException('KITCHEN_DEVICE_NOT_FOUND');
     return db.audit.findMany({ where: { tenantId: c.tenantId, storeId: c.storeId, entityId: deviceId, action: { startsWith: 'KITCHEN_DEVICE_' } }, orderBy: { createdAt: 'desc' }, take: 100, select: { action: true, createdAt: true, details: true } });
   }
   @Post('admin/kitchen/devices/:id/revoke') async revokeKitchenDevice(@Req() req: Request, @Param('id') id: string) {
-    const c = await context(req); if (!['OWNER', 'MANAGER'].includes(c.role)) throw new ForbiddenException('PERMISSION_DENIED');
+    const c = await context(req); if (!allowed(c.role, 'admin')) throw new ForbiddenException('PERMISSION_DENIED');
     const deviceId = uuid(id);
     await db.$transaction(async tx => {
-      const changed = await tx.kitchenDevice.updateMany({ where: { id: deviceId, tenantId: c.tenantId, storeId: c.storeId, revokedAt: null }, data: { revokedAt: new Date() } });
+      const current = await reauthorize(tx, c);
+      if (!allowed(current.role, 'admin')) throw new ForbiddenException('PERMISSION_DENIED');
+      const changed = await tx.kitchenDevice.updateMany({ where: { id: deviceId, tenantId: current.tenantId, storeId: current.storeId, revokedAt: null }, data: { revokedAt: new Date() } });
       if (changed.count !== 1) throw new ConflictException('KITCHEN_DEVICE_NOT_FOUND_OR_REVOKED');
-      await tx.audit.create({ data: { tenantId: c.tenantId, storeId: c.storeId, actorId: c.userId, action: 'KITCHEN_DEVICE_REVOKED', entityId: deviceId, commandKey: `kitchen-device:revoke:${randomUUID()}`, correlationId: c.correlationId } });
+      await tx.audit.create({ data: { tenantId: current.tenantId, storeId: current.storeId, actorId: current.userId, action: 'KITCHEN_DEVICE_REVOKED', entityId: deviceId, commandKey: `kitchen-device:revoke:${randomUUID()}`, correlationId: current.correlationId } });
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
     return { id, revoked: true };
   }
@@ -261,7 +264,19 @@ class ApiController {
   @Get('admin/tables/config') async qrConfig(@Req() req: Request) { const c = await context(req); if (!allowed(c.role, 'catalog')) throw new ForbiddenException('PERMISSION_DENIED'); return db.store.findFirstOrThrow({ where: { tenantId: c.tenantId, id: c.storeId }, select: { name: true, qrOrderingEnabled: true } }); }
   @Put('admin/tables/config') async setQrConfig(@Req() req: Request, @Body() body: unknown) { const input = parse(z.object({ enabled: z.boolean() }).strict(), body); return qrOrdering.setStoreEnabled(await context(req), key(req), input.enabled); }
   @Get('admin/tables') async tables(@Req() req: Request) { const c = await context(req); if (!allowed(c.role, 'catalog')) throw new ForbiddenException('PERMISSION_DENIED'); return qrOrdering.listTables(c); }
-  @Get('admin/tables/qr-code') async tableQrCode(@Req() req: Request, @Query('token') token: string | undefined, @Res() res: Response) { const c = await context(req); if (!allowed(c.role, 'catalog')) throw new ForbiddenException('PERMISSION_DENIED'); if (!token) throw new BadRequestException('QR_TOKEN_REQUIRED'); await db.restaurantTable.findFirstOrThrow({ where: { tenantId: c.tenantId, storeId: c.storeId, qrTokenHash: digest(token) } }); const svg = await QRCode.toString(`${process.env.WEB_ORIGIN ?? 'http://localhost:3000'}/order/${token}`, { type: 'svg', errorCorrectionLevel: 'M', margin: 2, width: 420 }); res.type('image/svg+xml').send(svg); }
+  @Get('admin/tables/qr-code') async tableQrCode(@Req() req: Request, @Query('token') token: string | undefined, @Res() res: Response) {
+    const c = await context(req); if (!allowed(c.role, 'catalog')) throw new ForbiddenException('PERMISSION_DENIED');
+    const resolvedToken = (req.get('X-QR-Token') ?? token)?.trim();
+    if (!resolvedToken) throw new BadRequestException('QR_TOKEN_REQUIRED');
+    if (!HEX64_RE.test(resolvedToken)) throw new BadRequestException('QR_TOKEN_INVALID');
+    const table = await db.restaurantTable.findFirst({ where: { tenantId: c.tenantId, storeId: c.storeId, qrTokenHash: digest(resolvedToken) }, select: { id: true } });
+    if (!table) throw new NotFoundException('TABLE_NOT_FOUND');
+    const svg = await QRCode.toString(`${process.env.WEB_ORIGIN ?? 'http://localhost:3000'}/order/${resolvedToken}`, { type: 'svg', errorCorrectionLevel: 'M', margin: 2, width: 420 });
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.type('image/svg+xml').send(svg);
+  }
   @Post('admin/tables') async createTable(@Req() req: Request, @Body() body: unknown) { const input = parse(z.object({ name: z.string().trim().min(1).max(80) }).strict(), body); return qrOrdering.createTable(await context(req), key(req), input.name); }
   @Put('admin/tables/:id') async updateTable(@Req() req: Request, @Param('id') id: string, @Body() body: unknown) { const input = parse(z.object({ name: z.string().trim().min(1).max(80), active: z.boolean(), qrEnabled: z.boolean(), expectedVersion: z.number().int().min(1) }).strict(), body); return qrOrdering.updateTable(await context(req), key(req), uuid(id), input.expectedVersion, input.name, input.active, input.qrEnabled); }
   @Post('admin/tables/:id/regenerate-qr') async regenerateQr(@Req() req: Request, @Param('id') id: string, @Body() body: unknown) { return qrOrdering.regenerate(await context(req), key(req), uuid(id), parse(versionSchema, body).expectedVersion); }
