@@ -118,7 +118,7 @@ Detailed architectural references:
 | **Runtime & Package Manager** | Node.js `>=22.14.0`, pnpm `12.4.1` (workspace monorepo) | [package.json](package.json), [pnpm-workspace.yaml](pnpm-workspace.yaml) |
 | **Language & Shared Contracts** | TypeScript `^5.9.0` (`strict`, `noUncheckedIndexedAccess`), Zod `^4.6.7` | [tsconfig.base.json](tsconfig.base.json), [packages/contracts/package.json](packages/contracts/package.json) |
 | **Frontend** | Next.js `16.4.2` (App Router, webpack build), React `^19.2.0`, `socket.io-client ^4.8.1` | [apps/web/package.json](apps/web/package.json) |
-| **Backend & Worker** | NestJS `12.2.0`, Express `^5.1.0`, Helmet `^8.1.0`, `express-rate-limit ^8.1.0`, `socket.io ^4.8.1`, `qrcode 1.5.4` | [apps/api/package.json](apps/api/package.json) |
+| **Backend & Worker** | NestJS `12.2.0`, Express `^5.1.0`, Helmet `^8.1.0`, `socket.io ^4.8.1`, `qrcode 1.5.4` | [apps/api/package.json](apps/api/package.json) |
 | **Database & ORM** | PostgreSQL `17-alpine` (Compose/CI) / optional `18`, Prisma `6.19.0`, `embedded-postgres 18.4.0-beta.17` | [docker-compose.yml](docker-compose.yml), [prisma/schema.prisma](prisma/schema.prisma) |
 | **Cache & Realtime Broker** | Redis `7-alpine`, `ioredis ^5.8.0` | [docker-compose.yml](docker-compose.yml), [apps/api/package.json](apps/api/package.json) |
 | **Testing & Quality** | Vitest `^4.1.12`, `@vitest/coverage-v8 4.1.12`, Playwright `^1.56.0`, ESLint `^10.13.0`, CodeQL `v4` | [package.json](package.json), [vitest.config.ts](vitest.config.ts), [playwright.config.ts](playwright.config.ts) |
@@ -150,8 +150,8 @@ OMNIHUB/
 │   └── Dockerfile               # Multi-stage API & web container builds
 ├── scripts/                     # Local embedded Postgres, CI E2E runner, security hygiene & staging drills
 ├── tests/
-│   ├── unit/                    # Pure domain, auth/commands, rate-limit & deployment-security tests (34)
-│   ├── integration/             # Real PostgreSQL transactional & isolation tests (27)
+│   ├── unit/                    # Pure domain, auth/commands, errors, realtime/outbox, rate-limit & deployment-security tests (50)
+│   ├── integration/             # Real PostgreSQL transactional, outbox, realtime, HTTP & isolation tests (32)
 │   ├── redis/                   # Redis Lua & multi-process API rate-limit tests (2)
 │   ├── e2e/                     # Playwright browser workflow tests (10)
 │   └── backup/                  # Disposable fake/stale archive test fixtures
@@ -238,8 +238,8 @@ OMNIHUB separates fast deterministic checks from database, Redis, browser, and D
 | Suite | Command | Cases | Dependencies & Scope |
 |---|---|---|---|
 | **Static Checks** | `pnpm typecheck`, `pnpm lint`, `pnpm build` | — | Strict TypeScript across packages, ESLint (no explicit `any`), production compilation. |
-| **Unit Tests & Coverage** | `pnpm test`, `pnpm test:coverage` | 34 tests (4 files) | Pure domain math/permissions, auth/command-receipt boundary logic, deployment security validator, mock rate-limit atomicity ([tests/unit/](tests/unit/domain.test.ts)), enforcing per-module V8 floors in [vitest.config.ts](vitest.config.ts). |
-| **PostgreSQL Integration** | `pnpm test:integration` | 27 tests (1 file) | Real migrated Postgres database: stock races, rollback, idempotency, splits, refunds, cash shifts, tenant isolation ([tests/integration/operations.test.ts](tests/integration/operations.test.ts)). |
+| **Unit Tests & Coverage** | `pnpm test`, `pnpm test:coverage` | 50 tests (6 files) | Pure domain math/permissions, auth/command-receipt boundary logic, error sanitization, outbox batch-budget/realtime batching, deployment security validator, mock rate-limit atomicity ([tests/unit/](tests/unit/domain.test.ts)), enforcing per-module V8 floors in [vitest.config.ts](vitest.config.ts). |
+| **PostgreSQL Integration** | `pnpm test:integration` | 32 tests (2 files) | Real migrated Postgres database: stock races, rollback, idempotency, splits, refunds, cash shifts, tenant isolation, concurrent `SKIP LOCKED` & bounded-budget outbox delivery, HTTP security headers/RBAC/errors, Socket.IO auth & catalog station filtering ([tests/integration/operations.test.ts](tests/integration/operations.test.ts), [tests/integration/m1-stabilization.test.ts](tests/integration/m1-stabilization.test.ts)). |
 | **Redis Integration** | `pnpm test:redis` | 2 tests (2 files) | Real Redis (`REDIS_URL`) + two spawned built API processes verifying atomic Lua limits across replicas ([tests/redis/](tests/redis/api-replicas.test.ts)). |
 | **Playwright E2E** | `pnpm test:e2e`, `pnpm test:e2e:ci` | 10 workflows (1 file) | Built `web` + `api` + `worker` + Postgres + Redis + Chromium: POS, cash shifts, two-browser Socket.IO reconnect, offline KDS conflict, QR mobile order, device revocation, auth/store-boundary & inventory ledger ([tests/e2e/workflow.spec.ts](tests/e2e/workflow.spec.ts)). |
 | **Security & Hygiene Scans** | `pnpm audit --prod --audit-level high`, `pnpm security:hygiene`, `sh -n` | Automated | Production dependency audit, tracked-file secret/path hygiene ([scripts/check-security-hygiene.ts](scripts/check-security-hygiene.ts)), POSIX shell syntax, CodeQL `v4` (`security-extended`), and PR `dependency-review` ([.github/workflows/security.yml](.github/workflows/security.yml)). |
@@ -252,17 +252,17 @@ OMNIHUB separates fast deterministic checks from database, Redis, browser, and D
 
 ## 11. Current Implementation Status
 
-### Latest Verified Automated Execution (`f9c8741` on `engineering/m02-quality-foundation`, 2026-11-14)
+### Latest Verified Automated Execution
 
-- **GitHub Actions CI (`checks` Run `#43585662222`):** **PASSED**
-  - `verify`: `pnpm install --frozen-lockfile`, `db:generate`, `db:migrate`, `contracts build`, `typecheck`, `lint`, `build`, `test:coverage:ci` (`34` unit + `27` PostgreSQL integration tests; V8 backend totals `Stmts 49.33% (897/1818)`, `Branches 51.66% (653/1264)`, `Funcs 49.51% (206/416)`, `Lines 58.3% (695/1192)` meeting both per-file and `ci`-scoped global thresholds), `pnpm test:redis` (`2/2`), and `backend-coverage` artifact upload (`118,603` bytes).
-  - `e2e`: `pnpm test:e2e:ci` against real built `api`, `worker`, `web`, Postgres 17, Redis 7, and headless Chromium — all `10/10` Playwright workflows **PASSED**.
-- **GitHub Actions Security (`security` Run `#43585662264`):** **PASSED** — `audit` (`pnpm audit --prod --audit-level high`: `No known vulnerabilities found`, `pnpm security:hygiene`, `sh -n` on tracked `.sh` scripts) and `codeql` (`github/codeql-action@v4`, `security-extended`); `dependency-review` is scoped to `pull_request` events (`skipped` on branch push).
-- **Local Host Verification (`engineering/m02-quality-foundation`):** `pnpm.cmd typecheck`, `pnpm.cmd lint`, `pnpm.cmd test:coverage` (`34/34` unit tests), `pnpm.cmd audit --prod --audit-level high`, `pnpm.cmd security:hygiene` (`142` tracked files, `0` violations), `@omnihub/contracts build`, and `@omnihub/api build` **PASSED**. Note: local Windows `@omnihub/web build` previously hit file ACL `EPERM` on untracked `.next` cache files while Linux CI `pnpm build` passes cleanly; full Docker/Playwright runs on `main` baseline `8aee7c0` + `8913a09` (`checks` Run `#43535373056`) remain preserved in history.
+- **Milestone 1 Verification (`fix/m1-backend-stabilization`, 2026-11-15):** On PR #3 commit `9a46416`, hosted Linux CI verified `46` unit tests, `31` PostgreSQL integration tests, and passed hosted Redis (`pnpm test:redis`: `2/2`) and Chromium Playwright E2E (`pnpm test:e2e:ci`: `10/10`) checks. Following the outbox transaction-deadline review fix, local Windows + `embedded-postgres` (PostgreSQL 18 on `127.0.0.1:5432`) verified `pnpm.cmd typecheck`, `pnpm.cmd lint`, `pnpm.cmd test` (**50/50** unit tests across 6 files), `pnpm.cmd test:integration` (**32/32** PostgreSQL tests across 2 files), `OMNIHUB_COVERAGE_SCOPE=ci pnpm.cmd test:coverage:ci` (**82/82** tests, V8 backend totals `Stmts 65.76%`, `Branches 62.02%`, `Funcs 58.29%`, `Lines 77.17%`), `pnpm.cmd security:hygiene`, `pnpm.cmd audit --prod --audit-level high`, and `pnpm.cmd build`. Local Redis integration (`pnpm test:redis`) and browser E2E (`pnpm test:e2e:ci`) remain **BLOCKED** locally on Windows (no Docker Desktop Engine / Redis 7); PR CI will re-run them on push.
+- **Milestone 0.2 Hosted CI Baseline (`6e55093` on `main`, PR #2 from `f9c8741`, 2026-11-14):**
+  - `verify` (Run `#43585662222`): Postgres 17 + Redis 7 services passed `pnpm install --frozen-lockfile`, `db:generate`, `db:migrate`, `contracts build`, `typecheck`, `lint`, `build`, `test:coverage:ci` (`34` unit + `27` PG integration tests), `pnpm test:redis` (`2/2`), and `backend-coverage` artifact upload.
+  - `e2e` (Run `#43585662222`): `pnpm test:e2e:ci` against real built `api`, `worker`, `web`, Postgres 17, Redis 7, and headless Chromium — all `10/10` Playwright workflows **PASSED**.
+  - **GitHub Actions Security (`security` Run `#43585662264`):** **PASSED** — `audit` (`pnpm audit --prod --audit-level high`, `pnpm security:hygiene`, `sh -n`) and `codeql` (`github/codeql-action@v4`, `security-extended`); `dependency-review` ran as `pull_request`-scoped gate on PR #2.
 
 | Area | Classification | Current Evidence / Gap |
 |---|---|---|
-| CI/CD (`verify` + `e2e` + `security`) | **VERIFIED** | Green on `engineering/m02-quality-foundation` (`f9c8741`); pending PR review/merge to `main`. |
+| CI/CD & M1 Stabilization Verification | **PARTIALLY VERIFIED** | Hosted CI on PR #3 (`9a46416`) verified `46` unit, `31` PG integration, `2` Redis, and `10` Playwright E2E checks; post-review outbox deadline fix passed `50/50` unit + `32/32` PG integration (`82/82` total) and full build locally on Windows, awaiting PR CI re-run after push for Linux Redis/E2E. |
 | PR Dependency Review Gate | **PARTIALLY VERIFIED** | Configured on `pull_request` in [.github/workflows/security.yml](.github/workflows/security.yml); `skipped` on branch push until PR execution. |
 | Off-Machine DR & 900s RPO Gate | **BLOCKED / FAILED** | Latest host outage drills measured `35,797 s` / `212,374 s` RPO age; off-machine Restic storage and alert endpoints remain unprovisioned. |
 | Physical Device & Operator UAT | **UNVERIFIED** | Hardware, LAN/TLS cutover, and restaurant staff UAT ([docs/PILOT_UAT.md](docs/PILOT_UAT.md)) have not been executed. |

@@ -11,9 +11,10 @@ export function verifyPassword(password: string, encoded: string): boolean {
   return timingSafeEqual(Buffer.from(hash, 'hex'), scryptSync(password, salt, 64, { N: 16384, r: 8, p: 1 }));
 }
 export const digest = (value: string): string => createHash('sha256').update(value).digest('hex');
-export type Permission = 'read' | 'pos' | 'kitchen' | 'handoff' | 'cancelPending' | 'cancelStarted' | 'cash' | 'cashShift' | 'cashApprove' | 'inventory' | 'report' | 'catalog';
+export type Permission = 'read' | 'pos' | 'kitchen' | 'handoff' | 'cancelPending' | 'cancelStarted' | 'cash' | 'cashShift' | 'cashApprove' | 'inventory' | 'report' | 'catalog' | 'admin';
 const policy: Record<Permission, readonly Role[]> = {
   catalog: ['OWNER', 'MANAGER'],
+  admin: ['OWNER', 'MANAGER'],
   read: ['OWNER', 'MANAGER', 'CASHIER', 'KITCHEN', 'INVENTORY'],
   pos: ['OWNER', 'MANAGER', 'CASHIER'], kitchen: ['OWNER', 'MANAGER', 'KITCHEN'],
   handoff: ['OWNER', 'MANAGER', 'CASHIER', 'KITCHEN'], cancelPending: ['OWNER', 'MANAGER', 'CASHIER'],

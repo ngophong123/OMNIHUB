@@ -76,7 +76,7 @@ export class QrOrdering extends CommandBus {
   async publicMenu(raw: string) {
     const table = await this.resolveQr(raw);
     const context = { tenantId: table.tenantId, storeId: table.storeId, userId: table.id, role: 'CASHIER' as const, tokenHash: '', expiresAt: new Date(0), correlationId: '' };
-    const products = await this.db.product.findMany({ where: { ...scope(context), active: true, deletedAt: null, OR: [{ categoryId: null }, { category: { active: true, deletedAt: null } }] }, include: { category: { select: { id: true, name: true } }, recipe: true, variants: { where: { active: true, deletedAt: null } }, modifierGroups: { where: { active: true, deletedAt: null }, include: { options: { where: { active: true, deletedAt: null }, include: { recipe: true } } } } }, orderBy: [{ category: { name: 'asc' } }, { name: 'asc' }] });
+    const products = await this.db.product.findMany({ where: { ...scope(context), active: true, deletedAt: null, station: { active: true, deletedAt: null }, OR: [{ categoryId: null }, { category: { active: true, deletedAt: null } }] }, include: { category: { select: { id: true, name: true } }, recipe: true, variants: { where: { active: true, deletedAt: null } }, modifierGroups: { where: { active: true, deletedAt: null }, include: { options: { where: { active: true, deletedAt: null }, include: { recipe: true } } } } }, orderBy: [{ category: { name: 'asc' } }, { name: 'asc' }] });
     const base = await this.catalog.availability(context, products.map(p => ({ id: p.id, recipe: p.recipe })));
     const selectedRecipes = products.flatMap(p => [
       ...p.variants.map(v => ({ id: v.id, recipe: p.recipe.map(r => ({ ingredientId: r.ingredientId, quantity: r.quantity.mul(v.recipeMultiplier) })) })),

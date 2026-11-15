@@ -1,5 +1,16 @@
 # Testing strategy
 
+## Milestone 1 — Backend Stabilization, Realtime/Outbox & Security Hardening — 2026-11-15
+
+Verified on branch `fix/m1-backend-stabilization` across hosted PR #3 CI (prior commit `9a46416`) and the post-review local Windows `embedded-postgres` run (PostgreSQL 18 on `127.0.0.1:5432`, **Pilot remains NO-GO**):
+
+| Check | Status | Current result |
+|---|---|---|
+| Static checks & supply-chain (`typecheck`, `lint`, `security:hygiene`, `audit`, `build`) | VERIFIED | Passed cleanly after outbox batch-budget hardening, unused `express-rate-limit` removal, and explicit Helmet/CORS/error/realtime security controls; full monorepo `pnpm.cmd build` (`@omnihub/contracts`, `@omnihub/api`, `@omnihub/web`) succeeded. |
+| Unit & CI-scoped V8 coverage (`pnpm.cmd test`, `OMNIHUB_COVERAGE_SCOPE=ci pnpm.cmd test:coverage:ci`) | VERIFIED | Current local run: `50/50` unit tests across 6 files (including outbox batch-budget / tx-deadline regressions) + `32/32` real PostgreSQL integration tests across 2 files (`82/82` total; V8 backend totals `Stmts 65.76%`, `Branches 62.02%`, `Funcs 58.29%`, `Lines 77.17%`). Earlier PR #3 baseline commit `9a46416` verified `46` unit and `31` PG integration tests. |
+| PostgreSQL M1 regression suite (`pnpm.cmd test:integration`) | VERIFIED | `tests/integration/operations.test.ts` (`27/27`) + `tests/integration/m1-stabilization.test.ts` (`5/5`) proved concurrent `FOR UPDATE SKIP LOCKED` outbox batching without duplicates, bounded batch-budget commit before tx expiration under slow Redis responses, partial commit recovery on mid-batch publish failures, poison-event quarantine isolation, HTTP security headers/CSRF Origin gate, sanitized error envelopes, consolidated admin RBAC + transactional `reauthorize`, `X-QR-Token` SVG hardening, Kitchen Device ownership lock, Socket.IO Origin/auth handshake + batched `O(1)` DB queries, and inactive/archived station/category exclusion across `GET /catalog`, `publicMenu`, and `pilotReadiness`. |
+| Hosted CI Redis & browser E2E (`pnpm test:redis`, `pnpm test:e2e:ci`) | VERIFIED ON PR #3 (`9a46416`) / BLOCKED LOCALLY | Hosted Linux GitHub Actions CI on PR #3 commit `9a46416` passed all applicable checks including `46` unit tests, `31` PG integration tests, hosted Redis (`pnpm test:redis`: `2/2`), and Chromium Playwright E2E (`pnpm test:e2e:ci`: `10/10`). Local Windows Redis/E2E remain **BLOCKED** (no Docker Desktop Engine / local Redis `127.0.0.1:6379`); the post-`9a46416` outbox fix awaits PR CI re-run after manual push. |
+
 ## Milestone 0.2 CI/CD, E2E, Coverage & Security Gate Verification — 2026-11-14
 
 Verified on branch `engineering/m02-quality-foundation` (`f9c8741`, **Pilot remains NO-GO**):
