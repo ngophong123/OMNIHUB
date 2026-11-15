@@ -1,5 +1,16 @@
 # Testing strategy
 
+## Milestone 1 — Backend Stabilization, Realtime/Outbox & Security Hardening — 2026-11-15
+
+Verified locally on branch `fix/m1-backend-stabilization` against clean clone `OMNIHUB-m1` and `embedded-postgres` (PostgreSQL 18 on `127.0.0.1:5432`, **Pilot remains NO-GO**):
+
+| Check | Status | Current result |
+|---|---|---|
+| Static checks & supply-chain (`install --frozen-lockfile`, `contracts build`, `typecheck`, `lint`, `security:hygiene`, `audit`, `build`) | VERIFIED | Passed cleanly after removing unused `express-rate-limit` dependency and adding explicit Helmet/CORS/error/outbox/realtime hardening; full monorepo `pnpm.cmd build` (`@omnihub/contracts`, `@omnihub/api`, `@omnihub/web`) succeeded. |
+| Unit & CI-scoped V8 coverage (`pnpm.cmd test`, `OMNIHUB_COVERAGE_SCOPE=ci pnpm.cmd test:coverage:ci`) | VERIFIED | `46/46` unit tests across 6 files (including new `errors-and-security.test.ts` and `realtime-and-outbox.test.ts`) + `31/31` real PostgreSQL integration tests across 2 files (`77/77` total; V8 backend totals `Stmts 64.97%`, `Branches 61.26%`, `Funcs 57.67%`, `Lines 76.36%`). |
+| PostgreSQL M1 regression suite (`pnpm.cmd test:integration`) | VERIFIED | `tests/integration/operations.test.ts` (`27/27`) + `tests/integration/m1-stabilization.test.ts` (`4/4`) proved concurrent `FOR UPDATE SKIP LOCKED` outbox batching without duplicates, partial commit recovery on mid-batch publish failures, poison-event quarantine isolation, HTTP security headers/CSRF Origin gate, sanitized error envelopes, consolidated admin RBAC + transactional `reauthorize`, `X-QR-Token` SVG hardening, Kitchen Device ownership lock, Socket.IO Origin/auth handshake + batched `O(1)` DB queries, and inactive/archived station/category exclusion across `GET /catalog`, `publicMenu`, and `pilotReadiness`. |
+| Local Redis & browser E2E (`pnpm test:redis`, `pnpm test:e2e:ci`) | BLOCKED (Local Windows) | Docker Desktop Engine (`com.docker.service` Stopped, named pipe absent) and local Redis (`127.0.0.1:6379`) are unavailable on this Windows host; hosted Linux CI re-execution will verify both on push/PR. |
+
 ## Milestone 0.2 CI/CD, E2E, Coverage & Security Gate Verification — 2026-11-14
 
 Verified on branch `engineering/m02-quality-foundation` (`f9c8741`, **Pilot remains NO-GO**):

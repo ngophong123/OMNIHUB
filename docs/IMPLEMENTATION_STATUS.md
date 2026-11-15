@@ -1,5 +1,19 @@
 # Implementation status
 
+## Milestone 1 — Backend Stabilization, Realtime/Outbox Hardening & Security (2026-11-15)
+
+**Pilot NO-GO.** Milestone 1 resolved backend stability, exception sanitization, transactional outbox concurrency/retry isolation, Socket.IO N+1 query scaling & room enforcement, RBAC/reauthorization consistency, HTTP/QR header hardening, and inactive-station/category catalog filtering on branch `fix/m1-backend-stabilization` without modifying frontend UI or adding unapproved schema migrations.
+
+| Workstream / Gate | Status | Evidence & Scope Boundary |
+|---|---|---|
+| Global error sanitization & structured logging (`apps/api/src/errors.ts`) | VERIFIED | Maps Prisma (`P2025 -> 404`, `P2002/P2034 -> 409`, input codes `-> 400`, `P10*/P2024` & init errors `-> 503`), HTTP 4xx/503 operational codes, 404 `ROUTE_NOT_FOUND`, JSON parser errors, and unexpected `500 INTERNAL_SERVER_ERROR` without leaking stacks, queries, or capability tokens. |
+| Outbox concurrency & fault isolation (`apps/api/src/outbox.ts`, `worker.ts`) | VERIFIED | Concurrent workers use `FOR UPDATE SKIP LOCKED`; invalid events quarantine cleanly (`MAX_QUARANTINE_IDS = 1000`); partial batches commit already-published rows before transient errors; worker uses bounded exponential jittered backoff and clean shutdown (`stop`). |
+| Socket.IO room/device authorization & batched queries (`apps/api/src/realtime.ts`) | VERIFIED | Safe URI cookie decoding, strict tracking/session/device handshakes, server-room drift disconnects, `O(1)` batched PostgreSQL lookups during broadcast & 30s revalidation (`<= 4` queries verified under PG query counter), and bounded Redis subscriber teardown. |
+| Security headers, RBAC, reauth & QR hardening (`http-app.ts`, `http.ts`, `domain.ts`, `pilot-admin.ts`, `cash-shifts.ts`) | VERIFIED | Explicit Helmet CSP/COOP/frameguard/referrer policies, `nosniff`, `Permissions-Policy`, `Cache-Control: no-store`, `httpOnly` logout clearing, unified `admin` RBAC + in-transaction `reauthorize`, `X-QR-Token` header SVG support, `Serializable` kitchen device registration ownership, unused `express-rate-limit` removed. |
+| Inactive-station & category filtering (`http.ts`, `qr-ordering.ts`) | VERIFIED | `GET /catalog`, `QrOrdering.publicMenu`, and `GET /admin/pilot-readiness` consistently exclude products tied to inactive/deleted stations or categories. |
+| Migration-free deferred schema notes | DOCUMENTED | **No unapproved migrations executed in M1:** (1) `Movement(tenantId, storeId, createdAt)` composite index gap noted for future store inventory ledger queries (`GET /inventory/movements`); (2) persistent `Outbox` dead-letter/attempt columns deferred beyond M1's bounded in-memory quarantine. |
+| Local verification vs hosted CI coverage | PARTIALLY VERIFIED | Local Windows `embedded-postgres` run verified `46/46` unit + `31/31` PG integration tests (`V8: Stmts 64.97%, Branches 61.26%, Funcs 57.67%, Lines 76.36%`), `typecheck`, `lint`, `security:hygiene`, `audit`, and `build`; `pnpm test:redis` and `pnpm test:e2e:ci` are **BLOCKED** locally (no Docker/Redis) pending PR execution in hosted CI. |
+
 ## Milestone 0.2 — CI/CD, E2E, Coverage & Security Foundation (2026-11-14)
 
 **Pilot NO-GO.** Engineering quality automation, full-stack CI execution, V8 coverage gates, and CI security controls are verified on branch `engineering/m02-quality-foundation` (`f9c8741`, pending PR merge to `main`), while operational DR, offsite storage/monitoring, RPO compliance, and physical pilot UAT remain open blockers.
