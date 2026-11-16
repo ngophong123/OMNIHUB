@@ -1,9 +1,9 @@
 # OMNIHUB – MILESTONE 2: BACKEND ARCHITECTURE & RELIABILITY AUDIT
 
-**Workspace:** `D:\duannuoiem\CV offline\OMNIHUB-m1`  
-**Branch / Baseline HEAD:** `main` @ `e79ad6fa12d0a597067b5eaa6b0a8eed60ab24b7` (post PR #3 / M1 merge)  
-**Vai trò đánh giá:** Senior Backend Architect / Staff Software Engineer / Reliability Engineer  
-**Phương pháp:** Đọc trực tiếp source code `apps/api/src/*`, `packages/contracts/src/*`, `prisma/schema.prisma`, `prisma/migrations/*`, `deploy/*`, `.github/workflows/*`, `vitest.config.ts`, `package.json`, và thống kê/kiểm tra test suites trong `tests/*`. Không chỉnh sửa code, không suy đoán ngoài dữ liệu đã kiểm chứng.
+- **Workspace:** `D:\duannuoiem\CV offline\OMNIHUB-m1`
+- **Branch / Baseline HEAD:** `main` @ `e79ad6fa12d0a597067b5eaa6b0a8eed60ab24b7` (post PR #3 / M1 merge)
+- **Vai trò đánh giá:** Senior Backend Architect / Staff Software Engineer / Reliability Engineer
+- **Phương pháp:** Đọc trực tiếp source code `apps/api/src/*`, `packages/contracts/src/*`, `prisma/schema.prisma`, `prisma/migrations/*`, `deploy/*`, `.github/workflows/*`, `vitest.config.ts`, `package.json`, và thống kê/kiểm tra test suites trong `tests/*`. Không chỉnh sửa code, không suy đoán ngoài dữ liệu đã kiểm chứng.
 
 ---
 

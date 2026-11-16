@@ -1,9 +1,9 @@
 # OMNIHUB – MILESTONE 2: BACKEND IMPLEMENTATION PLAN
 
-**Workspace:** `D:\duannuoiem\CV offline\OMNIHUB-m1`  
-**Baseline HEAD:** `e79ad6fa12d0a597067b5eaa6b0a8eed60ab24b7` (`main`)  
-**Căn cứ:** [`docs/M2_BACKEND_AUDIT.md`](M2_BACKEND_AUDIT.md)  
-**Nguyên tắc triển khai:** Chia nhỏ thành từng PR/commit độc lập, backward-compatible trong giai đoạn chuyển tiếp với frontend M1, giữ nguyên 100% PostgreSQL ledger/financial invariants đã có, kiểm thử bằng real PostgreSQL + Redis trong CI.
+- **Workspace:** `D:\duannuoiem\CV offline\OMNIHUB-m1`
+- **Baseline HEAD:** `e79ad6fa12d0a597067b5eaa6b0a8eed60ab24b7` (`main`)
+- **Căn cứ:** [`docs/M2_BACKEND_AUDIT.md`](M2_BACKEND_AUDIT.md)
+- **Nguyên tắc triển khai:** Chia nhỏ thành từng PR/commit độc lập, backward-compatible trong giai đoạn chuyển tiếp với frontend M1, giữ nguyên 100% PostgreSQL ledger/financial invariants đã có, kiểm thử bằng real PostgreSQL + Redis trong CI.
 
 ---
 
