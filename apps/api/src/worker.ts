@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
+import rateLimit from 'express-rate-limit';
 import type { Server } from 'node:http';
 import Redis from 'ioredis';
 import { db } from './database';
@@ -7,20 +8,42 @@ import { validateDeployment } from './deployment-security';
 import { createOutboxWorkerLoop } from './outbox';
 import { workerLogger } from './observability/logger';
 import { workerMetrics } from './observability/metrics';
-import { createMetricsRequestHandler } from './observability/metrics-endpoint';
+import {
+  BoundedMemoryRateLimitStore,
+  buildMetricsRateLimitOptions,
+  createMetricsRequestHandler,
+  resolveMetricsRateLimitConfig,
+} from './observability/metrics-endpoint';
 
 validateDeployment();
 
 let metricsServer: Server | undefined;
+let metricsRateLimitStore: BoundedMemoryRateLimitStore | undefined;
 const metricsPortRaw = process.env.WORKER_METRICS_PORT;
 if (metricsPortRaw) {
   const metricsPort = Number(metricsPortRaw);
   if (!Number.isInteger(metricsPort) || metricsPort < 1 || metricsPort > 65535) {
     throw new Error('WORKER_METRICS_PORT must be an integer between 1 and 65535');
   }
+  const rateLimitConfig = resolveMetricsRateLimitConfig();
+  metricsRateLimitStore = new BoundedMemoryRateLimitStore({
+    windowMs: rateLimitConfig.windowMs,
+    maxEntries: rateLimitConfig.maxEntries,
+  });
   const metricsApp = express();
   metricsApp.disable('x-powered-by');
-  metricsApp.get('/metrics', createMetricsRequestHandler({ metrics: workerMetrics, backlogDb: db }));
+  metricsApp.get(
+    '/metrics',
+    rateLimit(
+      buildMetricsRateLimitOptions({
+        store: metricsRateLimitStore,
+        windowMs: rateLimitConfig.windowMs,
+        limit: rateLimitConfig.limit,
+        logger: workerLogger,
+      }),
+    ),
+    createMetricsRequestHandler({ metrics: workerMetrics, backlogDb: db, logger: workerLogger }),
+  );
   metricsServer = metricsApp.listen(metricsPort, process.env.WORKER_METRICS_HOST ?? '127.0.0.1');
 }
 
@@ -64,6 +87,7 @@ async function shutdown(): Promise<void> {
     });
     process.exitCode = 1;
   } finally {
+    metricsRateLimitStore?.shutdown();
     workerMetrics.close();
     await workerLogger.close();
   }
@@ -80,6 +104,7 @@ void loop.run().catch(async (err: unknown) => {
     component: 'outbox-worker',
     errorType: err instanceof Error ? err.name : typeof err,
   });
+  metricsRateLimitStore?.shutdown();
   workerMetrics.close();
   await workerLogger.close();
   process.exitCode = 1;

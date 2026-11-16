@@ -62,8 +62,9 @@ All metrics enforce strictly bounded finite label sets (`service="omnihub-api"` 
 ## 4. Cardinality & Security Controls
 
 1. **Bounded Route Normalization (`normalizeHttpRouteLabel`):** Matched NestJS controllers emit `req.route.path` templates (e.g. `/orders/:id/payments`). Pre-route failures and arbitrary `404` scanner URLs normalize only against finite static API prefixes and collapse everything else to `"unmatched"`, preventing attacker-induced memory exhaustion.
-2. **Double Defense on `/metrics`:**
+2. **Defense-in-Depth on `/metrics`:**
    - **Edge proxy ([deploy/Caddyfile](../deploy/Caddyfile)):** Immediately returns `403` for `/metrics*` before forwarding external traffic.
+   - **In-process rate limiter (`buildMetricsRateLimitOptions` / `BoundedMemoryRateLimitStore`):** Mounted inline via `express-rate-limit` ahead of `createMetricsRequestHandler` on both API `GET /metrics` (`http-app.ts`) and Worker `GET /metrics` (`worker.ts`). Uses fixed-window O(1) LRU storage bounded to `METRICS_RATE_LIMIT_MAX_ENTRIES` (default `1024`, zero background `setInterval` timers, torn down on shutdown), keys on a SHA-256 digest of the direct socket peer IP (`req.socket.remoteAddress`, ignoring `X-Forwarded-For`, normalizing `/64` IPv6 prefixes), defaults to `120` req / `60_000 ms`, returns `429 RATE_LIMITED` with `Retry-After` and logs `METRICS_RATE_LIMITED` without storing raw client IPs, and stays Redis-independent so Prometheus continues scraping during Redis outages.
    - **API / Worker handler (`createMetricsRequestHandler`):** When `METRICS_AUTH_TOKEN` is set, requires exact `Authorization: Bearer <token>` compared via `timingSafeEqual` on SHA-256 digests (`403 METRICS_ACCESS_DENIED` otherwise). When `METRICS_AUTH_TOKEN` is unset, allows **only direct unproxied loopback** (`127.0.0.1` / `::1` with no `X-Forwarded-For`, `Forwarded`, or `X-Real-IP` headers) and logs denied access attempts via `apiLogger.security('warn', 'METRICS_ACCESS_DENIED', ...)`.
 
 ---

@@ -12,7 +12,14 @@ import {
   normalizeHttpMethod,
   normalizeHttpRouteLabel,
 } from '../../apps/api/src/observability/metrics';
-import { createMetricsRequestHandler, isLoopbackAddress } from '../../apps/api/src/observability/metrics-endpoint';
+import {
+  BoundedMemoryRateLimitStore,
+  createMetricsRateLimiter,
+  createMetricsRequestHandler,
+  isLoopbackAddress,
+  metricsRateLimitKey,
+  resolveMetricsRateLimitConfig,
+} from '../../apps/api/src/observability/metrics-endpoint';
 import { createOutboxWorkerLoop, processOutboxBatch } from '../../apps/api/src/outbox';
 import { createRedisRateLimiter } from '../../apps/api/src/rate-limit';
 
@@ -462,5 +469,170 @@ describe('prometheus metrics architecture (M2-T02)', () => {
     expect(errRes.status).toBe(500);
     expect(errRes.body).toMatchObject({ code: 'METRICS_UNAVAILABLE' });
     metrics.close();
+  });
+
+  it('rate-limits /metrics with HTTP 429, Retry-After, X-Forwarded-For bypass immunity, IPv4/IPv6 keys, and bounded LRU cleanup', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let nowMs = Date.now();
+    const store = new BoundedMemoryRateLimitStore({ windowMs: 60_000, maxEntries: 3, now: () => nowMs });
+    const metrics = createMetricsRegistry({ service: 'omnihub-worker', collectDefaultMetrics: false });
+    const token = 'worker-scrape-secret-token-32-chars';
+    const limiter = createMetricsRateLimiter({ store, windowMs: 60_000, limit: 3 });
+    const handler = createMetricsRequestHandler({ metrics, authToken: token });
+
+    const runPipeline = async (opts: { remoteAddress: string; headers?: Record<string, string> }) => {
+      const resHeaders: Record<string, string> = {};
+      let status = 200;
+      let body: unknown;
+      const req = {
+        method: 'GET',
+        ip: opts.remoteAddress,
+        socket: { remoteAddress: opts.remoteAddress },
+        headers: opts.headers ?? {},
+        get: (name: string) => opts.headers?.[name.toLowerCase()],
+      };
+      const res = {
+        headersSent: false,
+        getHeader: (k: string) => resHeaders[k.toLowerCase()],
+        setHeader: (k: string, v: string | number) => {
+          resHeaders[k.toLowerCase()] = String(v);
+          return res;
+        },
+        set: (k: string, v: string | number) => {
+          resHeaders[k.toLowerCase()] = String(v);
+          return res;
+        },
+        status: (code: number) => {
+          status = code;
+          return res;
+        },
+        json: (payload: unknown) => {
+          res.headersSent = true;
+          body = payload;
+          return res;
+        },
+        send: (payload: unknown) => {
+          res.headersSent = true;
+          body = payload;
+          return res;
+        },
+      };
+
+      let passedLimiter = false;
+      await new Promise<void>(resolve => {
+        void limiter(req as never, res as never, () => {
+          passedLimiter = true;
+          resolve();
+        });
+        setImmediate(() => {
+          if (res.headersSent && !passedLimiter) resolve();
+        });
+      });
+
+      if (passedLimiter) {
+        await handler(req as never, res as never, vi.fn());
+      }
+      return { status, headers: resHeaders, body };
+    };
+
+    // 1. Valid scrapes within limit succeed (200) and keep Prometheus exposition intact
+    const authHeaders = { authorization: `Bearer ${token}` };
+    const r1 = await runPipeline({ remoteAddress: '127.0.0.1', headers: authHeaders });
+    const r2 = await runPipeline({ remoteAddress: '127.0.0.1', headers: authHeaders });
+    expect(r1.status).toBe(200);
+    expect(r2.status).toBe(200);
+    expect(r2.headers['content-type']).toContain('text/plain');
+    expect(String(r2.body)).toContain('# TYPE outbox_worker_health gauge');
+
+    // 2. Spoofing X-Forwarded-For / Forwarded / X-Real-IP does NOT change bucket or bypass 429
+    const r3 = await runPipeline({
+      remoteAddress: '::ffff:127.0.0.1',
+      headers: { ...authHeaders, 'x-forwarded-for': '198.51.100.77', forwarded: 'for=198.51.100.88' },
+    });
+    expect(r3.status).toBe(200);
+    const r4 = await runPipeline({
+      remoteAddress: '127.0.0.1',
+      headers: { ...authHeaders, 'x-forwarded-for': '203.0.113.99' },
+    });
+    expect(r4.status).toBe(429);
+    expect(r4.body).toEqual({ code: 'RATE_LIMITED' });
+    expect(Number(r4.headers['retry-after'])).toBeGreaterThanOrEqual(1);
+    expect(Number(r4.headers['retry-after'])).toBeLessThanOrEqual(60);
+
+    // 3. Independent client IP still goes to auth check (unauthenticated 403) before exceeding its own quota
+    const unauthOtherIp = await runPipeline({ remoteAddress: '10.0.0.99' });
+    expect(unauthOtherIp.status).toBe(403);
+    expect(unauthOtherIp.body).toEqual({ code: 'METRICS_ACCESS_DENIED' });
+
+    // 4. Concurrent burst from an independent IPv6 client respects quota cleanly
+    const ipv6Results = await Promise.all([
+      runPipeline({ remoteAddress: '2001:db8:1:2::10', headers: authHeaders }),
+      runPipeline({ remoteAddress: '2001:db8:1:2::20', headers: authHeaders }),
+      runPipeline({ remoteAddress: '2001:db8:1:2::30', headers: authHeaders }),
+      runPipeline({ remoteAddress: '2001:db8:1:2::40', headers: authHeaders }),
+    ]);
+    expect(ipv6Results.filter(r => r.status === 200)).toHaveLength(3);
+    expect(ipv6Results.filter(r => r.status === 429)).toHaveLength(1);
+
+    // 5. IPv6 /64 normalization shares bucket across hosts in same /64, separates distinct /64s, and hashes IP
+    expect(metricsRateLimitKey({ ip: '2001:db8:1:2::1', socket: { remoteAddress: '2001:db8:1:2::1' } } as never))
+      .toBe(metricsRateLimitKey({ ip: '2001:db8:1:2::beef', socket: { remoteAddress: '2001:db8:1:2::beef' } } as never));
+    expect(metricsRateLimitKey({ ip: '2001:db8:1:2::1', socket: { remoteAddress: '2001:db8:1:2::1' } } as never))
+      .not.toBe(metricsRateLimitKey({ ip: '2001:db8:1:3::1', socket: { remoteAddress: '2001:db8:1:3::1' } } as never));
+    expect(metricsRateLimitKey({ ip: '::ffff:127.0.0.1', socket: { remoteAddress: '::ffff:127.0.0.1' } } as never))
+      .toBe(metricsRateLimitKey({ ip: '127.0.0.1', socket: { remoteAddress: '127.0.0.1' } } as never));
+
+    // 6. Memory store strictly respects maxEntries=3 across many distinct clients & evicts expired keys
+    for (let i = 0; i < 20; i++) {
+      store.increment(`flood-client-${i}`);
+    }
+    expect(store.size).toBe(3);
+    nowMs += 65_000;
+    expect(store.get('flood-client-19')).toBeUndefined();
+
+    // 7. Logs contain zero raw IPs or auth tokens
+    const loggedLines = warnSpy.mock.calls.map(c => String(c[0])).join('\n');
+    expect(loggedLines).toContain('METRICS_RATE_LIMITED');
+    expect(loggedLines).not.toContain('127.0.0.1');
+    expect(loggedLines).not.toContain('2001:db8');
+    expect(loggedLines).not.toContain('198.51.100.77');
+    expect(loggedLines).not.toContain(token);
+
+    // 8. Shutdown clears all store entries cleanly and defaults remain suitable for Prometheus scrapes
+    store.shutdown();
+    expect(store.size).toBe(0);
+    metrics.close();
+
+    const defaults = resolveMetricsRateLimitConfig({});
+    expect(defaults).toEqual({ windowMs: 60_000, limit: 120, maxEntries: 1024 });
+
+    // 9. Sustained Prometheus scrapes (20 sequential scrapes) under default 120/min quota succeed 100%
+    const promStore = new BoundedMemoryRateLimitStore();
+    const promMetrics = createMetricsRegistry({ service: 'omnihub-worker', collectDefaultMetrics: false });
+    const promLimiter = createMetricsRateLimiter({ store: promStore });
+    const promHandler = createMetricsRequestHandler({ metrics: promMetrics });
+    for (let s = 0; s < 20; s++) {
+      let scrapeStatus = 0;
+      await new Promise<void>(resolve => {
+        const res = {
+          getHeader: vi.fn().mockReturnValue(undefined),
+          setHeader: vi.fn().mockReturnThis(),
+          set: vi.fn().mockReturnThis(),
+          status: (c: number) => {
+            scrapeStatus = c;
+            return res;
+          },
+          json: vi.fn().mockReturnThis(),
+          send: vi.fn().mockReturnThis(),
+        };
+        const req = { method: 'GET', ip: '127.0.0.1', socket: { remoteAddress: '127.0.0.1' }, get: () => undefined };
+        void promLimiter(req as never, res as never, () => {
+          void Promise.resolve(promHandler(req as never, res as never, vi.fn())).then(() => resolve());
+        });
+      });
+      expect(scrapeStatus).toBe(200);
+    }
+    promStore.shutdown();
+    promMetrics.close();
   });
 });

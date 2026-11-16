@@ -1,13 +1,19 @@
 import type { INestApplication } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import cookieParser from 'cookie-parser';
+import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
 import { db } from './database';
 import { AppModule } from './http';
 import { Errors } from './errors';
 import { createHttpSecurityLoggingMiddleware } from './observability/http-middleware';
 import { apiMetrics } from './observability/metrics';
-import { createMetricsRequestHandler } from './observability/metrics-endpoint';
+import {
+  BoundedMemoryRateLimitStore,
+  buildMetricsRateLimitOptions,
+  createMetricsRequestHandler,
+  resolveMetricsRateLimitConfig,
+} from './observability/metrics-endpoint';
 
 export type HttpAppOptions = {
   origin?: string;
@@ -57,7 +63,25 @@ export async function createConfiguredHttpApp(options: HttpAppOptions = {}): Pro
   });
   options.configureBeforeFilters?.(app);
   if (enableMetrics) {
-    app.getHttpAdapter().getInstance().get('/metrics', createMetricsRequestHandler({ metrics: apiMetrics, backlogDb: db }));
+    const rateLimitConfig = resolveMetricsRateLimitConfig();
+    const apiMetricsRateLimitStore = new BoundedMemoryRateLimitStore({
+      windowMs: rateLimitConfig.windowMs,
+      maxEntries: rateLimitConfig.maxEntries,
+    });
+    app.getHttpAdapter().getInstance().get(
+      '/metrics',
+      rateLimit(
+        buildMetricsRateLimitOptions({
+          store: apiMetricsRateLimitStore,
+          windowMs: rateLimitConfig.windowMs,
+          limit: rateLimitConfig.limit,
+        }),
+      ),
+      createMetricsRequestHandler({ metrics: apiMetrics, backlogDb: db }),
+    );
+    app.getHttpServer()?.once?.('close', () => {
+      apiMetricsRateLimitStore.shutdown();
+    });
   }
   app.useGlobalFilters(new Errors());
   return app;
