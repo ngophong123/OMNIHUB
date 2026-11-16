@@ -2,7 +2,7 @@ import 'reflect-metadata';
 import 'dotenv/config';
 import Redis from 'ioredis';
 import { db } from './database';
-import { attachRealtime } from './realtime';
+import { attachRealtime, setRealtimeRedisHealthProbe } from './realtime';
 import { createRedisRateLimiter, setRateLimitRedisHealthProbe } from './rate-limit';
 import { validateDeployment } from './deployment-security';
 import { createConfiguredHttpApp } from './http-app';
@@ -43,6 +43,7 @@ async function main() {
       configuredApp.use('/webhooks/', createRedisRateLimiter(limiterRedis, { prefix: 'webhook', limit: configuredLimit('WEBHOOK_RATE_LIMIT', 120, 5000), windowMs }));
     },
   });
+  setRealtimeRedisHealthProbe(() => false);
   await app.listen(Number(process.env.PORT ?? 4000), process.env.API_HOST ?? '127.0.0.1');
   apiLogger.ops('info', 'API_LISTENING', { component: 'bootstrap' });
   const closeRealtime = attachRealtime(app.getHttpServer(), origin);
