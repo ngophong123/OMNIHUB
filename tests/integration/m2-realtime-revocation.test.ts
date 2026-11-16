@@ -2,7 +2,6 @@ import 'dotenv/config';
 import { randomBytes, randomUUID } from 'node:crypto';
 import http from 'node:http';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import type { OperationalEvent } from '@omnihub/contracts';
 import { db } from '../../apps/api/src/database';
 import { digest, hashPassword } from '../../apps/api/src/domain';
 import { processOutboxBatch } from '../../apps/api/src/outbox';
@@ -194,7 +193,7 @@ describe('Realtime readiness probe & transactional session/device revocation (M2
     });
     expect(batch1.quarantined).toBe(0);
     expect(batch1.delivered).toBe(1);
-    const sessionEvent = JSON.parse(published[0]!) as OperationalEvent;
+    const sessionEvent = JSON.parse(published[0]!) as Parameters<typeof broadcastOperationalEvent>[2];
     expect(sessionEvent.type).toBe('session.revoked');
     expect(sessionEvent.aggregateId).toBe(ownerId);
 
@@ -231,7 +230,7 @@ describe('Realtime readiness probe & transactional session/device revocation (M2
     });
     expect(batch2.quarantined).toBe(0);
     expect(batch2.delivered).toBe(1);
-    const assignEvent = JSON.parse(published[1]!) as OperationalEvent;
+    const assignEvent = JSON.parse(published[1]!) as Parameters<typeof broadcastOperationalEvent>[2];
     expect(assignEvent.type).toBe('kitchen.device.changed');
     expect(assignEvent.aggregateId).toBe(deviceId);
 
