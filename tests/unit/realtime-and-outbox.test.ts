@@ -1,6 +1,10 @@
+import { EventEmitter } from 'node:events';
+import { createServer, type Server as HttpServer } from 'node:http';
 import type { PrismaClient } from '@prisma/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { io as createSocketClient, type Socket as ClientSocket } from '../../apps/web/node_modules/socket.io-client';
 import { digest } from '../../apps/api/src/domain';
+import { createMetricsRegistry } from '../../apps/api/src/observability/metrics';
 import {
   computeBackoffMs,
   createOutboxWorkerLoop,
@@ -8,9 +12,15 @@ import {
   resolveOutboxTiming,
 } from '../../apps/api/src/outbox';
 import {
+  attachRealtime,
   broadcastOperationalEvent,
+  createEventDeduplicator,
   extractCookieValue,
+  publishRealtimeOperationalEvent,
+  realtimeRedisReady,
   revalidateRealtimeSockets,
+  setRealtimeRedisHealthProbe,
+  type RealtimeRedisLike,
   type RealtimeServerLike,
   type RealtimeSocketLike,
 } from '../../apps/api/src/realtime';
@@ -563,5 +573,449 @@ describe('Outbox batch processing, poison isolation, backoff, and clean shutdown
     expect(stalledDelay).toBeGreaterThanOrEqual(75);
     expect(stalledDelay).toBeLessThanOrEqual(200);
     expect(warnSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+function createInMemoryRedisBroker() {
+  const exactSubs = new Map<string, Set<InMemoryMockRedis>>();
+  const patternSubs = new Map<string, Set<InMemoryMockRedis>>();
+
+  const patternToRegex = (pattern: string) =>
+    new RegExp(`^${pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*')}$`);
+
+  class InMemoryMockRedis extends EventEmitter implements RealtimeRedisLike {
+    status = 'connecting';
+    isCluster = false;
+    private readonly channels = new Set<string>();
+    private readonly patterns = new Set<string>();
+    public psubscribeError: Error | null = null;
+    public publishError: Error | null = null;
+
+    async subscribe(...args: unknown[]) {
+      const list = Array.isArray(args[0]) ? (args[0] as unknown[]) : args;
+      for (const ch of list) {
+        if (typeof ch !== 'string') continue;
+        this.channels.add(ch);
+        if (!exactSubs.has(ch)) exactSubs.set(ch, new Set());
+        exactSubs.get(ch)!.add(this);
+      }
+      return this.channels.size;
+    }
+
+    async unsubscribe(...args: unknown[]) {
+      const list = Array.isArray(args[0]) ? (args[0] as unknown[]) : args;
+      for (const ch of list) {
+        if (typeof ch !== 'string') continue;
+        this.channels.delete(ch);
+        exactSubs.get(ch)?.delete(this);
+      }
+      return 0;
+    }
+
+    async psubscribe(...args: unknown[]) {
+      if (this.psubscribeError) throw this.psubscribeError;
+      const list = Array.isArray(args[0]) ? (args[0] as unknown[]) : args;
+      for (const pat of list) {
+        if (typeof pat !== 'string') continue;
+        this.patterns.add(pat);
+        if (!patternSubs.has(pat)) patternSubs.set(pat, new Set());
+        patternSubs.get(pat)!.add(this);
+      }
+      return this.patterns.size;
+    }
+
+    async punsubscribe(...args: unknown[]) {
+      const list = Array.isArray(args[0]) ? (args[0] as unknown[]) : args;
+      for (const pat of list) {
+        if (typeof pat !== 'string') continue;
+        this.patterns.delete(pat);
+        patternSubs.get(pat)?.delete(this);
+      }
+      return 0;
+    }
+
+    async publish(channel: string, message: string | Buffer): Promise<number> {
+      if (this.publishError) throw this.publishError;
+      let count = 0;
+      const buf = Buffer.isBuffer(message) ? message : Buffer.from(message);
+      for (const sub of exactSubs.get(channel) ?? []) {
+        sub.emit('message', channel, buf.toString('utf8'));
+        sub.emit('messageBuffer', Buffer.from(channel), buf);
+        count++;
+      }
+      for (const [pattern, subs] of patternSubs.entries()) {
+        if (patternToRegex(pattern).test(channel)) {
+          for (const sub of subs) {
+            sub.emit('pmessage', pattern, channel, buf.toString('utf8'));
+            sub.emit('pmessageBuffer', Buffer.from(pattern), Buffer.from(channel), buf);
+            count++;
+          }
+        }
+      }
+      return count;
+    }
+
+    send_command(_command: string, args: unknown[], callback?: (err: Error | null, res?: unknown) => void) {
+      const ch = String(args[1] ?? '');
+      const count = exactSubs.get(ch)?.size ?? 0;
+      callback?.(null, [ch, count]);
+    }
+
+    emitReady() {
+      this.status = 'ready';
+      this.emit('ready');
+    }
+
+    emitDisconnect(err: Error) {
+      this.status = 'reconnecting';
+      this.emit('error', err);
+      this.emit('close');
+    }
+
+    async quit() {
+      this.status = 'end';
+      this.disconnect();
+      return 'OK';
+    }
+
+    disconnect() {
+      this.status = 'end';
+      for (const ch of this.channels) exactSubs.get(ch)?.delete(this);
+      for (const pat of this.patterns) patternSubs.get(pat)?.delete(this);
+      this.emit('end');
+    }
+  }
+
+  return {
+    publishRaw: async (channel: string, payload: string) => {
+      const pub = new InMemoryMockRedis();
+      return pub.publish(channel, payload);
+    },
+    createClient: () => new InMemoryMockRedis(),
+  };
+}
+
+describe('M2-T09: Socket.IO Redis adapter resilience, deduplication, ACL safety, and multi-instance bridge', () => {
+  afterEach(() => {
+    setRealtimeRedisHealthProbe(undefined);
+    vi.restoreAllMocks();
+  });
+
+  it('bounds event deduplicator size and preserves FIFO eviction order', () => {
+    const deduper = createEventDeduplicator(2);
+    deduper.mark('evt-1');
+    deduper.mark('evt-2');
+    expect(deduper.has('evt-1')).toBe(true);
+    expect(deduper.has('evt-2')).toBe(true);
+
+    deduper.mark('evt-3');
+    expect(deduper.size).toBe(2);
+    expect(deduper.has('evt-1')).toBe(false);
+    expect(deduper.has('evt-2')).toBe(true);
+    expect(deduper.has('evt-3')).toBe(true);
+  });
+
+  it('tracks honest subscriber/adapter readiness, handles ACL NOPERM cleanly, and recovers on reconnect', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    const broker = createInMemoryRedisBroker();
+    const metrics = createMetricsRegistry({ service: 'omnihub-api', collectDefaultMetrics: false });
+    const roles: Record<string, ReturnType<typeof broker.createClient>> = {};
+    const server = createServer();
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+
+    const close = attachRealtime(server, 'http://localhost:3000', {
+      metrics,
+      database: {} as unknown as PrismaClient,
+      createRedisClient: (_url, _opts, role) => {
+        const c = broker.createClient();
+        roles[role] = c;
+        if (role === 'adapter_sub') {
+          c.psubscribeError = new Error('NOPERM this user has no permissions to run psubscribe');
+        }
+        return c;
+      },
+    });
+
+    try {
+      // Slow startup: probe must remain false before Redis clients connect & subscribe.
+      expect(await realtimeRedisReady()).toBe(false);
+
+      // ACL NOPERM on adapter_sub must never crash the process and must keep readiness false.
+      roles.events_sub!.emitReady();
+      roles.adapter_pub!.emitReady();
+      roles.adapter_sub!.emitReady();
+      await new Promise(resolve => setTimeout(resolve, 25));
+
+      expect(await realtimeRedisReady()).toBe(false);
+      expect(errSpy.mock.calls.some(args => String(args[0]).includes('REALTIME_ADAPTER_SUBSCRIPTION_FAILED'))).toBe(true);
+
+      // Clearing ACL error and reconnecting makes readiness turn honest true once psubscribe + subscribe succeed.
+      roles.adapter_sub!.psubscribeError = null;
+      roles.adapter_sub!.emitDisconnect(new Error('reconnecting'));
+      roles.adapter_sub!.emitReady();
+      await new Promise(resolve => setTimeout(resolve, 25));
+      expect(await realtimeRedisReady()).toBe(true);
+
+      // Simulate events_sub disconnect -> logs once, drops readiness false, and recovers on ready.
+      roles.events_sub!.emitDisconnect(new Error('ECONNRESET'));
+      expect(await realtimeRedisReady()).toBe(false);
+      expect(warnSpy.mock.calls.some(args => String(args[0]).includes('REALTIME_REDIS_UNAVAILABLE'))).toBe(true);
+
+      // Fast-path publish returns false cleanly during pub outage (never throws UnhandledPromiseRejection).
+      roles.adapter_pub!.publishError = new Error('NOPERM publish denied');
+      const pubOk = await publishRealtimeOperationalEvent({
+        eventId: '99999999-9999-4999-8999-999999999999',
+        schemaVersion: 1,
+        tenantId: TENANT_ID,
+        storeId: STORE_ID,
+        type: 'order.accepted',
+        aggregateId: ORDER_ID,
+        version: 1,
+        occurredAt: new Date().toISOString(),
+      });
+      expect(pubOk).toBe(false);
+
+      roles.adapter_pub!.publishError = null;
+      roles.events_sub!.emitReady();
+      await new Promise(resolve => setTimeout(resolve, 25));
+      expect(await realtimeRedisReady()).toBe(true);
+
+      const text = await metrics.render();
+      expect(text).toContain('realtime_adapter_ready{service="omnihub-api"} 1');
+      expect(text).toContain('realtime_adapter_errors_total{component="acl",service="omnihub-api"}');
+    } finally {
+      await close();
+      expect(await realtimeRedisReady()).toBe(true);
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      metrics.close();
+    }
+  });
+
+  it('isolates tenants, deduplicates retried broadcasts, and revokes sessions & kitchen devices across two API replicas', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    const USER_A = '91111111-1111-4111-8111-111111111111';
+    const USER_CASHIER = '92222222-2222-4222-8222-222222222222';
+    const USER_KITCHEN = '93333333-3333-4333-8333-333333333333';
+    const USER_B = '94444444-4444-4444-8444-444444444444';
+
+    const broker = createInMemoryRedisBroker();
+    const metricsA = createMetricsRegistry({ service: 'omnihub-api', collectDefaultMetrics: false });
+    const metricsB = createMetricsRegistry({ service: 'omnihub-api', collectDefaultMetrics: false });
+
+    const tokenA1 = 'a'.repeat(64);
+    const tokenA2 = 'b'.repeat(64);
+    const tokenCashier = 'c'.repeat(64);
+    const tokenKitchen = 'd'.repeat(64);
+    const tokenTenantB = 'e'.repeat(64);
+
+    let activeSessions = new Set([digest(tokenA1), digest(tokenA2), digest(tokenCashier), digest(tokenKitchen), digest(tokenTenantB)]);
+    let kitchenStation: string | null = STATION_A;
+    let kitchenRevoked = false;
+
+    const makeMockDb = () =>
+      ({
+        session: {
+          findUnique: vi.fn(async ({ where }: { where: { tokenHash: string } }) => {
+            if (!activeSessions.has(where.tokenHash)) return null;
+            if (where.tokenHash === digest(tokenTenantB)) {
+              return { tokenHash: where.tokenHash, userId: USER_B, tenantId: OTHER_STORE_ID, storeId: OTHER_STORE_ID, expiresAt: new Date(Date.now() + 60_000), user: { active: true } };
+            }
+            const userId = where.tokenHash === digest(tokenCashier)
+              ? USER_CASHIER
+              : where.tokenHash === digest(tokenKitchen)
+                ? USER_KITCHEN
+                : USER_A;
+            return { tokenHash: where.tokenHash, userId, tenantId: TENANT_ID, storeId: STORE_ID, expiresAt: new Date(Date.now() + 60_000), user: { active: true } };
+          }),
+          findMany: vi.fn(async ({ where }: { where: { tokenHash: { in: string[] } } }) =>
+            where.tokenHash.in
+              .filter(h => activeSessions.has(h))
+              .map(h => {
+                if (h === digest(tokenTenantB)) {
+                  return { tokenHash: h, userId: USER_B, tenantId: OTHER_STORE_ID, storeId: OTHER_STORE_ID };
+                }
+                const userId = h === digest(tokenCashier) ? USER_CASHIER : h === digest(tokenKitchen) ? USER_KITCHEN : USER_A;
+                return { tokenHash: h, userId, tenantId: TENANT_ID, storeId: STORE_ID };
+              }),
+          ),
+        },
+        membership: {
+          findUnique: vi.fn(async ({ where }: { where: { userId_storeId: { userId: string; storeId: string } } }) => {
+            if (where.userId_storeId.userId === USER_B) return { tenantId: OTHER_STORE_ID, storeId: OTHER_STORE_ID, userId: USER_B, role: 'OWNER' };
+            if (where.userId_storeId.userId === USER_KITCHEN) return { tenantId: TENANT_ID, storeId: STORE_ID, userId: USER_KITCHEN, role: 'KITCHEN' };
+            return { tenantId: TENANT_ID, storeId: STORE_ID, userId: where.userId_storeId.userId, role: 'CASHIER' };
+          }),
+          findMany: vi.fn(async () => [
+            { userId: USER_A, tenantId: TENANT_ID, storeId: STORE_ID, role: 'CASHIER' },
+            { userId: USER_CASHIER, tenantId: TENANT_ID, storeId: STORE_ID, role: 'CASHIER' },
+            { userId: USER_KITCHEN, tenantId: TENANT_ID, storeId: STORE_ID, role: 'KITCHEN' },
+            { userId: USER_B, tenantId: OTHER_STORE_ID, storeId: OTHER_STORE_ID, role: 'OWNER' },
+          ]),
+        },
+        kitchenDevice: {
+          findFirst: vi.fn(async ({ where }: { where: { id: string } }) =>
+            kitchenRevoked || where.id !== DEVICE_A ? null : { id: DEVICE_A, stationId: kitchenStation },
+          ),
+          findMany: vi.fn(async () =>
+            kitchenRevoked ? [] : [{ id: DEVICE_A, tenantId: TENANT_ID, storeId: STORE_ID, userId: USER_KITCHEN, stationId: kitchenStation }],
+          ),
+        },
+        kitchenTicket: {
+          findMany: vi.fn(async () => [{ stationId: STATION_A }]),
+        },
+        order: { findMany: vi.fn(async () => []) },
+      }) as unknown as PrismaClient;
+
+    const startInstance = async (metrics: ReturnType<typeof createMetricsRegistry>) => {
+      const server: HttpServer = createServer();
+      await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+      const port = (server.address() as { port: number }).port;
+      const close = attachRealtime(server, 'http://localhost:3000', {
+        database: makeMockDb(),
+        metrics,
+        createRedisClient: () => {
+          const client = broker.createClient();
+          queueMicrotask(() => client.emitReady());
+          return client;
+        },
+      });
+      await new Promise(resolve => setTimeout(resolve, 25));
+      return { baseUrl: `http://127.0.0.1:${port}`, server, close };
+    };
+
+    const repA = await startInstance(metricsA);
+    const repB = await startInstance(metricsB);
+
+    const connectClient = (baseUrl: string, token: string, deviceId?: string) =>
+      new Promise<ClientSocket>((resolve, reject) => {
+        const sock = createSocketClient(baseUrl, {
+          transports: ['websocket'],
+          reconnection: false,
+          extraHeaders: { origin: 'http://localhost:3000', cookie: `session=${token}` },
+          auth: deviceId ? { deviceId } : undefined,
+        });
+        sock.once('connect', () => resolve(sock));
+        sock.once('connect_error', reject);
+      });
+
+    const clientA1 = await connectClient(repA.baseUrl, tokenA1);
+    const clientA2 = await connectClient(repB.baseUrl, tokenA2);
+    const clientCashierB = await connectClient(repB.baseUrl, tokenCashier);
+    const clientKitchenB = await connectClient(repB.baseUrl, tokenKitchen, DEVICE_A);
+    const clientTenantB = await connectClient(repB.baseUrl, tokenTenantB);
+
+    const receivedA1: string[] = [];
+    const receivedCashierB: string[] = [];
+    const receivedTenantB: string[] = [];
+    clientA1.on('operational.event', (e: { type: string }) => receivedA1.push(e.type));
+    clientCashierB.on('operational.event', (e: { type: string }) => receivedCashierB.push(e.type));
+    clientTenantB.on('operational.event', (e: { type: string }) => receivedTenantB.push(e.type));
+
+    try {
+      // 1. Outbox broadcast reaches authorized Tenant A clients across replicas once; duplicate eventId is deduplicated; Tenant B gets 0.
+      const orderEvent = {
+        eventId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        schemaVersion: 1,
+        tenantId: TENANT_ID,
+        storeId: STORE_ID,
+        type: 'order.accepted',
+        aggregateId: ORDER_ID,
+        version: 1,
+        occurredAt: new Date().toISOString(),
+      };
+      await broker.publishRaw('omnihub.events', JSON.stringify(orderEvent));
+      await broker.publishRaw('omnihub.events', JSON.stringify(orderEvent));
+      await new Promise(resolve => setTimeout(resolve, 40));
+
+      expect(receivedA1).toEqual(['order.accepted']);
+      expect(receivedCashierB).toEqual(['order.accepted']);
+      expect(receivedTenantB).toEqual([]);
+      expect(await metricsB.render()).toContain('realtime_events_broadcast_total{outcome="deduplicated",service="omnihub-api"} 1');
+
+      // 2. Revoke only tokenA1 on session.revoked -> clientA1 disconnects immediately, while tokenA2, cashier, & tenantB stay connected and see zero leaked session events.
+      activeSessions = new Set([digest(tokenA2), digest(tokenCashier), digest(tokenKitchen), digest(tokenTenantB)]);
+      const a1Disconnected = new Promise<void>(resolve => clientA1.once('disconnect', () => resolve()));
+      await publishRealtimeOperationalEvent({
+        eventId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+        schemaVersion: 1,
+        tenantId: TENANT_ID,
+        storeId: STORE_ID,
+        type: 'session.revoked',
+        aggregateId: USER_A,
+        version: 1,
+        occurredAt: new Date().toISOString(),
+      });
+      await Promise.race([
+        a1Disconnected,
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('STEP2_A1_DISCONNECT_TIMEOUT')), 1500)),
+      ]);
+      await new Promise(resolve => setTimeout(resolve, 25));
+
+      expect(clientA1.connected).toBe(false);
+      expect(clientA2.connected).toBe(true);
+      expect(clientCashierB.connected).toBe(true);
+      expect(clientTenantB.connected).toBe(true);
+      expect(receivedCashierB).toEqual(['order.accepted']);
+
+      // 3. Reassign / revoke kitchen device -> clientKitchenB on replica B disconnects immediately.
+      kitchenStation = STATION_B;
+      kitchenRevoked = true;
+      const kitchenDisconnected = new Promise<void>(resolve => clientKitchenB.once('disconnect', () => resolve()));
+      await broker.publishRaw('omnihub.events', JSON.stringify({
+        eventId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+        schemaVersion: 1,
+        tenantId: TENANT_ID,
+        storeId: STORE_ID,
+        type: 'kitchen.device.changed',
+        aggregateId: DEVICE_A,
+        version: 1,
+        occurredAt: new Date().toISOString(),
+      }));
+      await Promise.race([
+        kitchenDisconnected,
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('STEP3_KITCHEN_DISCONNECT_TIMEOUT')), 1500)),
+      ]);
+      expect(clientKitchenB.connected).toBe(false);
+
+      // 4. Rejects unauthorized custom namespaces to preserve single-namespace isolation.
+      await expect(
+        new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(() => {
+            badNs.close();
+            reject(new Error('STEP4_BAD_NS_TIMEOUT'));
+          }, 1500);
+          const badNs = createSocketClient(`${repA.baseUrl}/admin`, {
+            transports: ['websocket'],
+            reconnection: false,
+            extraHeaders: { origin: 'http://localhost:3000', cookie: `session=${tokenA2}` },
+          });
+          badNs.once('connect', () => {
+            clearTimeout(timer);
+            badNs.close();
+            resolve();
+          });
+          badNs.once('connect_error', err => {
+            clearTimeout(timer);
+            badNs.close();
+            reject(err);
+          });
+        }),
+      ).rejects.toThrow();
+    } finally {
+      for (const s of [clientA1, clientA2, clientCashierB, clientKitchenB, clientTenantB]) s.close();
+      await repA.close();
+      await repB.close();
+      await Promise.all([
+        new Promise<void>(resolve => repA.server.close(() => resolve())),
+        new Promise<void>(resolve => repB.server.close(() => resolve())),
+      ]);
+      metricsA.close();
+      metricsB.close();
+    }
   });
 });
