@@ -3,6 +3,7 @@ import { writeFile } from 'node:fs/promises';
 import { Prisma, type PrismaClient } from '@prisma/client';
 import { eventSchema } from '@omnihub/contracts';
 import { workerLogger } from './observability/logger';
+import { type MetricsCollector, type OutboxBacklogReader, workerMetrics } from './observability/metrics';
 import { runWithLogContext } from './observability/request-context';
 
 export const OUTBOX_CHANNEL = 'omnihub.events';
@@ -45,6 +46,7 @@ export type OutboxBatchOptions = {
   quarantinedIds?: Set<string>;
   tenantIds?: readonly string[];
   shouldContinue?: () => boolean;
+  metrics?: MetricsCollector;
 };
 
 export type OutboxBatchResult = {
@@ -158,117 +160,139 @@ export async function processOutboxBatch(options: OutboxBatchOptions): Promise<O
     quarantinedIds = new Set<string>(),
     tenantIds,
     shouldContinue = () => true,
+    metrics = workerMetrics,
   } = options;
   const timing = resolveOutboxTiming({ publishTimeoutMs, batchTimeBudgetMs, transactionTimeoutMs });
+  const batchStartNs = process.hrtime.bigint();
+  let outcome: 'ok' | 'degraded' | 'budget_exceeded' | 'error' = 'error';
 
-  return db.$transaction(async tx => {
-    const batchDeadlineMs = now() + timing.batchTimeBudgetMs;
-    const excluded = [...quarantinedIds].filter(id => UUID_RE.test(id));
-    const exclusionSql = excluded.length
-      ? Prisma.sql`AND id NOT IN (${Prisma.join(excluded.map(id => Prisma.sql`${id}::uuid`))})`
-      : Prisma.empty;
-    const scopedTenants = tenantIds?.filter(id => UUID_RE.test(id)) ?? [];
-    const tenantScopeSql = scopedTenants.length
-      ? Prisma.sql`AND "tenantId" IN (${Prisma.join(scopedTenants.map(id => Prisma.sql`${id}::uuid`))})`
-      : Prisma.empty;
+  try {
+    const result = await db.$transaction(async tx => {
+      const batchDeadlineMs = now() + timing.batchTimeBudgetMs;
+      const excluded = [...quarantinedIds].filter(id => UUID_RE.test(id));
+      const exclusionSql = excluded.length
+        ? Prisma.sql`AND id NOT IN (${Prisma.join(excluded.map(id => Prisma.sql`${id}::uuid`))})`
+        : Prisma.empty;
+      const scopedTenants = tenantIds?.filter(id => UUID_RE.test(id)) ?? [];
+      const tenantScopeSql = scopedTenants.length
+        ? Prisma.sql`AND "tenantId" IN (${Prisma.join(scopedTenants.map(id => Prisma.sql`${id}::uuid`))})`
+        : Prisma.empty;
 
-    const batch = await tx.$queryRaw<OutboxRow[]>(Prisma.sql`
-      SELECT id, "tenantId", "storeId", type, "aggregateId", version, "correlationId", "createdAt"
-      FROM "Outbox"
-      WHERE "deliveredAt" IS NULL
-      ${tenantScopeSql}
-      ${exclusionSql}
-      ORDER BY "createdAt" ASC, id ASC
-      LIMIT ${batchSize}::int
-      FOR UPDATE SKIP LOCKED
-    `);
+      const batch = await tx.$queryRaw<OutboxRow[]>(Prisma.sql`
+        SELECT id, "tenantId", "storeId", type, "aggregateId", version, "correlationId", "createdAt"
+        FROM "Outbox"
+        WHERE "deliveredAt" IS NULL
+        ${tenantScopeSql}
+        ${exclusionSql}
+        ORDER BY "createdAt" ASC, id ASC
+        LIMIT ${batchSize}::int
+        FOR UPDATE SKIP LOCKED
+      `);
 
-    const deliveredIds: string[] = [];
-    let quarantined = 0;
-    let budgetExceeded = false;
-    let error: Error | undefined;
+      const deliveredIds: string[] = [];
+      let quarantined = 0;
+      let budgetExceeded = false;
+      let error: Error | undefined;
 
-    for (const row of batch) {
-      if (!shouldContinue()) break;
+      for (const row of batch) {
+        if (!shouldContinue()) break;
 
-      const remainingBudgetMs = batchDeadlineMs - now();
-      if (remainingBudgetMs <= 0) {
-        budgetExceeded = true;
-        if (deliveredIds.length === 0 && quarantined === 0) {
-          error = new PublishTimeoutError('batch_budget');
-        }
-        break;
-      }
-
-      const candidate = {
-        eventId: row.id,
-        schemaVersion: 1 as const,
-        tenantId: row.tenantId,
-        storeId: row.storeId,
-        type: row.type,
-        aggregateId: row.aggregateId,
-        version: row.version,
-        occurredAt: row.createdAt.toISOString(),
-      };
-      const parsed = eventSchema.safeParse(candidate);
-      if (!parsed.success) {
-        quarantined++;
-        quarantineId(quarantinedIds, row.id);
-        workerLogger.ops('error', 'OUTBOX_EVENT_INVALID', {
-          component: 'outbox-worker',
-          eventId: row.id,
-          ...(row.correlationId ? { correlationId: row.correlationId } : {}),
-        });
-        continue;
-      }
-
-      const budgetCapped = remainingBudgetMs < timing.publishTimeoutMs;
-      const attemptTimeoutMs = Math.min(timing.publishTimeoutMs, remainingBudgetMs);
-
-      try {
-        await publishWithTimeout(
-          redis,
-          channel,
-          JSON.stringify(parsed.data),
-          attemptTimeoutMs,
-          budgetCapped ? 'batch_budget' : 'publish_timeout',
-        );
-        deliveredIds.push(row.id);
-        workerLogger.ops('info', 'OUTBOX_PUBLISHED', {
-          component: 'outbox-worker',
-          action: 'outbox.published',
-          eventId: row.id,
-          eventType: parsed.data.type,
-          ...(row.correlationId ? { correlationId: row.correlationId } : {}),
-        });
-      } catch (err) {
-        if (err instanceof PublishTimeoutError && err.reason === 'batch_budget') {
+        const remainingBudgetMs = batchDeadlineMs - now();
+        if (remainingBudgetMs <= 0) {
           budgetExceeded = true;
           if (deliveredIds.length === 0 && quarantined === 0) {
-            error = err;
+            error = new PublishTimeoutError('batch_budget');
           }
           break;
         }
-        error = err instanceof Error ? err : new Error('OUTBOX_PUBLISH_FAILED');
-        break;
+
+        const candidate = {
+          eventId: row.id,
+          schemaVersion: 1 as const,
+          tenantId: row.tenantId,
+          storeId: row.storeId,
+          type: row.type,
+          aggregateId: row.aggregateId,
+          version: row.version,
+          occurredAt: row.createdAt.toISOString(),
+        };
+        const parsed = eventSchema.safeParse(candidate);
+        if (!parsed.success) {
+          quarantined++;
+          quarantineId(quarantinedIds, row.id);
+          metrics.recordOutboxQuarantined(quarantinedIds.size, 1);
+          workerLogger.ops('error', 'OUTBOX_EVENT_INVALID', {
+            component: 'outbox-worker',
+            eventId: row.id,
+            ...(row.correlationId ? { correlationId: row.correlationId } : {}),
+          });
+          continue;
+        }
+
+        const budgetCapped = remainingBudgetMs < timing.publishTimeoutMs;
+        const attemptTimeoutMs = Math.min(timing.publishTimeoutMs, remainingBudgetMs);
+
+        try {
+          await publishWithTimeout(
+            redis,
+            channel,
+            JSON.stringify(parsed.data),
+            attemptTimeoutMs,
+            budgetCapped ? 'batch_budget' : 'publish_timeout',
+          );
+          deliveredIds.push(row.id);
+          metrics.recordOutboxPublished(1);
+          workerLogger.ops('info', 'OUTBOX_PUBLISHED', {
+            component: 'outbox-worker',
+            action: 'outbox.published',
+            eventId: row.id,
+            eventType: parsed.data.type,
+            ...(row.correlationId ? { correlationId: row.correlationId } : {}),
+          });
+        } catch (err) {
+          metrics.recordOutboxFailed(1);
+          if (err instanceof PublishTimeoutError && err.reason === 'batch_budget') {
+            budgetExceeded = true;
+            if (deliveredIds.length === 0 && quarantined === 0) {
+              error = err;
+            }
+            break;
+          }
+          error = err instanceof Error ? err : new Error('OUTBOX_PUBLISH_FAILED');
+          break;
+        }
       }
-    }
 
-    if (deliveredIds.length > 0) {
-      await tx.outbox.updateMany({
-        where: { id: { in: deliveredIds } },
-        data: { deliveredAt: new Date() },
-      });
-    }
+      if (deliveredIds.length > 0) {
+        await tx.outbox.updateMany({
+          where: { id: { in: deliveredIds } },
+          data: { deliveredAt: new Date() },
+        });
+      }
 
-    return {
-      claimed: batch.length,
-      delivered: deliveredIds.length,
-      quarantined,
-      ...(budgetExceeded ? { budgetExceeded: true } : {}),
-      ...(error ? { error } : {}),
-    };
-  }, { timeout: timing.transactionTimeoutMs });
+      return {
+        claimed: batch.length,
+        delivered: deliveredIds.length,
+        quarantined,
+        ...(budgetExceeded ? { budgetExceeded: true } : {}),
+        ...(error ? { error } : {}),
+      };
+    }, { timeout: timing.transactionTimeoutMs });
+
+    outcome = result.budgetExceeded
+      ? 'budget_exceeded'
+      : result.error
+        ? 'degraded'
+        : 'ok';
+    return result;
+  } catch (err) {
+    if (err instanceof Prisma.PrismaClientKnownRequestError) {
+      metrics.recordDbError(err.code);
+    }
+    throw err;
+  } finally {
+    metrics.recordOutboxBatchDuration(outcome, Number(process.hrtime.bigint() - batchStartNs) / 1e9);
+  }
 }
 
 export type WorkerLoopOptions = {
@@ -283,11 +307,12 @@ export type WorkerLoopOptions = {
   transactionTimeoutMs?: number;
   now?: () => number;
   heartbeatFile?: string;
+  metrics?: MetricsCollector;
 };
 
 /**
  * Supervises outbox polling with exponential failure backoff, Redis/DB heartbeat reporting,
- * and abortable sleep for deterministic graceful shutdown.
+ * Prometheus worker/backlog telemetry, and abortable sleep for deterministic graceful shutdown.
  */
 export function createOutboxWorkerLoop(options: WorkerLoopOptions) {
   const {
@@ -302,6 +327,7 @@ export function createOutboxWorkerLoop(options: WorkerLoopOptions) {
     transactionTimeoutMs,
     now,
     heartbeatFile = process.env.WORKER_HEARTBEAT_FILE,
+    metrics = workerMetrics,
   } = options;
 
   let running = true;
@@ -311,6 +337,10 @@ export function createOutboxWorkerLoop(options: WorkerLoopOptions) {
   let wakeTimer: ReturnType<typeof setTimeout> | undefined;
   let wakeResolve: (() => void) | undefined;
   const quarantinedIds = new Set<string>();
+  const hasBacklogReader =
+    typeof (db as { outbox?: { count?: unknown; findFirst?: unknown } }).outbox?.count === 'function' &&
+    typeof (db as { outbox?: { count?: unknown; findFirst?: unknown } }).outbox?.findFirst === 'function';
+  metrics.setOutboxWorkerHealth(true, 0);
 
   const wait = (ms: number) => new Promise<void>(resolve => {
     if (!running || ms <= 0) {
@@ -345,10 +375,16 @@ export function createOutboxWorkerLoop(options: WorkerLoopOptions) {
           now,
           quarantinedIds,
           shouldContinue: () => running,
+          metrics,
         });
+
+        if (hasBacklogReader) {
+          await metrics.refreshOutboxBacklog(db as unknown as OutboxBacklogReader);
+        }
 
         if (result.error) {
           consecutiveFailures++;
+          metrics.setOutboxWorkerHealth(false, consecutiveFailures);
           if (!degraded) {
             workerLogger.ops('warn', 'OUTBOX_RETRY', {
               component: 'outbox-worker',
@@ -369,11 +405,13 @@ export function createOutboxWorkerLoop(options: WorkerLoopOptions) {
         }
         degraded = false;
         consecutiveFailures = 0;
+        metrics.setOutboxWorkerHealth(true, 0);
         const madeProgressUnderBudget =
           Boolean(result.budgetExceeded) && (result.delivered > 0 || result.quarantined > 0);
         return result.claimed >= batchSize || madeProgressUnderBudget ? 0 : pollIntervalMs;
       } catch (err) {
         consecutiveFailures++;
+        metrics.setOutboxWorkerHealth(false, consecutiveFailures);
         if (!degraded) {
           workerLogger.ops('warn', 'OUTBOX_RETRY', {
             component: 'outbox-worker',
@@ -399,6 +437,7 @@ export function createOutboxWorkerLoop(options: WorkerLoopOptions) {
 
   const stop = async (timeoutMs = 10_000): Promise<void> => {
     running = false;
+    metrics.setOutboxWorkerHealth(false, consecutiveFailures);
     if (wakeTimer) {
       clearTimeout(wakeTimer);
       wakeTimer = undefined;

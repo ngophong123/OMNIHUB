@@ -1,5 +1,15 @@
 # Testing strategy
 
+## Milestone 2 — Task 02 (Prometheus Metrics & Monitoring) — 2026-11-16
+
+Verified on branch `feat/m2-prometheus-metrics` (branched from `main` `0ecb210`):
+
+| Check | Status | Current result |
+|---|---|---|
+| Prometheus metrics unit suite (`tests/unit/prometheus-metrics.test.ts`) | VERIFIED | `8/8` tests verifying unique registry exposition (`text/plain; version=0.0.4`), idempotent `collectDefaultMetrics`, HTTP request counters / duration histograms / aborted `in-flight` gauge cleanup, anti-cardinality route collapsing (`unmatched`) & zero-PII enforcement across fuzz traffic, `rate_limit_decisions_total` (`allowed`/`blocked_429`/`unavailable_503`), `CommandBus` `P2034` retry & exhaustion counters, Outbox batch/quarantine/health/coalesced DB backlog metrics, Socket.IO connection/disconnect/broadcast telemetry, `/metrics` proxy-header/remote-IP denial & `METRICS_AUTH_TOKEN` validation, and clean `close()`. |
+| PostgreSQL + NestJS `/metrics` & Socket.IO integration suite (`tests/integration/m2-metrics.test.ts`) | VERIFIED | Executed against live `embedded-postgres`: verifies real HTTP calls (`/health`, `/orders`, `404`), `CommandBus` order creation & indexed `outbox_pending_count`, real Socket.IO connect/disconnect gauge accuracy, `X-Forwarded-For` (`403`) & Bearer token checks, and `deploy/Caddyfile` `/metrics*` `403` edge block without leaking IDs or tokens into metric labels. |
+| Full local unit, PostgreSQL integration & V8 CI coverage gates | VERIFIED | Unit suite: **8 files, 73/73 tests passed** (`pnpm test` / `pnpm test:coverage`). CI-scoped PG + unit suite (`OMNIHUB_COVERAGE_SCOPE=ci pnpm test:coverage:ci` on `embedded-postgres`): **11 files, 106/106 tests passed** (`73` unit + `33` PG integration); V8 totals `Stmts 69.64%`, `Branch 65.16%`, `Funcs 63.89%`, `Lines 79.85%` passing all global and per-file floors. Redis (`pnpm test:redis`) and Playwright E2E remain **NOT RUN** locally (no local Redis `127.0.0.1:6379`). |
+
 ## Milestone 2 — Task 01 (Unified Structured Logging & Context Propagation) — 2026-11-15
 
 Verified on branch `feat/m2-structured-logging` (branched from `main` `e79ad6f`):

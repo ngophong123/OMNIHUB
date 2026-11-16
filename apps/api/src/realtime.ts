@@ -7,6 +7,7 @@ import { digest } from './domain';
 import { authenticate } from './auth';
 import { db } from './database';
 import { apiLogger } from './observability/logger';
+import { apiMetrics } from './observability/metrics';
 
 const TRACKING_TOKEN_RE = /^[a-f0-9]{64}$/i;
 const SESSION_TOKEN_RE = /^[a-f0-9]{64}$/i;
@@ -287,9 +288,16 @@ export async function revalidateRealtimeSockets(
 
 /** Attaches origin-enforced Socket.IO gateway and Redis Pub/Sub invalidation bridge to HTTP server. */
 export function attachRealtime(server: HttpServer, origin: string) {
+  let activeSockets = 0;
+  apiMetrics.setRealtimeConnectedSockets(0);
+
   const io = new Server(server, {
     cors: { origin, credentials: true },
-    allowRequest: (req, done) => done(null, req.headers.origin === origin),
+    allowRequest: (req, done) => {
+      const allowedOrigin = req.headers.origin === origin;
+      if (!allowedOrigin) apiMetrics.recordRealtimeConnection(false);
+      done(null, allowedOrigin);
+    },
   });
 
   io.use(async (socket, next) => {
@@ -327,6 +335,7 @@ export function attachRealtime(server: HttpServer, origin: string) {
       socket.data.room = `${c.tenantId}:${c.storeId}`;
       next();
     } catch (err) {
+      apiMetrics.recordRealtimeConnection(false);
       apiLogger.security('warn', 'REALTIME_HANDSHAKE_REJECTED', {
         component: 'realtime',
         errorType: err instanceof Error ? err.name : typeof err,
@@ -345,9 +354,21 @@ export function attachRealtime(server: HttpServer, origin: string) {
         ? socket.data.room
         : undefined;
     if (!assignedRoom) {
+      apiMetrics.recordRealtimeConnection(false);
       socket.disconnect(true);
       return;
     }
+    activeSockets++;
+    apiMetrics.setRealtimeConnectedSockets(activeSockets);
+    apiMetrics.recordRealtimeConnection(true);
+    let disconnected = false;
+    socket.once('disconnect', reason => {
+      if (disconnected) return;
+      disconnected = true;
+      activeSockets = Math.max(0, activeSockets - 1);
+      apiMetrics.setRealtimeConnectedSockets(activeSockets);
+      apiMetrics.recordRealtimeDisconnect(reason);
+    });
     void socket.join(assignedRoom);
   });
 
@@ -377,12 +398,15 @@ export function attachRealtime(server: HttpServer, origin: string) {
     try {
       const parsed = eventSchema.safeParse(JSON.parse(message));
       if (!parsed.success) {
+        apiMetrics.recordRealtimeBroadcast('invalid_payload');
         apiLogger.ops('warn', 'REALTIME_EVENT_INVALID', { component: 'realtime' });
         return;
       }
       await broadcastOperationalEvent(io, db, parsed.data);
+      apiMetrics.recordRealtimeBroadcast('broadcast');
     } catch (err) {
       /* malformed broker payload never reaches clients */
+      apiMetrics.recordRealtimeBroadcast('error');
       apiLogger.ops('error', 'REALTIME_BROADCAST_FAILED', {
         component: 'realtime',
         errorType: err instanceof Error ? err.name : typeof err,
@@ -403,6 +427,8 @@ export function attachRealtime(server: HttpServer, origin: string) {
   return async () => {
     clearInterval(timer);
     await io.close();
+    activeSockets = 0;
+    apiMetrics.setRealtimeConnectedSockets(0);
     await Promise.race([
       subscriber.quit().catch(() => undefined),
       new Promise<void>(resolve => setTimeout(resolve, 500)),

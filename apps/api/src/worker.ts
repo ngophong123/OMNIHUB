@@ -1,11 +1,28 @@
 import 'dotenv/config';
+import express from 'express';
+import type { Server } from 'node:http';
 import Redis from 'ioredis';
 import { db } from './database';
 import { validateDeployment } from './deployment-security';
 import { createOutboxWorkerLoop } from './outbox';
 import { workerLogger } from './observability/logger';
+import { workerMetrics } from './observability/metrics';
+import { createMetricsRequestHandler } from './observability/metrics-endpoint';
 
 validateDeployment();
+
+let metricsServer: Server | undefined;
+const metricsPortRaw = process.env.WORKER_METRICS_PORT;
+if (metricsPortRaw) {
+  const metricsPort = Number(metricsPortRaw);
+  if (!Number.isInteger(metricsPort) || metricsPort < 1 || metricsPort > 65535) {
+    throw new Error('WORKER_METRICS_PORT must be an integer between 1 and 65535');
+  }
+  const metricsApp = express();
+  metricsApp.disable('x-powered-by');
+  metricsApp.get('/metrics', createMetricsRequestHandler({ metrics: workerMetrics, backlogDb: db }));
+  metricsServer = metricsApp.listen(metricsPort, process.env.WORKER_METRICS_HOST ?? '127.0.0.1');
+}
 
 const redis = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', { maxRetriesPerRequest: 1 });
 let redisConnected = false;
@@ -30,6 +47,9 @@ async function shutdown(): Promise<void> {
   stopping = true;
   try {
     await loop.stop(10_000);
+    if (metricsServer) {
+      await new Promise<void>(resolve => metricsServer?.close(() => resolve()));
+    }
     await Promise.race([
       redis.quit().catch(() => undefined),
       new Promise<void>(resolve => setTimeout(resolve, 1_000)),
@@ -44,6 +64,7 @@ async function shutdown(): Promise<void> {
     });
     process.exitCode = 1;
   } finally {
+    workerMetrics.close();
     await workerLogger.close();
   }
 }
@@ -59,6 +80,7 @@ void loop.run().catch(async (err: unknown) => {
     component: 'outbox-worker',
     errorType: err instanceof Error ? err.name : typeof err,
   });
+  workerMetrics.close();
   await workerLogger.close();
   process.exitCode = 1;
 });

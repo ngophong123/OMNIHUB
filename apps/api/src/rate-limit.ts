@@ -2,6 +2,7 @@ import type { NextFunction, Request, RequestHandler, Response } from 'express';
 import type Redis from 'ioredis';
 import { digest } from './domain';
 import { apiLogger } from './observability/logger';
+import { apiMetrics } from './observability/metrics';
 
 const incrementScript = `
 local count = redis.call('INCR', KEYS[1])
@@ -42,14 +43,17 @@ export function createRedisRateLimiter(redis: RateLimitRedis, options: { prefix:
       if (count > limit) {
         res.setHeader('Retry-After', resetSeconds);
         const correlationId = res.getHeader('x-correlation-id');
+        apiMetrics.recordRateLimitDecision(prefix, 'blocked_429');
         apiLogger.security('warn', 'RATE_LIMITED', { component: 'rate-limiter', prefix, remaining: 0, resetSeconds, ...(correlationId ? { correlationId } : {}) });
         res.status(429).json({ code: 'RATE_LIMITED', correlationId });
         return;
       }
+      apiMetrics.recordRateLimitDecision(prefix, 'allowed');
       next();
     }).catch((error: unknown) => {
       // Protected routes fail closed: a Redis outage cannot reset counters on each API replica.
       const correlationId = res.getHeader('x-correlation-id');
+      apiMetrics.recordRateLimitDecision(prefix, 'unavailable_503');
       apiLogger.ops('error', 'RATE_LIMITER_UNAVAILABLE', {
         component: 'rate-limiter',
         prefix,
