@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { authEmailHmacPrefix } from '../../apps/api/src/auth';
+import { authenticate, authEmailHmacPrefix, reauthorize } from '../../apps/api/src/auth';
 import { digest } from '../../apps/api/src/domain';
 import { Errors } from '../../apps/api/src/errors';
 import { createHttpSecurityLoggingMiddleware } from '../../apps/api/src/observability/http-middleware';
@@ -630,5 +630,126 @@ describe('structured logging architecture (M2-T01)', () => {
     expect(sinkCloseCalls).toBe(1);
     expect(gates).toHaveLength(2);
     for (const release of gates) release();
+  });
+
+  it('omits correlationId in rate limiter logs when header is absent and records primitive error types cleanly', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const req = { ip: '127.0.0.1', socket: {} };
+
+    const blockedLimiter = createRedisRateLimiter(
+      { eval: vi.fn().mockResolvedValue([6, 60_000]) } as never,
+      { prefix: 'api_public', limit: 5, windowMs: 60_000 },
+    );
+    await new Promise<void>(resolve => {
+      const res = {
+        getHeader: vi.fn().mockReturnValue(undefined),
+        setHeader: vi.fn(),
+        status: vi.fn().mockReturnThis(),
+        json: vi.fn(() => resolve()),
+      };
+      blockedLimiter(req as never, res as never, vi.fn());
+    });
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    const blockedLog = JSON.parse(String(mustAt(warnSpy.mock.calls, 0)[0])) as Record<string, unknown>;
+    expect(blockedLog).toMatchObject({ category: 'security', level: 'warn', code: 'RATE_LIMITED' });
+    expect(blockedLog).not.toHaveProperty('correlationId');
+
+    const stringFailLimiter = createRedisRateLimiter(
+      { eval: vi.fn().mockRejectedValue('redis-timeout-string') } as never,
+      { prefix: 'login', limit: 5, windowMs: 60_000 },
+    );
+    await new Promise<void>(resolve => {
+      const res = {
+        getHeader: vi.fn().mockReturnValue(undefined),
+        setHeader: vi.fn(),
+        status: vi.fn().mockReturnThis(),
+        json: vi.fn(() => resolve()),
+      };
+      stringFailLimiter(req as never, res as never, vi.fn());
+    });
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    const errLog = JSON.parse(String(mustAt(errorSpy.mock.calls, 0)[0])) as Record<string, unknown>;
+    expect(errLog).toMatchObject({
+      category: 'operational',
+      level: 'error',
+      code: 'RATE_LIMITER_UNAVAILABLE',
+      errorType: 'string',
+    });
+    expect(errLog).not.toHaveProperty('correlationId');
+  });
+
+  it('falls back to AsyncLocalStorage correlationId across auth rejections and omits empty correlationId outside scope', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const validToken = 'd'.repeat(64);
+    const future = new Date(Date.now() + 60_000);
+
+    // 1. Missing session inside active AsyncLocalStorage context -> inherits ALS correlationId
+    const notFoundDb = {
+      session: { findUnique: vi.fn().mockResolvedValue(null) },
+    };
+    await runWithLogContext({ correlationId: 'corr-auth-als-01', service: 'omnihub-api', component: 'http' }, async () => {
+      await expect(authenticate(notFoundDb as never, validToken)).rejects.toThrow('SESSION_EXPIRED');
+    });
+    expect(JSON.parse(String(mustAt(warnSpy.mock.calls, 0)[0]))).toMatchObject({
+      code: 'AUTH_SESSION_REJECTED',
+      reason: 'SESSION_NOT_FOUND',
+      correlationId: 'corr-auth-als-01',
+    });
+
+    // 2. Inactive user outside ALS scope and no correlationId argument -> omits correlationId field
+    const inactiveDb = {
+      session: {
+        findUnique: vi.fn().mockResolvedValue({
+          userId: 'u-1',
+          storeId: 's-1',
+          tenantId: 't-1',
+          expiresAt: future,
+          user: { active: false },
+        }),
+      },
+    };
+    await expect(authenticate(inactiveDb as never, validToken)).rejects.toThrow('SESSION_EXPIRED');
+    const inactiveLog = JSON.parse(String(mustAt(warnSpy.mock.calls, 1)[0])) as Record<string, unknown>;
+    expect(inactiveLog).toMatchObject({ code: 'AUTH_SESSION_REJECTED', reason: 'USER_INACTIVE' });
+    expect(inactiveLog).not.toHaveProperty('correlationId');
+
+    // 3. Membership denied outside ALS scope -> omits correlationId
+    const noMemberDb = {
+      session: {
+        findUnique: vi.fn().mockResolvedValue({
+          userId: 'u-1',
+          storeId: 's-1',
+          tenantId: 't-1',
+          expiresAt: future,
+          user: { active: true },
+        }),
+      },
+      membership: { findUnique: vi.fn().mockResolvedValue(null) },
+    };
+    await expect(authenticate(noMemberDb as never, validToken)).rejects.toThrow('MEMBERSHIP_REQUIRED');
+    const noMemberLog = JSON.parse(String(mustAt(warnSpy.mock.calls, 2)[0])) as Record<string, unknown>;
+    expect(noMemberLog).toMatchObject({ code: 'AUTH_MEMBERSHIP_DENIED', tenantId: 't-1', storeId: 's-1', userId: 'u-1' });
+    expect(noMemberLog).not.toHaveProperty('correlationId');
+
+    // 4. Reauthorize revoked with empty ctx.correlationId -> omits correlationId
+    const revokedTx = {
+      session: { findUnique: vi.fn().mockResolvedValue(null) },
+      membership: { findUnique: vi.fn().mockResolvedValue(null) },
+    };
+    await expect(
+      reauthorize(revokedTx as never, {
+        tenantId: 't-1',
+        storeId: 's-1',
+        userId: 'u-1',
+        role: 'CASHIER',
+        tokenHash: digest(validToken),
+        expiresAt: future,
+        correlationId: '',
+      }),
+    ).rejects.toThrow('SESSION_REVOKED');
+    const revokedLog = JSON.parse(String(mustAt(warnSpy.mock.calls, 3)[0])) as Record<string, unknown>;
+    expect(revokedLog).toMatchObject({ code: 'AUTH_REAUTHORIZE_REVOKED', tenantId: 't-1', storeId: 's-1', userId: 'u-1' });
+    expect(revokedLog).not.toHaveProperty('correlationId');
   });
 });
