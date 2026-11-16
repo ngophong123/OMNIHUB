@@ -219,25 +219,30 @@ describe('multi-replica Socket.IO Redis adapter & instant revocation (M2-T09)', 
   }, 60_000);
 
   it('fails readiness closed and enforces real Redis 7 ACL least-privilege permissions without crashing', async () => {
-    const unusedPort = await availablePort();
-    const server = createHttpServer();
-    await new Promise<void>(resolvePromise => server.listen(0, '127.0.0.1', resolvePromise));
+    const withAttachedServer = async (redisUrl: string, fn: () => Promise<void>) => {
+      const srv = createHttpServer();
+      await new Promise<void>(resolvePromise => srv.listen(0, '127.0.0.1', resolvePromise));
+      const closeRealtime = attachRealtime(srv, 'http://localhost:3000', { redisUrl });
+      try {
+        await fn();
+      } finally {
+        await closeRealtime();
+        await new Promise<void>(resolvePromise => srv.close(() => resolvePromise()));
+      }
+    };
 
-    const closeOffline = attachRealtime(server, 'http://localhost:3000', {
-      redisUrl: `redis://127.0.0.1:${unusedPort}`,
-    });
-    try {
+    const unusedPort = await availablePort();
+    await withAttachedServer(`redis://127.0.0.1:${unusedPort}`, async () => {
       await new Promise(resolveDelay => setTimeout(resolveDelay, 150));
       expect(await realtimeRedisReady()).toBe(false);
-    } finally {
-      await closeOffline();
-    }
+    });
 
     if (!process.env.REDIS_URL) throw new Error('REDIS_URL is required');
     const adminRedis = new Redis(process.env.REDIS_URL, { lazyConnect: true, enableOfflineQueue: false, retryStrategy: () => null });
     adminRedis.on('error', () => undefined);
     const aclPassword = randomBytes(16).toString('hex');
     const goodUser = `omnihub_rt_ok_${randomBytes(4).toString('hex')}`;
+    const noPsubUser = `omnihub_rt_nopsub_${randomBytes(4).toString('hex')}`;
     const badUser = `omnihub_rt_bad_${randomBytes(4).toString('hex')}`;
 
     try {
@@ -245,6 +250,7 @@ describe('multi-replica Socket.IO Redis adapter & instant revocation (M2-T09)', 
       const baseParsed = new URL(process.env.REDIS_URL);
 
       // Exact staging ACL from deploy/redis-start.sh succeeds cleanly for Socket.IO Redis adapter + Outbox subscriber.
+      // Redis 7 PSUBSCRIBE checks literal pattern equality, so &omnihub:socket.io#/#* must match the default "/" namespace pattern.
       await adminRedis.acl(
         'SETUSER',
         goodUser,
@@ -252,7 +258,7 @@ describe('multi-replica Socket.IO Redis adapter & instant revocation (M2-T09)', 
         `>${aclPassword}`,
         '~omnihub:rate:*',
         '&omnihub.events',
-        '&omnihub:socket.io#*',
+        '&omnihub:socket.io#/#*',
         '&omnihub:socket.io-request#*',
         '&omnihub:socket.io-response#*',
         '-@all',
@@ -278,18 +284,44 @@ describe('multi-replica Socket.IO Redis adapter & instant revocation (M2-T09)', 
       const goodUrl = new URL(baseParsed.toString());
       goodUrl.username = goodUser;
       goodUrl.password = aclPassword;
-      const closeGood = attachRealtime(server, 'http://localhost:3000', { redisUrl: goodUrl.toString() });
-      try {
+      await withAttachedServer(goodUrl.toString(), async () => {
         const deadline = Date.now() + 5_000;
         while (Date.now() < deadline && !(await realtimeRedisReady())) {
           await new Promise(resolveDelay => setTimeout(resolveDelay, 50));
         }
         expect(await realtimeRedisReady()).toBe(true);
-      } finally {
-        await closeGood();
-      }
+      });
 
-      // Restricted ACL missing +psubscribe & +pubsub|numsub fails readiness closed with NOPERM without crashing process.
+      // ACL with +info and +subscribe on omnihub.events, but missing literal PSUBSCRIBE pattern / +psubscribe, fails NOPERM cleanly without crashing.
+      await adminRedis.acl(
+        'SETUSER',
+        noPsubUser,
+        'on',
+        `>${aclPassword}`,
+        '&omnihub.events',
+        '&omnihub:socket.io#*',
+        '&omnihub:socket.io-request#*',
+        '&omnihub:socket.io-response#*',
+        '-@all',
+        '+ping',
+        '+hello',
+        '+quit',
+        '+select',
+        '+client|setinfo',
+        '+client|setname',
+        '+info',
+        '+subscribe',
+        '+unsubscribe',
+      );
+      const noPsubUrl = new URL(baseParsed.toString());
+      noPsubUrl.username = noPsubUser;
+      noPsubUrl.password = aclPassword;
+      await withAttachedServer(noPsubUrl.toString(), async () => {
+        await new Promise(resolveDelay => setTimeout(resolveDelay, 250));
+        expect(await realtimeRedisReady()).toBe(false);
+      });
+
+      // Minimal ACL missing both +info and +psubscribe also fails readiness closed cleanly.
       await adminRedis.acl(
         'SETUSER',
         badUser,
@@ -309,17 +341,13 @@ describe('multi-replica Socket.IO Redis adapter & instant revocation (M2-T09)', 
       const badUrl = new URL(baseParsed.toString());
       badUrl.username = badUser;
       badUrl.password = aclPassword;
-      const closeBad = attachRealtime(server, 'http://localhost:3000', { redisUrl: badUrl.toString() });
-      try {
+      await withAttachedServer(badUrl.toString(), async () => {
         await new Promise(resolveDelay => setTimeout(resolveDelay, 250));
         expect(await realtimeRedisReady()).toBe(false);
-      } finally {
-        await closeBad();
-      }
+      });
     } finally {
-      await adminRedis.acl('DELUSER', goodUser, badUser).catch(() => undefined);
-      await new Promise<void>(resolvePromise => server.close(() => resolvePromise()));
+      await adminRedis.acl('DELUSER', goodUser, noPsubUser, badUser).catch(() => undefined);
       adminRedis.disconnect();
     }
-  });
+  }, 20_000);
 });
