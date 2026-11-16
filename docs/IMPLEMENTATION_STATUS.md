@@ -1,5 +1,15 @@
 # Implementation status
 
+## Milestone 2 — Task 02: Prometheus Metrics & Monitoring (2026-11-16)
+
+Branch `feat/m2-prometheus-metrics` implements `M2-T02` (from [`M2_BACKEND_AUDIT.md`](M2_BACKEND_AUDIT.md) and [`M2_IMPLEMENTATION_PLAN.md`](M2_IMPLEMENTATION_PLAN.md), **Pilot remains NO-GO** pending remaining M2 P0/P1/ops gates):
+
+| Workstream / Gate | Status | Evidence & Scope Boundary |
+|---|---|---|
+| Prometheus registry & cardinality controls (`apps/api/src/observability/metrics.ts`) | VERIFIED | Added `prom-client@15.1.3` (`Apache-2.0`, 0 high/critical advisories) with bounded finite-label metrics covering HTTP Golden Signals (`http_requests_total`, `http_request_duration_seconds`, `http_requests_in_flight`, `http_errors_total`), rate limits (`rate_limit_decisions_total`), database retries/errors (`command_bus_attempts_total`, `db_transaction_retries_total`, `db_errors_total`), Outbox backlog/health (`outbox_pending_count`, `outbox_oldest_pending_age_seconds`, `outbox_dead_letter_total`, `outbox_quarantined_events_total`, `outbox_events_total`, `outbox_batch_duration_seconds`, `outbox_worker_health`, `outbox_worker_consecutive_failures`), Socket.IO (`realtime_connected_sockets`, `realtime_connections_total`, `realtime_disconnects_total`, `realtime_events_broadcast_total`), and single-guarded default Node runtime metrics. See [`METRICS_ARCHITECTURE.md`](METRICS_ARCHITECTURE.md). |
+| Protected `/metrics` endpoint & instrumentation wiring (`metrics-endpoint.ts`, `http-middleware.ts`, `http-app.ts`, `errors.ts`, `rate-limit.ts`, `commands.ts`, `outbox.ts`, `realtime.ts`, `main.ts`, `worker.ts`, `deploy/Caddyfile`) | VERIFIED | `/metrics` blocked externally at `deploy/Caddyfile` (`respond /metrics* 403`), rate-limited in-process via `express-rate-limit@8.7.4` (`BoundedMemoryRateLimitStore`, `120` req/`60s` default per SHA-256 hashed direct socket IP / `/64` IPv6 prefix, `429 RATE_LIMITED` + `Retry-After`), and gated in `createMetricsRequestHandler` via constant-time `METRICS_AUTH_TOKEN` Bearer auth or unproxied loopback allowlist, with TTL-cached coalesced `Outbox(deliveredAt, createdAt)` backlog polling and optional loopback-only `WORKER_METRICS_PORT` support + graceful `close()` teardown across API and Worker shutdown paths. |
+| `M2-T02` verification & CI coverage gates | VERIFIED | Verified `74/74` unit tests (`8` files) and `107/107` unit + real `embedded-postgres` integration tests (`11` files; V8 `Stmts 69.83%`, `Branch 65.13%`, `Funcs 64.56%`, `Lines 79.81%`), `typecheck`, `lint`, `security:hygiene`, `audit`, and `build`; Redis & Playwright E2E await GitHub Actions PR CI. |
+
 ## Milestone 2 — Task 01: Unified Structured Logging & Correlation Context (2026-11-15)
 
 Branch `feat/m2-structured-logging` implements `M2-T01` (from [`M2_BACKEND_AUDIT.md`](M2_BACKEND_AUDIT.md) and [`M2_IMPLEMENTATION_PLAN.md`](M2_IMPLEMENTATION_PLAN.md)) and reconciles M2 roadmap/baseline documentation (**Pilot remains NO-GO** pending remaining M2 P0/P1/ops gates):

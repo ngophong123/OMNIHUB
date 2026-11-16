@@ -3,6 +3,7 @@ import { Prisma } from '@prisma/client';
 import type { Request, Response } from 'express';
 import { accessLogPath } from './deployment-security';
 import { apiLogger } from './observability/logger';
+import { apiMetrics } from './observability/metrics';
 import { getLogContext } from './observability/request-context';
 
 export type ClassifiedError = {
@@ -127,9 +128,20 @@ export class Errors implements ExceptionFilter {
     const response = http.getResponse<Response>();
     const correlationId = response.getHeader('x-correlation-id') ?? getLogContext()?.correlationId;
     const classified = classifyError(error);
+    const pathSource = request?.originalUrl ?? request?.url;
+    const routeObj = request ? (request as Request & { route?: { path?: unknown } }).route : undefined;
+
+    apiMetrics.recordHttpError({
+      method: request?.method,
+      routePath: routeObj?.path,
+      originalUrl: pathSource,
+      code: classified.code,
+    });
+    if (classified.prismaCode || classified.code === 'DB_UNAVAILABLE') {
+      apiMetrics.recordDbError(classified.prismaCode ?? classified.code);
+    }
 
     if (classified.shouldLog) {
-      const pathSource = request?.originalUrl ?? request?.url;
       apiLogger.ops('error', classified.code, {
         component: 'http-exception-filter',
         statusCode: classified.status,

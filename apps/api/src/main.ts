@@ -7,6 +7,7 @@ import { createRedisRateLimiter, setRateLimitRedisHealthProbe } from './rate-lim
 import { validateDeployment } from './deployment-security';
 import { createConfiguredHttpApp } from './http-app';
 import { apiLogger } from './observability/logger';
+import { apiMetrics } from './observability/metrics';
 
 function configuredLimit(name: string, fallback: number, maximum: number): number {
   const value = Number(process.env[name] ?? fallback);
@@ -54,11 +55,13 @@ async function main() {
     void closeRealtime().then(() => app.close()).then(() => limiterRedis.quit().catch(() => limiterRedis.disconnect())).then(() => db.$disconnect())
       .then(async () => {
         apiLogger.ops('info', 'API_STOPPED', { component: 'bootstrap', signal });
+        apiMetrics.close();
         await apiLogger.close();
         clearTimeout(deadline);
       })
       .catch(async (err: unknown) => {
         apiLogger.ops('error', 'API_SHUTDOWN_FAILED', { component: 'bootstrap', signal, errorType: err instanceof Error ? err.name : typeof err });
+        apiMetrics.close();
         await apiLogger.close();
         clearTimeout(deadline);
         process.exitCode = 1;
@@ -67,6 +70,7 @@ async function main() {
 }
 void main().catch(async (err: unknown) => {
   apiLogger.ops('fatal', 'API_START_FAILED', { component: 'bootstrap', errorType: err instanceof Error ? err.name : typeof err });
+  apiMetrics.close();
   await apiLogger.close();
   process.exitCode = 1;
 });
