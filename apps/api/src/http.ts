@@ -18,6 +18,7 @@ import { QrOrdering } from './qr-ordering';
 import * as QRCode from 'qrcode';
 import { Prisma } from '@prisma/client';
 import { rateLimitRedisReady } from './rate-limit';
+import { getLogContext } from './observability/request-context';
 
 const ops = new Operations(db);
 const catalog = new CatalogOperations(db);
@@ -40,7 +41,7 @@ function parse<S extends z.ZodTypeAny>(schema: S, value: unknown): z.output<S> {
   if (!result.success) throw new BadRequestException('INVALID_INPUT');
   return result.data;
 }
-const context = (req: Request) => authenticate(db, typeof req.cookies?.session === 'string' ? req.cookies.session : undefined, String(req.res?.getHeader('x-correlation-id') ?? ''));
+const context = (req: Request) => authenticate(db, typeof req.cookies?.session === 'string' ? req.cookies.session : undefined, String(req.res?.getHeader('x-correlation-id') ?? getLogContext()?.correlationId ?? ''));
 const key = (req: Request) => req.get('Idempotency-Key') ?? '';
 const uuid = (id: string) => parse(z.string().uuid(), id);
 const HEX64_RE = /^[a-f0-9]{64}$/i;
@@ -77,10 +78,13 @@ class ApiController {
     const bearer = req.get('Authorization')?.match(/^Bearer ([a-f0-9]{64})$/i)?.[1];
     if (!bearer) throw new ForbiddenException('TABLE_SESSION_REQUIRED');
     const session = await qrOrdering.validateCustomerSession(bearer);
-    const ctx = { tenantId: session.tenantId, storeId: session.storeId, userId: session.id, role: 'CASHIER' as const, tokenHash: session.sessionTokenHash, expiresAt: session.expiresAt, correlationId: String(req.res?.getHeader('x-correlation-id') ?? '') };
+    const ctx = { tenantId: session.tenantId, storeId: session.storeId, userId: session.id, role: 'CASHIER' as const, tokenHash: session.sessionTokenHash, expiresAt: session.expiresAt, correlationId: String(req.res?.getHeader('x-correlation-id') ?? getLogContext()?.correlationId ?? '') };
     return ops.acceptFromTable(ctx, key(req), parse(orderSchema, body), session.id);
   }
-  @Post('public/invitations/:token/accept') async acceptInvitation(@Param('token') token: string, @Body() body: unknown) { return pilotAdmin.acceptInvitation(token, parse(invitationAcceptSchema, body).password); }
+  @Post('public/invitations/:token/accept') async acceptInvitation(@Req() req: Request, @Param('token') token: string, @Body() body: unknown) {
+    const correlationId = String(req.res?.getHeader('x-correlation-id') ?? getLogContext()?.correlationId ?? '');
+    return pilotAdmin.acceptInvitation(token, parse(invitationAcceptSchema, body).password, correlationId);
+  }
   @Get('public/order-status/:token') async publicOrderStatus(@Param('token') token: string) { return qrOrdering.status(token); }
   @Get('catalog') async catalog(@Req() req: Request) {
     const c = await context(req);

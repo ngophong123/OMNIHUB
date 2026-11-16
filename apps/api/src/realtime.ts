@@ -6,6 +6,7 @@ import { eventSchema, type OperationalEvent } from '@omnihub/contracts';
 import { digest } from './domain';
 import { authenticate } from './auth';
 import { db } from './database';
+import { apiLogger } from './observability/logger';
 
 const TRACKING_TOKEN_RE = /^[a-f0-9]{64}$/i;
 const SESSION_TOKEN_RE = /^[a-f0-9]{64}$/i;
@@ -325,7 +326,11 @@ export function attachRealtime(server: HttpServer, origin: string) {
       socket.data.token = token;
       socket.data.room = `${c.tenantId}:${c.storeId}`;
       next();
-    } catch {
+    } catch (err) {
+      apiLogger.security('warn', 'REALTIME_HANDSHAKE_REJECTED', {
+        component: 'realtime',
+        errorType: err instanceof Error ? err.name : typeof err,
+      });
       next(new Error('UNAUTHORIZED'));
     }
   });
@@ -347,25 +352,51 @@ export function attachRealtime(server: HttpServer, origin: string) {
   });
 
   const subscriber = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', { maxRetriesPerRequest: 1 });
-  subscriber.on('error', () => {
+  let realtimeRedisConnected = false;
+  let realtimeRedisFailed = false;
+  subscriber.on('error', error => {
     /* The Redis health probe keeps readiness fail-closed during an outage. */
+    if (realtimeRedisConnected || !realtimeRedisFailed) {
+      apiLogger.ops('warn', 'REALTIME_REDIS_UNAVAILABLE', { component: 'realtime', errorType: error.name });
+    }
+    realtimeRedisConnected = false;
+    realtimeRedisFailed = true;
   });
   // Initial subscribe can exhaust retries while Redis is down; re-register on recovery.
   subscriber.on('ready', () => {
-    void subscriber.subscribe('omnihub.events').catch(() => undefined);
+    if (!realtimeRedisConnected) apiLogger.ops('info', 'REALTIME_REDIS_READY', { component: 'realtime' });
+    realtimeRedisConnected = true;
+    void subscriber.subscribe('omnihub.events').catch((err: unknown) => {
+      apiLogger.ops('error', 'REALTIME_SUBSCRIBE_FAILED', {
+        component: 'realtime',
+        errorType: err instanceof Error ? err.name : typeof err,
+      });
+    });
   });
   subscriber.on('message', async (_channel, message) => {
     try {
       const parsed = eventSchema.safeParse(JSON.parse(message));
-      if (!parsed.success) return;
+      if (!parsed.success) {
+        apiLogger.ops('warn', 'REALTIME_EVENT_INVALID', { component: 'realtime' });
+        return;
+      }
       await broadcastOperationalEvent(io, db, parsed.data);
-    } catch {
+    } catch (err) {
       /* malformed broker payload never reaches clients */
+      apiLogger.ops('error', 'REALTIME_BROADCAST_FAILED', {
+        component: 'realtime',
+        errorType: err instanceof Error ? err.name : typeof err,
+      });
     }
   });
 
   const timer = setInterval(() => {
-    void revalidateRealtimeSockets(io.sockets.sockets.values(), db).catch(() => undefined);
+    void revalidateRealtimeSockets(io.sockets.sockets.values(), db).catch((err: unknown) => {
+      apiLogger.ops('warn', 'REALTIME_REVALIDATE_FAILED', {
+        component: 'realtime',
+        errorType: err instanceof Error ? err.name : typeof err,
+      });
+    });
   }, 30_000);
   timer.unref?.();
 

@@ -1,5 +1,15 @@
 # Testing strategy
 
+## Milestone 2 — Task 01 (Unified Structured Logging & Context Propagation) — 2026-11-15
+
+Verified on branch `feat/m2-structured-logging` (branched from `main` `e79ad6f`):
+
+| Check | Status | Current result |
+|---|---|---|
+| Structured logging unit & HTTP middleware tests (`tests/unit/structured-logging.test.ts`) | VERIFIED | `15/15` tests covering JSON envelope schema & categories (`application`/`security`/`operational`), `LOG_LEVEL` short-circuit filtering, `resolveCorrelationId` sanitization, concurrent `Promise.all` `AsyncLocalStorage` isolation & `updateLogContext` tenant/store/user enrichment, worker batch metadata (`jobName`/`batchId`) + valid per-event `correlationId` preservation, keyed HMAC `authEmailHmacPrefix`, full URL credential/Redis `:pass@`/`Basic`/query/binary/prototype-key redaction, context-overwrite protection, `Errors` filter + `createRedisRateLimiter` (`429`/`503`, omitted header & non-`Error` rejections), `authenticate`/`reauthorize` rejection/ALS correlation fallback branches, concurrent `close()` idempotency + backpressure cap + bounded `flush()`, and HTTP `createHttpSecurityLoggingMiddleware` (`X-Correlation-ID`, `HTTP_ACCESS`, `ORIGIN_DENIED`). |
+| Full local unit, PostgreSQL integration & CI coverage gates (`pnpm test`, `pnpm test:coverage`, `pnpm test:coverage:ci`) | VERIFIED | **9 files, 97/97 tests passed** (`65/65` unit tests across 7 files + `32/32` real `embedded-postgres` integration tests across 2 files) passing all global & per-file V8 coverage floors (including `auth.ts` and `rate-limit.ts` branch coverage thresholds). |
+| Static checks (`typecheck`, `lint`, `security:hygiene`) & build | VERIFIED | Passed cleanly after all `M2-T01` code, test, and documentation edits (recorded below). |
+
 ## Milestone 1 — Backend Stabilization, Realtime/Outbox & Security Hardening — 2026-11-15
 
 Verified on branch `fix/m1-backend-stabilization` across hosted PR #3 CI (prior commit `9a46416`) and the post-review local Windows `embedded-postgres` run (PostgreSQL 18 on `127.0.0.1:5432`, **Pilot remains NO-GO**):

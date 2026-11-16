@@ -1,6 +1,7 @@
 import type { NextFunction, Request, RequestHandler, Response } from 'express';
 import type Redis from 'ioredis';
 import { digest } from './domain';
+import { apiLogger } from './observability/logger';
 
 const incrementScript = `
 local count = redis.call('INCR', KEYS[1])
@@ -40,13 +41,22 @@ export function createRedisRateLimiter(redis: RateLimitRedis, options: { prefix:
       res.setHeader('RateLimit-Reset', resetSeconds);
       if (count > limit) {
         res.setHeader('Retry-After', resetSeconds);
-        res.status(429).json({ code: 'RATE_LIMITED', correlationId: res.getHeader('x-correlation-id') });
+        const correlationId = res.getHeader('x-correlation-id');
+        apiLogger.security('warn', 'RATE_LIMITED', { component: 'rate-limiter', prefix, remaining: 0, resetSeconds, ...(correlationId ? { correlationId } : {}) });
+        res.status(429).json({ code: 'RATE_LIMITED', correlationId });
         return;
       }
       next();
-    }).catch(() => {
+    }).catch((error: unknown) => {
       // Protected routes fail closed: a Redis outage cannot reset counters on each API replica.
-      res.status(503).json({ code: 'RATE_LIMITER_UNAVAILABLE', correlationId: res.getHeader('x-correlation-id') });
+      const correlationId = res.getHeader('x-correlation-id');
+      apiLogger.ops('error', 'RATE_LIMITER_UNAVAILABLE', {
+        component: 'rate-limiter',
+        prefix,
+        errorType: error instanceof Error ? error.name : typeof error,
+        ...(correlationId ? { correlationId } : {}),
+      });
+      res.status(503).json({ code: 'RATE_LIMITER_UNAVAILABLE', correlationId });
     });
   };
 }

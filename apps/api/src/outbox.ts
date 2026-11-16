@@ -1,6 +1,9 @@
+import { randomUUID } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
 import { Prisma, type PrismaClient } from '@prisma/client';
 import { eventSchema } from '@omnihub/contracts';
+import { workerLogger } from './observability/logger';
+import { runWithLogContext } from './observability/request-context';
 
 export const OUTBOX_CHANNEL = 'omnihub.events';
 export const DEFAULT_BATCH_SIZE = 100;
@@ -211,13 +214,11 @@ export async function processOutboxBatch(options: OutboxBatchOptions): Promise<O
       if (!parsed.success) {
         quarantined++;
         quarantineId(quarantinedIds, row.id);
-        console.error(JSON.stringify({
-          level: 'error',
+        workerLogger.ops('error', 'OUTBOX_EVENT_INVALID', {
           component: 'outbox-worker',
-          code: 'OUTBOX_EVENT_INVALID',
           eventId: row.id,
-          correlationId: row.correlationId,
-        }));
+          ...(row.correlationId ? { correlationId: row.correlationId } : {}),
+        });
         continue;
       }
 
@@ -233,12 +234,13 @@ export async function processOutboxBatch(options: OutboxBatchOptions): Promise<O
           budgetCapped ? 'batch_budget' : 'publish_timeout',
         );
         deliveredIds.push(row.id);
-        console.log(JSON.stringify({
-          level: 'info',
+        workerLogger.ops('info', 'OUTBOX_PUBLISHED', {
+          component: 'outbox-worker',
           action: 'outbox.published',
           eventId: row.id,
-          correlationId: row.correlationId,
-        }));
+          eventType: parsed.data.type,
+          ...(row.correlationId ? { correlationId: row.correlationId } : {}),
+        });
       } catch (err) {
         if (err instanceof PublishTimeoutError && err.reason === 'batch_budget') {
           budgetExceeded = true;
@@ -323,61 +325,66 @@ export function createOutboxWorkerLoop(options: WorkerLoopOptions) {
     }, ms);
   });
 
-  const step = async (): Promise<number> => {
-    try {
-      const result = await processOutboxBatch({
-        db,
-        redis,
-        batchSize,
-        publishTimeoutMs,
-        batchTimeBudgetMs,
-        transactionTimeoutMs,
-        now,
-        quarantinedIds,
-        shouldContinue: () => running,
-      });
+  const step = async (): Promise<number> => runWithLogContext(
+    {
+      correlationId: randomUUID(),
+      service: 'omnihub-worker',
+      component: 'outbox-worker',
+      jobName: 'outbox-batch',
+      batchId: randomUUID(),
+    },
+    async () => {
+      try {
+        const result = await processOutboxBatch({
+          db,
+          redis,
+          batchSize,
+          publishTimeoutMs,
+          batchTimeBudgetMs,
+          transactionTimeoutMs,
+          now,
+          quarantinedIds,
+          shouldContinue: () => running,
+        });
 
-      if (result.error) {
+        if (result.error) {
+          consecutiveFailures++;
+          if (!degraded) {
+            workerLogger.ops('warn', 'OUTBOX_RETRY', {
+              component: 'outbox-worker',
+              errorType: result.error.name,
+            });
+          }
+          degraded = true;
+          return computeBackoffMs(consecutiveFailures, baseBackoffMs, maxBackoffMs);
+        }
+
+        if (heartbeatFile) {
+          if (redis.ping) await redis.ping();
+          await writeFile(heartbeatFile, String(Date.now()));
+        }
+
+        if (degraded) {
+          workerLogger.ops('info', 'OUTBOX_RECOVERED', { component: 'outbox-worker' });
+        }
+        degraded = false;
+        consecutiveFailures = 0;
+        const madeProgressUnderBudget =
+          Boolean(result.budgetExceeded) && (result.delivered > 0 || result.quarantined > 0);
+        return result.claimed >= batchSize || madeProgressUnderBudget ? 0 : pollIntervalMs;
+      } catch (err) {
         consecutiveFailures++;
         if (!degraded) {
-          console.warn(JSON.stringify({
-            level: 'warn',
+          workerLogger.ops('warn', 'OUTBOX_RETRY', {
             component: 'outbox-worker',
-            code: 'OUTBOX_RETRY',
-            errorType: result.error.name,
-          }));
+            errorType: err instanceof Error ? err.name : 'unknown',
+          });
         }
         degraded = true;
         return computeBackoffMs(consecutiveFailures, baseBackoffMs, maxBackoffMs);
       }
-
-      if (heartbeatFile) {
-        if (redis.ping) await redis.ping();
-        await writeFile(heartbeatFile, String(Date.now()));
-      }
-
-      if (degraded) {
-        console.log(JSON.stringify({ level: 'info', component: 'outbox-worker', code: 'OUTBOX_RECOVERED' }));
-      }
-      degraded = false;
-      consecutiveFailures = 0;
-      const madeProgressUnderBudget =
-        Boolean(result.budgetExceeded) && (result.delivered > 0 || result.quarantined > 0);
-      return result.claimed >= batchSize || madeProgressUnderBudget ? 0 : pollIntervalMs;
-    } catch (err) {
-      consecutiveFailures++;
-      if (!degraded) {
-        console.warn(JSON.stringify({
-          level: 'warn',
-          component: 'outbox-worker',
-          code: 'OUTBOX_RETRY',
-          errorType: err instanceof Error ? err.name : 'unknown',
-        }));
-      }
-      degraded = true;
-      return computeBackoffMs(consecutiveFailures, baseBackoffMs, maxBackoffMs);
-    }
-  };
+    },
+  );
 
   const run = async () => {
     while (running) {

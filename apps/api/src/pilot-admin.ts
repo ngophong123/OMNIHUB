@@ -4,6 +4,8 @@ import { Prisma, PrismaClient } from '@prisma/client';
 import type { Role } from '@omnihub/contracts';
 import { allowed, digest, hashPassword, verifyPassword } from './domain';
 import { reauthorize, type Context } from './auth';
+import { apiLogger } from './observability/logger';
+import { getLogContext } from './observability/request-context';
 
 const invitationRoles: readonly Role[] = ['MANAGER', 'CASHIER', 'KITCHEN', 'INVENTORY'];
 
@@ -27,6 +29,7 @@ export class PilotAdmin {
       await tx.audit.create({ data: { tenantId: current.tenantId, storeId: current.storeId, actorId: current.userId, action: 'STORE_INVITATION_CREATED', entityId: created.id, commandKey: `store-invitation:create:${randomUUID()}`, correlationId: current.correlationId, details: { email, role: input.role, expiresAt: expiresAt.toISOString() } } });
       return created;
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    apiLogger.security('info', 'STORE_INVITATION_CREATED', { component: 'pilot-admin', tenantId: ctx.tenantId, storeId: ctx.storeId, invitationId: invitation.id, role: invitation.role, correlationId: ctx.correlationId });
     return { id: invitation.id, email, role: invitation.role, expiresAt: invitation.expiresAt, token };
   }
 
@@ -47,16 +50,20 @@ export class PilotAdmin {
       if (changed.count !== 1) throw new ConflictException('INVITATION_NOT_PENDING');
       await tx.audit.create({ data: { tenantId: current.tenantId, storeId: current.storeId, actorId: current.userId, action: 'STORE_INVITATION_REVOKED', entityId: id, commandKey: `store-invitation:revoke:${randomUUID()}`, correlationId: current.correlationId, details: { email: invitation.email, role: invitation.role } } });
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    apiLogger.security('info', 'STORE_INVITATION_REVOKED', { component: 'pilot-admin', tenantId: ctx.tenantId, storeId: ctx.storeId, invitationId: id, role: invitation.role, correlationId: ctx.correlationId });
     return { id, revoked: true };
   }
 
-  async acceptInvitation(token: string, password: string) {
+  async acceptInvitation(token: string, password: string, correlationId = getLogContext()?.correlationId ?? '') {
     if (!/^[a-f0-9]{64}$/.test(token)) throw new UnauthorizedException('INVITATION_INVALID_OR_EXPIRED');
     const tokenHash = digest(token); const now = new Date();
     const invitation = await this.client.storeInvitation.findFirst({ where: { tokenHash, acceptedAt: null, revokedAt: null, expiresAt: { gt: now } } });
     if (!invitation) throw new UnauthorizedException('INVITATION_INVALID_OR_EXPIRED');
     const existing = await this.client.user.findUnique({ where: { email: invitation.email } });
-    if (existing && !verifyPassword(password, existing.passwordHash)) throw new UnauthorizedException('EXISTING_ACCOUNT_PASSWORD_REQUIRED');
+    if (existing && !verifyPassword(password, existing.passwordHash)) {
+      apiLogger.security('warn', 'STORE_INVITATION_ACCEPT_DENIED', { component: 'pilot-admin', tenantId: invitation.tenantId, storeId: invitation.storeId, invitationId: invitation.id, ...(correlationId ? { correlationId } : {}) });
+      throw new UnauthorizedException('EXISTING_ACCOUNT_PASSWORD_REQUIRED');
+    }
     const passwordHash = existing ? undefined : hashPassword(password);
     return this.client.$transaction(async tx => {
       const current = await tx.storeInvitation.findFirst({ where: { id: invitation.id, tokenHash, acceptedAt: null, revokedAt: null, expiresAt: { gt: new Date() } } });
@@ -65,7 +72,8 @@ export class PilotAdmin {
       const claimed = await tx.storeInvitation.updateMany({ where: { id: current.id, acceptedAt: null, revokedAt: null, expiresAt: { gt: new Date() } }, data: { acceptedAt: new Date() } });
       if (claimed.count !== 1) throw new ConflictException('INVITATION_ALREADY_USED');
       await tx.membership.create({ data: { tenantId: current.tenantId, storeId: current.storeId, userId: user.id, role: current.role } });
-      await tx.audit.create({ data: { tenantId: current.tenantId, storeId: current.storeId, actorId: user.id, action: 'STORE_INVITATION_ACCEPTED', entityId: current.id, commandKey: `store-invitation:accept:${current.id}`, correlationId: '', details: { email: current.email, role: current.role } } });
+      await tx.audit.create({ data: { tenantId: current.tenantId, storeId: current.storeId, actorId: user.id, action: 'STORE_INVITATION_ACCEPTED', entityId: current.id, commandKey: `store-invitation:accept:${current.id}`, correlationId, details: { email: current.email, role: current.role } } });
+      apiLogger.security('info', 'STORE_INVITATION_ACCEPTED', { component: 'pilot-admin', tenantId: current.tenantId, storeId: current.storeId, invitationId: current.id, userId: user.id, role: current.role, ...(correlationId ? { correlationId } : {}) });
       return { accepted: true, email: current.email, storeId: current.storeId };
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
   }

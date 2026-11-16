@@ -2,11 +2,9 @@ import type { INestApplication } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
-import { randomUUID } from 'node:crypto';
-import type { NextFunction, Request, Response } from 'express';
 import { AppModule } from './http';
 import { Errors } from './errors';
-import { accessLogPath } from './deployment-security';
+import { createHttpSecurityLoggingMiddleware } from './observability/http-middleware';
 
 export type HttpAppOptions = {
   origin?: string;
@@ -14,6 +12,8 @@ export type HttpAppOptions = {
   enableAccessLogs?: boolean;
   configureBeforeFilters?: (app: INestApplication) => void;
 };
+
+export { createHttpSecurityLoggingMiddleware };
 
 /**
  * Creates the NestJS Express application with security headers, Origin CSRF gate,
@@ -44,26 +44,7 @@ export async function createConfiguredHttpApp(options: HttpAppOptions = {}): Pro
     referrerPolicy: { policy: 'no-referrer' },
   }));
   app.use(cookieParser());
-  app.use((req: Request, res: Response, next: NextFunction) => {
-    const correlationId = randomUUID();
-    res.setHeader('x-correlation-id', correlationId);
-    res.setHeader('Cache-Control', 'no-store');
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
-    const start = Date.now();
-    if (enableAccessLogs) {
-      res.on('finish', () => {
-        const path = accessLogPath(req.originalUrl);
-        console.log(JSON.stringify({ level: 'info', method: req.method, path, status: res.statusCode, durationMs: Date.now() - start, correlationId }));
-      });
-    }
-    // All mutations (including /webhooks/* until HMAC/replay verification exists) remain strictly origin-gated.
-    if ((req.get('origin') && req.get('origin') !== origin) || (!['GET', 'HEAD', 'OPTIONS'].includes(req.method) && req.get('origin') !== origin)) {
-      res.status(403).json({ code: 'ORIGIN_DENIED', correlationId });
-      return;
-    }
-    next();
-  });
+  app.use(createHttpSecurityLoggingMiddleware(origin, enableAccessLogs));
   app.enableCors({
     origin,
     credentials: true,

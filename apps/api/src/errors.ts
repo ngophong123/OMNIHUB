@@ -2,6 +2,8 @@ import { ArgumentsHost, Catch, ExceptionFilter, HttpException } from '@nestjs/co
 import { Prisma } from '@prisma/client';
 import type { Request, Response } from 'express';
 import { accessLogPath } from './deployment-security';
+import { apiLogger } from './observability/logger';
+import { getLogContext } from './observability/request-context';
 
 export type ClassifiedError = {
   status: number;
@@ -123,22 +125,20 @@ export class Errors implements ExceptionFilter {
     const http = host.switchToHttp();
     const request = http.getRequest<Request | undefined>();
     const response = http.getResponse<Response>();
-    const correlationId = response.getHeader('x-correlation-id');
+    const correlationId = response.getHeader('x-correlation-id') ?? getLogContext()?.correlationId;
     const classified = classifyError(error);
 
     if (classified.shouldLog) {
       const pathSource = request?.originalUrl ?? request?.url;
-      console.error(JSON.stringify({
-        timestamp: new Date().toISOString(),
-        level: 'error',
-        code: classified.code,
+      apiLogger.ops('error', classified.code, {
+        component: 'http-exception-filter',
         statusCode: classified.status,
         errorType: classified.errorType,
         ...(classified.prismaCode ? { prismaCode: classified.prismaCode } : {}),
         ...(request?.method ? { method: request.method } : {}),
         ...(pathSource ? { path: accessLogPath(pathSource) } : {}),
-        correlationId,
-      }));
+        ...(correlationId !== undefined ? { correlationId } : {}),
+      });
     }
 
     response.status(classified.status).json({ code: classified.code, correlationId });
