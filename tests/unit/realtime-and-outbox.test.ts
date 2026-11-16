@@ -1,8 +1,20 @@
 import { EventEmitter } from 'node:events';
 import { createServer, type Server as HttpServer } from 'node:http';
+import { createRequire } from 'node:module';
+import { join } from 'node:path';
 import type { PrismaClient } from '@prisma/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { io as createSocketClient, type Socket as ClientSocket } from '../../apps/web/node_modules/socket.io-client';
+
+type ClientSocket = {
+  connected: boolean;
+  on(event: string, listener: (...args: unknown[]) => void): void;
+  once(event: string, listener: (...args: unknown[]) => void): void;
+  close(): void;
+};
+const requireFromWeb = createRequire(join(process.cwd(), 'apps/web/package.json'));
+const { io: createSocketClient } = requireFromWeb('socket.io-client') as {
+  io: (url: string, opts: Record<string, unknown>) => ClientSocket;
+};
 import { digest } from '../../apps/api/src/domain';
 import { createMetricsRegistry } from '../../apps/api/src/observability/metrics';
 import {
@@ -912,9 +924,9 @@ describe('M2-T09: Socket.IO Redis adapter resilience, deduplication, ACL safety,
     const receivedA1: string[] = [];
     const receivedCashierB: string[] = [];
     const receivedTenantB: string[] = [];
-    clientA1.on('operational.event', (e: { type: string }) => receivedA1.push(e.type));
-    clientCashierB.on('operational.event', (e: { type: string }) => receivedCashierB.push(e.type));
-    clientTenantB.on('operational.event', (e: { type: string }) => receivedTenantB.push(e.type));
+    clientA1.on('operational.event', e => receivedA1.push((e as { type: string }).type));
+    clientCashierB.on('operational.event', e => receivedCashierB.push((e as { type: string }).type));
+    clientTenantB.on('operational.event', e => receivedTenantB.push((e as { type: string }).type));
 
     try {
       // 1. Outbox broadcast reaches authorized Tenant A clients across replicas once; duplicate eventId is deduplicated; Tenant B gets 0.
@@ -1002,7 +1014,7 @@ describe('M2-T09: Socket.IO Redis adapter resilience, deduplication, ACL safety,
           badNs.once('connect_error', err => {
             clearTimeout(timer);
             badNs.close();
-            reject(err);
+            reject(err instanceof Error ? err : new Error(String(err)));
           });
         }),
       ).rejects.toThrow();

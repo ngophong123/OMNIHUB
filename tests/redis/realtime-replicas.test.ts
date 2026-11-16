@@ -2,11 +2,22 @@ import 'dotenv/config';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createServer as createHttpServer } from 'node:http';
 import { createServer } from 'node:net';
-import { resolve } from 'node:path';
+import { createRequire } from 'node:module';
+import { join, resolve } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import Redis from '../../apps/api/node_modules/ioredis';
-import { io as createSocketClient, type Socket as ClientSocket } from '../../apps/web/node_modules/socket.io-client';
+
+type ClientSocket = {
+  connected: boolean;
+  on(event: string, listener: (...args: unknown[]) => void): void;
+  once(event: string, listener: (...args: unknown[]) => void): void;
+  close(): void;
+};
+const requireFromWeb = createRequire(join(process.cwd(), 'apps/web/package.json'));
+const { io: createSocketClient } = requireFromWeb('socket.io-client') as {
+  io: (url: string, opts: Record<string, unknown>) => ClientSocket;
+};
 import { db } from '../../apps/api/src/database';
 import { digest, hashPassword } from '../../apps/api/src/domain';
 import { attachRealtime, realtimeRedisReady } from '../../apps/api/src/realtime';
@@ -140,8 +151,8 @@ describe('multi-replica Socket.IO Redis adapter & instant revocation (M2-T09)', 
 
       const ownerEvents: string[] = [];
       const tenantBEvents: string[] = [];
-      ownerReplica1.on('operational.event', (e: { type: string }) => ownerEvents.push(e.type));
-      tenantBReplica2.on('operational.event', (e: { type: string }) => tenantBEvents.push(e.type));
+      ownerReplica1.on('operational.event', e => ownerEvents.push((e as { type: string }).type));
+      tenantBReplica2.on('operational.event', e => tenantBEvents.push((e as { type: string }).type));
 
       // Outbox broadcast reaches authorized store sockets on Replica 1 once and never leaks to Tenant B on Replica 2.
       const eventId = randomUUID();
