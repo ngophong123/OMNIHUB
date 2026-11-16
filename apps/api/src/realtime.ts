@@ -639,14 +639,19 @@ export function attachRealtime(server: HttpServer, origin: string, options: Atta
     });
     let lastPsubArgs: unknown[] | undefined;
     let lastSubArgs: unknown[] | undefined;
+    let psubInFlight = false;
+    let subInFlight = false;
+    let adapterSubRecovering = false;
 
     const subProxy = wrapAdapterSubClient(adapterSubClient, (op, ok, err, args) => {
       if (op === 'psubscribe') {
         if (args) lastPsubArgs = args;
+        psubInFlight = !ok && !err;
         adapterPsubConfirmed = ok;
       }
       if (op === 'subscribe') {
         if (args) lastSubArgs = args;
+        subInFlight = !ok && !err;
         adapterSubConfirmed = ok;
       }
       if (!ok && err && !closing) {
@@ -670,11 +675,13 @@ export function attachRealtime(server: HttpServer, origin: string, options: Atta
       adapterSubTcpConnected = true;
       adapterSubFailed = false;
       adapterSubAclDenied = false;
-      // Re-verify adapter subscriptions on recovery when initial or prior auto-resubscribe dropped.
-      if (!adapterPsubConfirmed && lastPsubArgs) {
+      const recovering = adapterSubRecovering;
+      adapterSubRecovering = false;
+      // Only re-issue subscriptions if prior attempt failed/dropped or reconnecting; avoid duplicating queued initial commands.
+      if (lastPsubArgs && ((!adapterPsubConfirmed && !psubInFlight) || recovering)) {
         void subProxy.psubscribe(...lastPsubArgs);
       }
-      if (!adapterSubConfirmed && lastSubArgs) {
+      if (lastSubArgs && ((!adapterSubConfirmed && !subInFlight) || recovering)) {
         void subProxy.subscribe(...lastSubArgs);
       }
       syncReadiness();
@@ -683,12 +690,18 @@ export function attachRealtime(server: HttpServer, origin: string, options: Atta
       adapterSubTcpConnected = false;
       adapterPsubConfirmed = false;
       adapterSubConfirmed = false;
+      adapterSubRecovering = true;
+      psubInFlight = false;
+      subInFlight = false;
       syncReadiness();
     });
     adapterSubClient.on('end', () => {
       adapterSubTcpConnected = false;
       adapterPsubConfirmed = false;
       adapterSubConfirmed = false;
+      adapterSubRecovering = true;
+      psubInFlight = false;
+      subInFlight = false;
       syncReadiness();
     });
 
