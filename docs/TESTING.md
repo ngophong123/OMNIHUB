@@ -1,5 +1,15 @@
 # Testing strategy
 
+## Milestone 2 — Task 10 (Dual-Key Auth Rate Limiting & Per-Account Lockout) — 2026-11-17
+
+Verified on branch `feat/m2-dual-key-auth-rate-limit` (branched from `main` `60843ea`):
+
+| Check | Status | Current result |
+|---|---|---|
+| Dual-key rate limit & per-account brute-force unit suite (`tests/unit/rate-limit.test.ts`) | VERIFIED | `7/7` tests covering Redis Lua `eval` failure/health probes (`503 RATE_LIMITER_UNAVAILABLE`), IP rate-limit override precedence (`AUTH_LOGIN_IP_LIMIT` over `AUTH_LOGIN_RATE_LIMIT`, default `60/min`), deterministic cross-replica normalized email SHA-256 keying without cleartext PII, pre-`scrypt` lock short-circuiting (`429 ACCOUNT_LOCKED_RETRY_LATER` + `Retry-After`), bad-password/unknown/inactive increment vs missing-membership non-increment, login-success `PEXPIRE 0` counter reset without `DEL`, single-transition `AUTH_ACCOUNT_LOCKED` logging, bounded Prometheus `rate_limit_decisions_total{prefix="login_account"}` labels, and `/public/invitations/` (`10/min`) limit without generic `/public/` double-counting or header overwrite. |
+| Real Redis 7 shared-counter & ACL suite (`tests/redis/shared-rate-limit.test.ts`) | ADDED / CI-PENDING | Exercises live Redis atomic shared counters across concurrent clients, 20-IP distributed credential-stuffing lockout against one email across 2 independent app instances, single-IP NAT isolation across multiple accounts, login-success reset (`PEXPIRE 0`) and membership non-increment, exact `deploy/redis-start.sh` Redis 7 ACL least-privilege enforcement (`NOPERM` on `DEL`, `0` ACL errors during normal login/lock/reset), and dedicated `10/min` `/public/invitations/` throttling. **NOT RUN** locally (no Docker Engine daemon / Redis `127.0.0.1:6379`); awaits GitHub Actions CI. |
+| Full local unit, PostgreSQL integration & V8 CI coverage gates | VERIFIED | Unit suite: **8 files, 81/81 tests passed** (`pnpm test` / `pnpm test:coverage`). CI-scoped PG + unit suite (`OMNIHUB_COVERAGE_SCOPE=ci pnpm test:coverage:ci` on `embedded-postgres`): **12 files, 115/115 tests passed** (`81` unit + `34` PG integration); V8 totals `Stmts 74.1%`, `Branch 68.39%`, `Funcs 68.78%`, `Lines 83.69%` (`auth.ts` `Lines 100%` / `Branch 93.75%`, `rate-limit.ts` `Lines 100%` / `Branch 95.5%`), passing all global and per-file floors. Redis (`pnpm test:redis`) and Playwright E2E remain **NOT RUN** locally. |
+
 ## Milestone 2 — Task 09 (Socket.IO Redis Adapter & Instant Revocation) — 2026-11-16
 
 Verified on branch `feat/m2-socketio-redis-adapter` (branched from `main` `170b211`):
