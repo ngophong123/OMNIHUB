@@ -1,5 +1,16 @@
 # Testing strategy
 
+## Milestone 2 — Task 09 (Socket.IO Redis Adapter & Instant Revocation) — 2026-11-16
+
+Verified on branch `feat/m2-socketio-redis-adapter` (branched from `main` `170b211`):
+
+| Check | Status | Current result |
+|---|---|---|
+| Realtime adapter, ACL, deduplication & revocation unit suite (`tests/unit/realtime-and-outbox.test.ts`) | VERIFIED | `13/13` tests covering two live Socket.IO instances bridged over `@socket.io/redis-adapter` and an in-memory Redis Pub/Sub broker, tenant/namespace isolation, concurrent & sequential `eventId` deduplication (`MAX_SEEN_EVENT_IDS`), honest `/ready` readiness gating across `events_sub`/`adapter_pub`/`adapter_sub` startup & reconnect catch-up, non-crashing ACL `NOPERM` & offline `publish` handling, immediate cross-instance `session.revoked` / `kitchen.device.changed` disconnect without leaking session events to store peers, and clean teardown. |
+| PostgreSQL `/ready` probe & transactional revocation suite (`tests/integration/m2-realtime-revocation.test.ts`) | VERIFIED | Executed against live `embedded-postgres`: verifies `/ready` fails closed with `503 REDIS_REQUIRED_FOR_REALTIME` when realtime subscriber/adapter probe returns `false`, atomic `Outbox` (`session.revoked`, `kitchen.device.changed`) creation inside `/auth/logout`, `/admin/kitchen/devices/:id/assignment`, and `/admin/kitchen/devices/:id/revoke`, `processOutboxBatch` validation (`0` quarantined), and immediate socket disconnect behavior. |
+| Real Redis 7 multi-replica & staging ACL suite (`tests/redis/realtime-replicas.test.ts`) | ADDED / CI-PENDING | Spawns 2 built `apps/api/dist/main.js` replicas + real Redis 7 to verify cross-replica WebSocket broadcasts, tenant isolation, cross-replica instant `/auth/logout` & `/admin/kitchen/devices/:id/revoke` disconnect, exact `deploy/redis-start.sh` Redis 7 ACL permissions, and `NOPERM` ACL fail-closed readiness. **NOT RUN** locally (no Docker Engine daemon / Redis `127.0.0.1:6379`); awaits GitHub Actions CI. |
+| Full local unit, PostgreSQL integration & V8 CI coverage gates | VERIFIED | Unit suite: **8 files, 77/77 tests passed** (`pnpm test` / `pnpm test:coverage`). CI-scoped PG + unit suite (`OMNIHUB_COVERAGE_SCOPE=ci pnpm test:coverage:ci` on `embedded-postgres`): **12 files, 111/111 tests passed** (`77` unit + `34` PG integration); `realtime.ts` coverage at `Stmts 86.78%`, `Branch 78.96%`, `Funcs 84.61%`, `Lines 89.00%`; V8 totals `Stmts 72.91%`, `Branch 67.07%`, `Funcs 67.73%`, `Lines 82.63%` passing all global and per-file floors. Redis (`pnpm test:redis`) and Playwright E2E remain **NOT RUN** locally. |
+
 ## Milestone 2 — Task 02 (Prometheus Metrics & Monitoring) — 2026-11-16
 
 Verified on branch `feat/m2-prometheus-metrics` (branched from `main` `0ecb210`):

@@ -21,6 +21,8 @@ const KNOWN_ERROR_CODES = new Set([
   'ORIGIN_DENIED',
   'RATE_LIMITED',
   'RATE_LIMITER_UNAVAILABLE',
+  'REDIS_REQUIRED_FOR_PROTECTED_RATE_LIMITS',
+  'REDIS_REQUIRED_FOR_REALTIME',
   'METRICS_ACCESS_DENIED',
   'INVALID_INPUT',
   'INVALID_JSON',
@@ -313,6 +315,26 @@ export function createMetricsRegistry(options: MetricsRegistryOptions = {}) {
     registers: [registry],
   });
 
+  const realtimeAdapterReady = new Gauge({
+    name: 'realtime_adapter_ready',
+    help: 'Realtime Socket.IO Redis adapter and event subscriber readiness indicator (1 = ready, 0 = degraded).',
+    registers: [registry],
+  });
+
+  const realtimeAdapterErrorsTotal = new Counter({
+    name: 'realtime_adapter_errors_total',
+    help: 'Cumulative realtime Redis adapter and subscriber errors partitioned by component.',
+    labelNames: ['component'] as const,
+    registers: [registry],
+  });
+
+  const realtimeRevocationsTotal = new Counter({
+    name: 'realtime_revocations_total',
+    help: 'Cumulative realtime socket disconnects triggered by session revocation, device change, or drift.',
+    labelNames: ['type'] as const,
+    registers: [registry],
+  });
+
   return {
     registry,
     get contentType() {
@@ -419,9 +441,21 @@ export function createMetricsRegistry(options: MetricsRegistryOptions = {}) {
       if (closed) return;
       realtimeDisconnectsTotal.inc({ reason: normalizeDisconnectReason(reason) }, 1);
     },
-    recordRealtimeBroadcast(outcome: 'broadcast' | 'invalid_payload' | 'error'): void {
+    recordRealtimeBroadcast(outcome: 'broadcast' | 'invalid_payload' | 'error' | 'deduplicated'): void {
       if (closed) return;
       realtimeEventsBroadcastTotal.inc({ outcome }, 1);
+    },
+    setRealtimeAdapterReady(ready: boolean): void {
+      if (closed) return;
+      realtimeAdapterReady.set(ready ? 1 : 0);
+    },
+    recordRealtimeAdapterError(component: 'events_sub' | 'adapter_pub' | 'adapter_sub' | 'acl' | 'revalidate'): void {
+      if (closed) return;
+      realtimeAdapterErrorsTotal.inc({ component }, 1);
+    },
+    recordRealtimeRevocation(type: 'session_revoked' | 'kitchen_device_changed' | 'periodic_drift', count = 1): void {
+      if (closed || count <= 0) return;
+      realtimeRevocationsTotal.inc({ type }, count);
     },
     async refreshOutboxBacklog(db: OutboxBacklogReader, nowMs: () => number = () => Date.now()): Promise<void> {
       if (closed) return;

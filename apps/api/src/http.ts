@@ -18,6 +18,7 @@ import { QrOrdering } from './qr-ordering';
 import * as QRCode from 'qrcode';
 import { Prisma } from '@prisma/client';
 import { rateLimitRedisReady } from './rate-limit';
+import { publishRealtimeOperationalEvent, realtimeRedisReady } from './realtime';
 import { getLogContext } from './observability/request-context';
 
 const ops = new Operations(db);
@@ -45,6 +46,21 @@ const context = (req: Request) => authenticate(db, typeof req.cookies?.session =
 const key = (req: Request) => req.get('Idempotency-Key') ?? '';
 const uuid = (id: string) => parse(z.string().uuid(), id);
 const HEX64_RE = /^[a-f0-9]{64}$/i;
+function publishOutboxRevocation(
+  row: { id: string; tenantId: string; storeId: string; aggregateId: string; version: number; createdAt: Date },
+  type: 'session.revoked' | 'kitchen.device.changed',
+): void {
+  void publishRealtimeOperationalEvent({
+    eventId: row.id,
+    schemaVersion: 1,
+    tenantId: row.tenantId,
+    storeId: row.storeId,
+    type,
+    aggregateId: row.aggregateId,
+    version: row.version,
+    occurredAt: row.createdAt.toISOString(),
+  });
+}
 
 @Controller()
 class ApiController {
@@ -52,7 +68,8 @@ class ApiController {
   @Get('ready') async ready() {
     await db.$queryRaw`SELECT 1`;
     if (!await rateLimitRedisReady()) throw new ServiceUnavailableException('REDIS_REQUIRED_FOR_PROTECTED_RATE_LIMITS');
-    return { database: 'ok', redis: 'ok' };
+    if (!await realtimeRedisReady()) throw new ServiceUnavailableException('REDIS_REQUIRED_FOR_REALTIME');
+    return { database: 'ok', redis: 'ok', realtime: 'ok' };
   }
   @Post('auth/login') async login(@Body() body: unknown, @Res({ passthrough: true }) res: Response) {
     const data = parse(loginSchema, body);
@@ -67,7 +84,23 @@ class ApiController {
   }
   @Post('auth/logout') async logout(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
     const c = await context(req);
-    await db.session.deleteMany({ where: { tokenHash: c.tokenHash } });
+    const revokedEvent = await db.$transaction(async tx => {
+      const deleted = await tx.session.deleteMany({ where: { tokenHash: c.tokenHash } });
+      if (deleted.count === 0) return null;
+      return tx.outbox.create({
+        data: {
+          tenantId: c.tenantId,
+          storeId: c.storeId,
+          type: 'session.revoked',
+          aggregateId: c.userId,
+          version: 1,
+          correlationId: c.correlationId,
+        },
+      });
+    });
+    if (revokedEvent) {
+      publishOutboxRevocation(revokedEvent, 'session.revoked');
+    }
     res.clearCookie('session', { path: '/', httpOnly: true, sameSite: 'strict', secure: process.env.SESSION_SECURE !== 'false' });
     return { ok: true };
   }
@@ -194,7 +227,7 @@ class ApiController {
   @Put('admin/kitchen/devices/:id/assignment') async assignKitchenDevice(@Req() req: Request, @Param('id') id: string, @Body() body: unknown) {
     const c = await context(req); if (!allowed(c.role, 'admin')) throw new ForbiddenException('PERMISSION_DENIED');
     const deviceId = uuid(id); const { stationId } = parse(kitchenDeviceAssignmentSchema, body);
-    return db.$transaction(async tx => {
+    const { result, event } = await db.$transaction(async tx => {
       const current = await reauthorize(tx, c);
       if (!allowed(current.role, 'admin')) throw new ForbiddenException('PERMISSION_DENIED');
       if (stationId && !await tx.station.findFirst({ where: { id: stationId, tenantId: current.tenantId, storeId: current.storeId, active: true, deletedAt: null }, select: { id: true } })) throw new BadRequestException('KITCHEN_STATION_NOT_AVAILABLE');
@@ -202,8 +235,11 @@ class ApiController {
       if (!device) throw new NotFoundException('KITCHEN_DEVICE_NOT_FOUND_OR_REVOKED');
       const updated = await tx.kitchenDevice.update({ where: { id: deviceId }, data: { stationId } });
       await tx.audit.create({ data: { tenantId: current.tenantId, storeId: current.storeId, actorId: current.userId, action: 'KITCHEN_DEVICE_ASSIGNED', entityId: deviceId, commandKey: `kitchen-device:assignment:${randomUUID()}`, correlationId: current.correlationId, details: { stationId } } });
-      return { id: updated.id, stationId: updated.stationId };
+      const outboxRow = await tx.outbox.create({ data: { tenantId: current.tenantId, storeId: current.storeId, type: 'kitchen.device.changed', aggregateId: deviceId, version: 1, correlationId: current.correlationId } });
+      return { result: { id: updated.id, stationId: updated.stationId }, event: outboxRow };
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    publishOutboxRevocation(event, 'kitchen.device.changed');
+    return result;
   }
   @Get('admin/kitchen/devices/:id/activity') async kitchenDeviceActivity(@Req() req: Request, @Param('id') id: string) {
     const c = await context(req); if (!allowed(c.role, 'admin')) throw new ForbiddenException('PERMISSION_DENIED');
@@ -213,13 +249,15 @@ class ApiController {
   @Post('admin/kitchen/devices/:id/revoke') async revokeKitchenDevice(@Req() req: Request, @Param('id') id: string) {
     const c = await context(req); if (!allowed(c.role, 'admin')) throw new ForbiddenException('PERMISSION_DENIED');
     const deviceId = uuid(id);
-    await db.$transaction(async tx => {
+    const event = await db.$transaction(async tx => {
       const current = await reauthorize(tx, c);
       if (!allowed(current.role, 'admin')) throw new ForbiddenException('PERMISSION_DENIED');
       const changed = await tx.kitchenDevice.updateMany({ where: { id: deviceId, tenantId: current.tenantId, storeId: current.storeId, revokedAt: null }, data: { revokedAt: new Date() } });
       if (changed.count !== 1) throw new ConflictException('KITCHEN_DEVICE_NOT_FOUND_OR_REVOKED');
       await tx.audit.create({ data: { tenantId: current.tenantId, storeId: current.storeId, actorId: current.userId, action: 'KITCHEN_DEVICE_REVOKED', entityId: deviceId, commandKey: `kitchen-device:revoke:${randomUUID()}`, correlationId: current.correlationId } });
+      return tx.outbox.create({ data: { tenantId: current.tenantId, storeId: current.storeId, type: 'kitchen.device.changed', aggregateId: deviceId, version: 1, correlationId: current.correlationId } });
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    publishOutboxRevocation(event, 'kitchen.device.changed');
     return { id, revoked: true };
   }
   @Post('orders/:id/cash') async cash(@Req() req: Request, @Param('id') id: string, @Body() body: unknown) { return ops.cash(await context(req), key(req), uuid(id), parse(cashSchema, body)); }

@@ -39,7 +39,7 @@ export type CashRegisterInput = z.infer<typeof cashRegisterSchema>;
 export type CashShiftClose = z.infer<typeof cashShiftCloseSchema>;
 export type CashMovementCommand = z.infer<typeof cashMovementSchema>;
 export type StockCommand = z.infer<typeof stockSchema>;
-export const eventTypes = ['order.accepted', 'order.cancelled', 'kitchen.item.started', 'kitchen.item.ready', 'kitchen.item.handed_off', 'order.item.cancelled', 'payment.confirmed', 'payment.recorded', 'payment.verified', 'payment.failed', 'refund.requested', 'refund.decided', 'payment.split.created', 'inventory.adjusted', 'catalog.changed', 'recipe.changed', 'ingredient.changed', 'station.changed', 'inventory.received', 'cash.shift.opened', 'cash.shift.closing', 'cash.shift.closed', 'cash.movement.recorded', 'cash.shift.approved', 'cash.register.changed', 'table.changed', 'table.session.closed'] as const;
+export const eventTypes = ['order.accepted', 'order.cancelled', 'kitchen.item.started', 'kitchen.item.ready', 'kitchen.item.handed_off', 'order.item.cancelled', 'payment.confirmed', 'payment.recorded', 'payment.verified', 'payment.failed', 'refund.requested', 'refund.decided', 'payment.split.created', 'inventory.adjusted', 'catalog.changed', 'recipe.changed', 'ingredient.changed', 'station.changed', 'inventory.received', 'cash.shift.opened', 'cash.shift.closing', 'cash.shift.closed', 'cash.movement.recorded', 'cash.shift.approved', 'cash.register.changed', 'table.changed', 'table.session.closed', 'session.revoked', 'kitchen.device.changed'] as const;
 export type EventType = (typeof eventTypes)[number];
 export const eventSchema = z.object({
   eventId: z.string().uuid(), schemaVersion: z.literal(1), tenantId: z.string().uuid(), storeId: z.string().uuid(),
