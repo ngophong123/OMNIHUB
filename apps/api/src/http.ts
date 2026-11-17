@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import type { Request, Response } from 'express';
 import { cashSchema, cashRegisterSchema, cashShiftOpenSchema, cashShiftCloseSchema, cashMovementSchema, cashApprovalSchema, categoryListSchema, commandSchema, loginSchema, orderSchema, stockSchema, paymentSchema, refundRequestSchema, refundDecisionSchema, billSplitSchema, paymentFailureSchema, orderCancelSchema, kitchenDeviceSchema, kitchenSyncSchema, kitchenDeviceAssignmentSchema, invitationCreateSchema, invitationAcceptSchema } from '@omnihub/contracts';
 import { z } from 'zod';
-import { db } from './database';
+import { db, runSerializableTransactionWithRetry } from './database';
 import { authenticate, login, reauthorize } from './auth';
 import { allowed, digest } from './domain';
 export { Errors } from './errors';
@@ -142,7 +142,7 @@ class ApiController {
   @Post('kitchen/devices/register') async registerKitchenDevice(@Req() req: Request, @Body() body: unknown) {
     const c = await context(req); const { deviceId } = parse(kitchenDeviceSchema, body);
     if (!allowed(c.role, 'kitchen')) throw new ForbiddenException('PERMISSION_DENIED');
-    await db.$transaction(async tx => {
+    await runSerializableTransactionWithRetry(db, async tx => {
       const current = await reauthorize(tx, c);
       if (!allowed(current.role, 'kitchen')) throw new ForbiddenException('PERMISSION_DENIED');
       const existing = await tx.kitchenDevice.findUnique({ where: { id: deviceId } });
@@ -150,12 +150,16 @@ class ApiController {
         if (existing.tenantId !== current.tenantId || existing.storeId !== current.storeId || existing.userId !== current.userId || existing.revokedAt) {
           throw new ForbiddenException('KITCHEN_DEVICE_REVOKED_OR_OUT_OF_SCOPE');
         }
-        await tx.kitchenDevice.update({ where: { id: deviceId }, data: { lastSeenAt: new Date() } });
+        const updated = await tx.kitchenDevice.updateMany({
+          where: { id: deviceId, tenantId: current.tenantId, storeId: current.storeId, userId: current.userId, revokedAt: null },
+          data: { lastSeenAt: new Date() },
+        });
+        if (updated.count !== 1) throw new ForbiddenException('KITCHEN_DEVICE_REVOKED_OR_OUT_OF_SCOPE');
         return;
       }
       await tx.kitchenDevice.create({ data: { id: deviceId, tenantId: current.tenantId, storeId: current.storeId, userId: current.userId } });
       await tx.audit.create({ data: { tenantId: current.tenantId, storeId: current.storeId, actorId: current.userId, action: 'KITCHEN_DEVICE_REGISTERED', entityId: deviceId, commandKey: `kitchen-device:KITCHEN_DEVICE_REGISTERED:${randomUUID()}`, correlationId: current.correlationId } });
-    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    }, { operation: 'kitchen.device.changed' });
     return { deviceId, authorized: true };
   }
   @Post('kitchen/sync') async syncKitchenCommands(@Req() req: Request, @Body() body: unknown) {
@@ -170,7 +174,8 @@ class ApiController {
       if (headerDeviceId !== commands[0]!.deviceId) throw new ForbiddenException('KITCHEN_DEVICE_HEADER_MISMATCH');
       device = await db.kitchenDevice.findFirst({ where: { id: commands[0]!.deviceId, tenantId: c.tenantId, storeId: c.storeId, userId: c.userId, revokedAt: null }, select: { id: true, stationId: true } });
       if (!device) throw new ForbiddenException('KITCHEN_DEVICE_NOT_AUTHORIZED');
-      await db.kitchenDevice.update({ where: { id: device.id }, data: { lastSeenAt: new Date() } });
+      const touched = await db.kitchenDevice.updateMany({ where: { id: device.id, tenantId: c.tenantId, storeId: c.storeId, userId: c.userId, revokedAt: null }, data: { lastSeenAt: new Date() } });
+      if (touched.count !== 1) throw new ForbiddenException('KITCHEN_DEVICE_NOT_AUTHORIZED');
     }
     const blockedOrders = new Set<string>(); const results: { commandId: string; status: 'CONFIRMED' | 'CONFLICT' | 'REJECTED' | 'BLOCKED'; version?: number; code?: string }[] = [];
     for (const command of commands) {
@@ -227,17 +232,16 @@ class ApiController {
   @Put('admin/kitchen/devices/:id/assignment') async assignKitchenDevice(@Req() req: Request, @Param('id') id: string, @Body() body: unknown) {
     const c = await context(req); if (!allowed(c.role, 'admin')) throw new ForbiddenException('PERMISSION_DENIED');
     const deviceId = uuid(id); const { stationId } = parse(kitchenDeviceAssignmentSchema, body);
-    const { result, event } = await db.$transaction(async tx => {
+    const { result, event } = await runSerializableTransactionWithRetry(db, async tx => {
       const current = await reauthorize(tx, c);
       if (!allowed(current.role, 'admin')) throw new ForbiddenException('PERMISSION_DENIED');
       if (stationId && !await tx.station.findFirst({ where: { id: stationId, tenantId: current.tenantId, storeId: current.storeId, active: true, deletedAt: null }, select: { id: true } })) throw new BadRequestException('KITCHEN_STATION_NOT_AVAILABLE');
-      const device = await tx.kitchenDevice.findFirst({ where: { id: deviceId, tenantId: current.tenantId, storeId: current.storeId, revokedAt: null } });
-      if (!device) throw new NotFoundException('KITCHEN_DEVICE_NOT_FOUND_OR_REVOKED');
-      const updated = await tx.kitchenDevice.update({ where: { id: deviceId }, data: { stationId } });
+      const changed = await tx.kitchenDevice.updateMany({ where: { id: deviceId, tenantId: current.tenantId, storeId: current.storeId, revokedAt: null }, data: { stationId } });
+      if (changed.count !== 1) throw new NotFoundException('KITCHEN_DEVICE_NOT_FOUND_OR_REVOKED');
       await tx.audit.create({ data: { tenantId: current.tenantId, storeId: current.storeId, actorId: current.userId, action: 'KITCHEN_DEVICE_ASSIGNED', entityId: deviceId, commandKey: `kitchen-device:assignment:${randomUUID()}`, correlationId: current.correlationId, details: { stationId } } });
       const outboxRow = await tx.outbox.create({ data: { tenantId: current.tenantId, storeId: current.storeId, type: 'kitchen.device.changed', aggregateId: deviceId, version: 1, correlationId: current.correlationId } });
-      return { result: { id: updated.id, stationId: updated.stationId }, event: outboxRow };
-    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+      return { result: { id: deviceId, stationId }, event: outboxRow };
+    }, { operation: 'kitchen.device.changed' });
     publishOutboxRevocation(event, 'kitchen.device.changed');
     return result;
   }
@@ -249,14 +253,14 @@ class ApiController {
   @Post('admin/kitchen/devices/:id/revoke') async revokeKitchenDevice(@Req() req: Request, @Param('id') id: string) {
     const c = await context(req); if (!allowed(c.role, 'admin')) throw new ForbiddenException('PERMISSION_DENIED');
     const deviceId = uuid(id);
-    const event = await db.$transaction(async tx => {
+    const event = await runSerializableTransactionWithRetry(db, async tx => {
       const current = await reauthorize(tx, c);
       if (!allowed(current.role, 'admin')) throw new ForbiddenException('PERMISSION_DENIED');
       const changed = await tx.kitchenDevice.updateMany({ where: { id: deviceId, tenantId: current.tenantId, storeId: current.storeId, revokedAt: null }, data: { revokedAt: new Date() } });
       if (changed.count !== 1) throw new ConflictException('KITCHEN_DEVICE_NOT_FOUND_OR_REVOKED');
       await tx.audit.create({ data: { tenantId: current.tenantId, storeId: current.storeId, actorId: current.userId, action: 'KITCHEN_DEVICE_REVOKED', entityId: deviceId, commandKey: `kitchen-device:revoke:${randomUUID()}`, correlationId: current.correlationId } });
       return tx.outbox.create({ data: { tenantId: current.tenantId, storeId: current.storeId, type: 'kitchen.device.changed', aggregateId: deviceId, version: 1, correlationId: current.correlationId } });
-    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    }, { operation: 'kitchen.device.changed' });
     publishOutboxRevocation(event, 'kitchen.device.changed');
     return { id, revoked: true };
   }
