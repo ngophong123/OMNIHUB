@@ -251,4 +251,601 @@ describe('Realtime readiness probe & transactional session/device revocation (M2
     expect(staleReconnectedKitchen.disconnected).toBe(true);
     expect(ownerSockB.disconnected).toBe(false);
   });
+
+  it('retries PostgreSQL P2034 serialization conflict during concurrent kitchen device heartbeat and revocation without duplicates or bypasses', async () => {
+    const concurrentDeviceId = randomUUID();
+    const burstDeviceId = randomUUID();
+
+    // 1. Register a kitchen device via the HTTP endpoint.
+    const initialReg = await httpRequest(
+      baseUrl,
+      'POST',
+      '/kitchen/devices/register',
+      {
+        Origin: TEST_ORIGIN,
+        Cookie: `session=${kitchenToken}`,
+        'Content-Type': 'application/json',
+      },
+      JSON.stringify({ deviceId: concurrentDeviceId }),
+    );
+    expect(initialReg.status).toBe(201);
+
+    // 2-3. Deterministically overlap a heartbeat (/kitchen/devices/register) committing
+    // lastSeenAt with revokeKitchenDevice's first Serializable attempt so PostgreSQL
+    // throws a real SQLSTATE 40001 / Prisma P2034 conflict on revoke attempt #1.
+    function deferred<T>() {
+      let resolve!: (value: T | PromiseLike<T>) => void;
+      const promise = new Promise<T>(r => {
+        resolve = r;
+      });
+      return { promise, resolve };
+    }
+
+    const heartbeatInsideTx = deferred<void>();
+    const allowHeartbeatCommit = deferred<void>();
+    let observedP2034 = false;
+    let revokeTxAttempts = 0;
+
+    const origTx = db.$transaction.bind(db);
+    let registerDone!: Promise<RawHttpResponse>;
+
+    const txSpy = vi.spyOn(db, '$transaction').mockImplementation((async (
+      fnOrArray: unknown,
+      options?: unknown,
+    ) => {
+      if (typeof fnOrArray !== 'function') {
+        return origTx(fnOrArray as never, options as never);
+      }
+      const callback = fnOrArray as (tx: unknown) => Promise<unknown>;
+      const callIdx = txSpy.mock.calls.length;
+
+      // Call #1 belongs to the in-flight heartbeat (/kitchen/devices/register).
+      if (callIdx === 1) {
+        return origTx(async tx => {
+          const result = await callback(tx);
+          heartbeatInsideTx.resolve();
+          await allowHeartbeatCommit.promise;
+          return result;
+        }, options as never);
+      }
+
+      // Call #2 belongs to revokeKitchenDevice attempt #1; capture its Serializable snapshot
+      // via reauthorize before letting heartbeat commit, then execute UPDATE to trigger real P2034.
+      if (callIdx === 2) {
+        revokeTxAttempts += 1;
+        try {
+          return await origTx(async tx => {
+            const rawTx = tx as Record<PropertyKey, unknown>;
+            const proxiedTx = new Proxy(rawTx, {
+              get(target, prop, receiver) {
+                if (prop === 'kitchenDevice') {
+                  const kd = target.kitchenDevice as { updateMany: (...args: unknown[]) => Promise<unknown> };
+                  return new Proxy(kd, {
+                    get(kdTarget, kdProp, kdReceiver) {
+                      if (kdProp === 'updateMany') {
+                        return async (...args: unknown[]) => {
+                          allowHeartbeatCommit.resolve();
+                          await registerDone;
+                          return kdTarget.updateMany(...args);
+                        };
+                      }
+                      return Reflect.get(kdTarget, kdProp, kdReceiver);
+                    },
+                  });
+                }
+                return Reflect.get(target, prop, receiver);
+              },
+            });
+            return callback(proxiedTx);
+          }, options as never);
+        } catch (err) {
+          if (err && typeof err === 'object' && 'code' in err && (err as { code?: unknown }).code === 'P2034') {
+            observedP2034 = true;
+          }
+          throw err;
+        }
+      }
+
+      // Call #3 belongs to the automatic P2034 retry of revokeKitchenDevice.
+      revokeTxAttempts += 1;
+      return origTx(callback as never, options as never);
+    }) as typeof db.$transaction);
+
+    let revokeResponse: RawHttpResponse;
+    let heartbeatResponse: RawHttpResponse;
+    try {
+      registerDone = httpRequest(
+        baseUrl,
+        'POST',
+        '/kitchen/devices/register',
+        {
+          Origin: TEST_ORIGIN,
+          Cookie: `session=${kitchenToken}`,
+          'Content-Type': 'application/json',
+        },
+        JSON.stringify({ deviceId: concurrentDeviceId }),
+      );
+      await heartbeatInsideTx.promise;
+
+      const revokePromise = httpRequest(baseUrl, 'POST', `/admin/kitchen/devices/${concurrentDeviceId}/revoke`, {
+        Origin: TEST_ORIGIN,
+        Cookie: `session=${ownerTokenB}`,
+      });
+
+      [heartbeatResponse, revokeResponse] = await Promise.all([registerDone, revokePromise]);
+    } finally {
+      txSpy.mockRestore();
+    }
+
+    // 4-5. Confirm real PostgreSQL P2034 was triggered and recovered via retry without 500/409.
+    expect(observedP2034).toBe(true);
+    expect(revokeTxAttempts).toBe(2);
+    expect(heartbeatResponse!.status).toBe(201);
+    expect(revokeResponse!.status).toBe(201);
+    expect(JSON.parse(revokeResponse!.body)).toEqual({ id: concurrentDeviceId, revoked: true });
+
+    // Also exercise uninstrumented concurrent heartbeat + revoke burst on a second device.
+    const burstInitial = await httpRequest(
+      baseUrl,
+      'POST',
+      '/kitchen/devices/register',
+      {
+        Origin: TEST_ORIGIN,
+        Cookie: `session=${kitchenToken}`,
+        'Content-Type': 'application/json',
+      },
+      JSON.stringify({ deviceId: burstDeviceId }),
+    );
+    expect(burstInitial.status).toBe(201);
+
+    const [burstRevoke, ...burstHeartbeats] = await Promise.all([
+      httpRequest(baseUrl, 'POST', `/admin/kitchen/devices/${burstDeviceId}/revoke`, {
+        Origin: TEST_ORIGIN,
+        Cookie: `session=${ownerTokenB}`,
+      }),
+      ...Array.from({ length: 4 }, () =>
+        httpRequest(
+          baseUrl,
+          'POST',
+          '/kitchen/devices/register',
+          {
+            Origin: TEST_ORIGIN,
+            Cookie: `session=${kitchenToken}`,
+            'Content-Type': 'application/json',
+          },
+          JSON.stringify({ deviceId: burstDeviceId }),
+        ),
+      ),
+    ]);
+
+    expect(burstRevoke.status).toBe(201);
+    for (const hb of burstHeartbeats) {
+      expect([201, 403]).toContain(hb.status);
+    }
+
+    // 6-7. Verify revokedAt persisted and strictly 1 Audit + 1 Outbox event created per revoked device.
+    for (const targetDeviceId of [concurrentDeviceId, burstDeviceId]) {
+      const persisted = await db.kitchenDevice.findUnique({ where: { id: targetDeviceId } });
+      expect(persisted).not.toBeNull();
+      expect(persisted!.revokedAt).toBeInstanceOf(Date);
+
+      const revokeAudits = await db.audit.findMany({
+        where: { tenantId, entityId: targetDeviceId, action: 'KITCHEN_DEVICE_REVOKED' },
+      });
+      expect(revokeAudits).toHaveLength(1);
+
+      const revokeOutbox = await db.outbox.findMany({
+        where: { tenantId, aggregateId: targetDeviceId, type: 'kitchen.device.changed' },
+      });
+      expect(revokeOutbox).toHaveLength(1);
+    }
+
+    // Drain Outbox and confirm kitchen.device.changed broadcasts disconnect any connected device socket.
+    const publishedRevocations: string[] = [];
+    const batchRevoke = await processOutboxBatch({
+      db,
+      tenantIds: [tenantId],
+      redis: {
+        publish: vi.fn(async (_ch, payload) => {
+          publishedRevocations.push(payload);
+          return 1;
+        }),
+      },
+    });
+    expect(batchRevoke.quarantined).toBe(0);
+    expect(batchRevoke.delivered).toBeGreaterThanOrEqual(2);
+    const concurrentRevokeMsg = publishedRevocations
+      .map(p => JSON.parse(p) as Parameters<typeof broadcastOperationalEvent>[2])
+      .find(msg => msg.type === 'kitchen.device.changed' && msg.aggregateId === concurrentDeviceId);
+    expect(concurrentRevokeMsg).toBeDefined();
+
+    for (const targetDeviceId of [concurrentDeviceId, burstDeviceId]) {
+
+      // 8. Re-registration and station reassignment must be rejected after revocation without clearing revokedAt.
+      const reregisterRes = await httpRequest(
+        baseUrl,
+        'POST',
+        '/kitchen/devices/register',
+        {
+          Origin: TEST_ORIGIN,
+          Cookie: `session=${kitchenToken}`,
+          'Content-Type': 'application/json',
+        },
+        JSON.stringify({ deviceId: targetDeviceId }),
+      );
+      expect(reregisterRes.status).toBe(403);
+      expect(JSON.parse(reregisterRes.body)).toMatchObject({ code: 'KITCHEN_DEVICE_REVOKED_OR_OUT_OF_SCOPE' });
+
+      const reassignAfterRevoke = await httpRequest(
+        baseUrl,
+        'PUT',
+        `/admin/kitchen/devices/${targetDeviceId}/assignment`,
+        {
+          Origin: TEST_ORIGIN,
+          Cookie: `session=${ownerTokenB}`,
+          'Content-Type': 'application/json',
+        },
+        JSON.stringify({ stationId: stationB }),
+      );
+      expect(reassignAfterRevoke.status).toBe(404);
+
+      const afterRejects = await db.kitchenDevice.findUnique({ where: { id: targetDeviceId } });
+      expect(afterRejects!.revokedAt).not.toBeNull();
+      expect(afterRejects!.stationId).toBeNull();
+
+      // 9. Revoked device cannot sync offline commands or reconnect/stay connected on Socket.IO.
+      const syncRes = await httpRequest(
+        baseUrl,
+        'POST',
+        '/kitchen/sync',
+        {
+          Origin: TEST_ORIGIN,
+          Cookie: `session=${kitchenToken}`,
+          'X-Kitchen-Device': targetDeviceId,
+          'Content-Type': 'application/json',
+        },
+        JSON.stringify({
+          commands: [
+            {
+              commandId: randomUUID(),
+              tenantId,
+              storeId,
+              userId: kitchenUserId,
+              deviceId: targetDeviceId,
+              sequence: 1,
+              orderId: randomUUID(),
+              itemId: randomUUID(),
+              expectedVersion: 1,
+              action: 'START',
+              createdAt: new Date().toISOString(),
+            },
+          ],
+        }),
+      );
+      expect(syncRes.status).toBe(403);
+      expect(JSON.parse(syncRes.body)).toMatchObject({ code: 'KITCHEN_DEVICE_NOT_AUTHORIZED' });
+
+      const revokedSocket = {
+        id: `revoked-${targetDeviceId}`,
+        data: { tokenHash: digest(kitchenToken), room: `${tenantId}:${storeId}`, deviceId: targetDeviceId, stationId: null },
+        disconnected: false,
+        emit: () => undefined,
+        disconnect: () => {
+          revokedSocket.disconnected = true;
+        },
+      };
+      await revalidateRealtimeSockets([revokedSocket], db);
+      expect(revokedSocket.disconnected).toBe(true);
+    }
+  });
+
+  it('rejects /kitchen/sync commands without partial confirmation or duplicate Audit/Outbox when revoked concurrently', async () => {
+    const productId = randomUUID();
+    const order1Id = randomUUID();
+    const order2Id = randomUUID();
+    const ticket1Id = randomUUID();
+    const ticket2Id = randomUUID();
+    const item1Id = randomUUID();
+    const item2Id = randomUUID();
+
+    await db.product.create({
+      data: { id: productId, tenantId, storeId, stationId: stationA, name: 'Concurrent Grill Dish', price: 50_000 },
+    });
+    await db.order.createMany({
+      data: [
+        { id: order1Id, tenantId, storeId, total: 50_000, status: 'ACCEPTED', paymentStatus: 'UNPAID', version: 1 },
+        { id: order2Id, tenantId, storeId, total: 50_000, status: 'ACCEPTED', paymentStatus: 'UNPAID', version: 1 },
+      ],
+    });
+    await db.kitchenTicket.createMany({
+      data: [
+        { id: ticket1Id, tenantId, storeId, orderId: order1Id, stationId: stationA },
+        { id: ticket2Id, tenantId, storeId, orderId: order2Id, stationId: stationA },
+      ],
+    });
+    await db.orderItem.createMany({
+      data: [
+        {
+          id: item1Id,
+          tenantId,
+          storeId,
+          orderId: order1Id,
+          ticketId: ticket1Id,
+          productId,
+          name: 'Concurrent Grill Dish',
+          unitPrice: 50_000,
+          recipeVersion: 1,
+          recipeSnapshot: [],
+        },
+        {
+          id: item2Id,
+          tenantId,
+          storeId,
+          orderId: order2Id,
+          ticketId: ticket2Id,
+          productId,
+          name: 'Concurrent Grill Dish',
+          unitPrice: 50_000,
+          recipeVersion: 1,
+          recipeSnapshot: [],
+        },
+      ],
+    });
+
+    function deferred<T>() {
+      let resolve!: (value: T | PromiseLike<T>) => void;
+      const promise = new Promise<T>(r => {
+        resolve = r;
+      });
+      return { promise, resolve };
+    }
+
+    // Scenario A: /kitchen/sync passes line 177 updateMany(lastSeenAt) with count=1, then device is revoked
+    // before ops.item runs for a 2-command batch across order1 and order2.
+    const syncRaceDeviceId = randomUUID();
+    expect(
+      (
+        await httpRequest(
+          baseUrl,
+          'POST',
+          '/kitchen/devices/register',
+          { Origin: TEST_ORIGIN, Cookie: `session=${kitchenToken}`, 'Content-Type': 'application/json' },
+          JSON.stringify({ deviceId: syncRaceDeviceId }),
+        )
+      ).status,
+    ).toBe(201);
+    expect(
+      (
+        await httpRequest(
+          baseUrl,
+          'PUT',
+          `/admin/kitchen/devices/${syncRaceDeviceId}/assignment`,
+          { Origin: TEST_ORIGIN, Cookie: `session=${ownerTokenB}`, 'Content-Type': 'application/json' },
+          JSON.stringify({ stationId: stationA }),
+        )
+      ).status,
+    ).toBe(200);
+
+    const origDeviceUpdateMany = db.kitchenDevice.updateMany.bind(db.kitchenDevice);
+    let interceptedTouch = false;
+    let concurrentRevokePromise!: Promise<RawHttpResponse>;
+    const updateManySpy = vi.spyOn(db.kitchenDevice, 'updateMany').mockImplementation((async (args: unknown) => {
+      const result = await origDeviceUpdateMany(args as never);
+      const data = (args as { data?: Record<string, unknown> })?.data;
+      if (!interceptedTouch && data && 'lastSeenAt' in data) {
+        interceptedTouch = true;
+        expect(result.count).toBe(1);
+        concurrentRevokePromise = httpRequest(
+          baseUrl,
+          'POST',
+          `/admin/kitchen/devices/${syncRaceDeviceId}/revoke`,
+          { Origin: TEST_ORIGIN, Cookie: `session=${ownerTokenB}` },
+        );
+        const revokeRes = await concurrentRevokePromise;
+        expect(revokeRes.status).toBe(201);
+      }
+      return result;
+    }) as typeof db.kitchenDevice.updateMany);
+
+    let syncResA: RawHttpResponse;
+    try {
+      syncResA = await httpRequest(
+        baseUrl,
+        'POST',
+        '/kitchen/sync',
+        {
+          Origin: TEST_ORIGIN,
+          Cookie: `session=${kitchenToken}`,
+          'X-Kitchen-Device': syncRaceDeviceId,
+          'Content-Type': 'application/json',
+        },
+        JSON.stringify({
+          commands: [
+            {
+              commandId: randomUUID(),
+              tenantId,
+              storeId,
+              userId: kitchenUserId,
+              deviceId: syncRaceDeviceId,
+              sequence: 1,
+              orderId: order1Id,
+              itemId: item1Id,
+              expectedVersion: 1,
+              action: 'START',
+              createdAt: new Date().toISOString(),
+            },
+            {
+              commandId: randomUUID(),
+              tenantId,
+              storeId,
+              userId: kitchenUserId,
+              deviceId: syncRaceDeviceId,
+              sequence: 2,
+              orderId: order2Id,
+              itemId: item2Id,
+              expectedVersion: 1,
+              action: 'START',
+              createdAt: new Date().toISOString(),
+            },
+          ],
+        }),
+      );
+    } finally {
+      updateManySpy.mockRestore();
+    }
+
+    expect(syncResA!.status).toBe(403);
+    expect(JSON.parse(syncResA!.body)).toMatchObject({ code: 'KITCHEN_DEVICE_NOT_AUTHORIZED' });
+
+    // Scenario B: /admin/kitchen/devices/:id/revoke holds row lock inside Serializable tx while ops.item
+    // inside /kitchen/sync executes SELECT ... FOR SHARE in its own Serializable tx.
+    const syncLockDeviceId = randomUUID();
+    expect(
+      (
+        await httpRequest(
+          baseUrl,
+          'POST',
+          '/kitchen/devices/register',
+          { Origin: TEST_ORIGIN, Cookie: `session=${kitchenToken}`, 'Content-Type': 'application/json' },
+          JSON.stringify({ deviceId: syncLockDeviceId }),
+        )
+      ).status,
+    ).toBe(201);
+
+    const revokeLockedRow = deferred<void>();
+    const syncEnteredOpsItem = deferred<void>();
+    const origTx = db.$transaction.bind(db);
+    let txPhase = 0;
+
+    const txSpy = vi.spyOn(db, '$transaction').mockImplementation((async (fnOrArray: unknown, options?: unknown) => {
+      if (typeof fnOrArray !== 'function') {
+        return origTx(fnOrArray as never, options as never);
+      }
+      const callback = fnOrArray as (tx: unknown) => Promise<unknown>;
+      txPhase += 1;
+
+      if (txPhase === 1) {
+        // Revoke transaction: pause after writing revokedAt=now() (holding row lock) while sync enters ops.item.
+        return origTx(async tx => {
+          const out = await callback(tx);
+          revokeLockedRow.resolve();
+          await syncEnteredOpsItem.promise;
+          return out;
+        }, options as never);
+      }
+
+      if (txPhase === 2) {
+        // Sync ops.item transaction: signal right before tx.$queryRaw FOR SHARE blocks on revoke's row lock.
+        return origTx(async tx => {
+          const rawTx = tx as Record<PropertyKey, unknown>;
+          const proxiedTx = new Proxy(rawTx, {
+            get(target, prop, receiver) {
+              if (prop === '$queryRaw') {
+                const rawFn = target.$queryRaw as (...qArgs: unknown[]) => Promise<unknown>;
+                return (...args: unknown[]) => {
+                  syncEnteredOpsItem.resolve();
+                  return Reflect.apply(rawFn, target, args);
+                };
+              }
+              return Reflect.get(target, prop, receiver);
+            },
+          });
+          return callback(proxiedTx);
+        }, options as never);
+      }
+
+      return origTx(callback as never, options as never);
+    }) as typeof db.$transaction);
+
+    let revokeResB: RawHttpResponse;
+    let syncResB: RawHttpResponse;
+    try {
+      // Trigger sync first up to db.orderItem.findFirst / ops.item boundary ONLY after line 177 updateMany succeeds:
+      const syncTouchDone = deferred<void>();
+      const allowSyncIntoOpsItem = deferred<void>();
+      const itemFindSpy = vi.spyOn(db.orderItem, 'findFirst').mockImplementation((async (args: unknown) => {
+        itemFindSpy.mockRestore();
+        syncTouchDone.resolve();
+        await allowSyncIntoOpsItem.promise;
+        return db.orderItem.findFirst(args as never);
+      }) as typeof db.orderItem.findFirst);
+
+      const syncPromiseB = httpRequest(
+        baseUrl,
+        'POST',
+        '/kitchen/sync',
+        {
+          Origin: TEST_ORIGIN,
+          Cookie: `session=${kitchenToken}`,
+          'X-Kitchen-Device': syncLockDeviceId,
+          'Content-Type': 'application/json',
+        },
+        JSON.stringify({
+          commands: [
+            {
+              commandId: randomUUID(),
+              tenantId,
+              storeId,
+              userId: kitchenUserId,
+              deviceId: syncLockDeviceId,
+              sequence: 1,
+              orderId: order1Id,
+              itemId: item1Id,
+              expectedVersion: 1,
+              action: 'START',
+              createdAt: new Date().toISOString(),
+            },
+          ],
+        }),
+      );
+
+      await syncTouchDone.promise;
+      const revokePromiseB = httpRequest(baseUrl, 'POST', `/admin/kitchen/devices/${syncLockDeviceId}/revoke`, {
+        Origin: TEST_ORIGIN,
+        Cookie: `session=${ownerTokenB}`,
+      });
+      await revokeLockedRow.promise;
+      allowSyncIntoOpsItem.resolve();
+
+      [revokeResB, syncResB] = await Promise.all([revokePromiseB, syncPromiseB]);
+    } finally {
+      txSpy.mockRestore();
+    }
+
+    expect(revokeResB!.status).toBe(201);
+    expect(syncResB!.status).toBe(403);
+    expect(JSON.parse(syncResB!.body)).toMatchObject({ code: 'KITCHEN_DEVICE_NOT_AUTHORIZED' });
+
+    // Confirm neither order/item was mutated and no synced/item-started Audit or Outbox rows leaked.
+    const [o1, o2, i1, i2] = await Promise.all([
+      db.order.findUniqueOrThrow({ where: { id: order1Id } }),
+      db.order.findUniqueOrThrow({ where: { id: order2Id } }),
+      db.orderItem.findUniqueOrThrow({ where: { id: item1Id } }),
+      db.orderItem.findUniqueOrThrow({ where: { id: item2Id } }),
+    ]);
+    expect(o1.version).toBe(1);
+    expect(o2.version).toBe(1);
+    expect(i1.status).toBe('PENDING');
+    expect(i2.status).toBe('PENDING');
+
+    const itemAudits = await db.audit.findMany({
+      where: { tenantId, entityId: { in: [order1Id, order2Id] }, action: 'kitchen.item.started' },
+    });
+    expect(itemAudits).toHaveLength(0);
+
+    const itemOutbox = await db.outbox.findMany({
+      where: { tenantId, aggregateId: { in: [order1Id, order2Id] } },
+    });
+    expect(itemOutbox).toHaveLength(0);
+
+    const syncAudits = await db.audit.findMany({
+      where: { tenantId, entityId: { in: [syncRaceDeviceId, syncLockDeviceId] }, action: 'KITCHEN_DEVICE_SYNCED' },
+    });
+    expect(syncAudits).toHaveLength(0);
+
+    expect(await db.audit.findMany({ where: { tenantId, entityId: syncRaceDeviceId, action: 'KITCHEN_DEVICE_REVOKED' } })).toHaveLength(1);
+    expect(await db.audit.findMany({ where: { tenantId, entityId: syncLockDeviceId, action: 'KITCHEN_DEVICE_REVOKED' } })).toHaveLength(1);
+    expect(await db.outbox.findMany({ where: { tenantId, aggregateId: syncRaceDeviceId, type: 'kitchen.device.changed' } })).toHaveLength(2); // 1 assign + 1 revoke
+    expect(await db.outbox.findMany({ where: { tenantId, aggregateId: syncLockDeviceId, type: 'kitchen.device.changed' } })).toHaveLength(1);
+  });
 });
