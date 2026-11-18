@@ -77,12 +77,36 @@ export class Operations extends CommandBus {
       return { id: order.id, version: order.version };
   }
 
-  async item(ctx: Context, key: string, itemId: string, body: ItemCommand): Promise<Result> {
+  async item(
+    ctx: Context,
+    key: string,
+    itemId: string,
+    body: ItemCommand,
+    options?: { kitchenDeviceId?: string },
+  ): Promise<Result> {
     const permission: Permission = body.action === 'START' || body.action === 'READY' ? 'kitchen' : body.action === 'HANDOFF' ? 'handoff' : 'cancelPending';
     const events: Record<ItemCommand['action'], EventType> = { START: 'kitchen.item.started', READY: 'kitchen.item.ready', HANDOFF: 'kitchen.item.handed_off', CANCEL: 'order.item.cancelled' };
     return this.command(ctx, key, events[body.action], { itemId, ...body }, async (tx, current) => {
-      const item = await tx.orderItem.findFirst({ where: { ...scope(ctx), id: itemId }, include: { order: true, reservations: { orderBy: { ingredientId: 'asc' } } } });
+      let authorizedStationId: string | null = null;
+      if (options?.kitchenDeviceId) {
+        const devices = await tx.$queryRaw<{ stationId: string | null }[]>`
+          SELECT "stationId"
+          FROM "KitchenDevice"
+          WHERE "id" = ${options.kitchenDeviceId}::uuid
+            AND "tenantId" = ${current.tenantId}::uuid
+            AND "storeId" = ${current.storeId}::uuid
+            AND "userId" = ${current.userId}::uuid
+            AND "revokedAt" IS NULL
+          FOR SHARE
+        `;
+        if (devices.length !== 1) throw new ForbiddenException('KITCHEN_DEVICE_NOT_AUTHORIZED');
+        authorizedStationId = devices[0]!.stationId;
+      }
+      const item = await tx.orderItem.findFirst({ where: { ...scope(ctx), id: itemId }, include: { order: true, ticket: { select: { stationId: true } }, reservations: { orderBy: { ingredientId: 'asc' } } } });
       if (!item) throw new NotFoundException('ITEM_NOT_FOUND');
+      if (authorizedStationId && item.ticket.stationId !== authorizedStationId) {
+        throw new ForbiddenException('KITCHEN_COMMAND_SCOPE_MISMATCH');
+      }
       const order = item.order;
       if (order.version !== body.expectedVersion || order.status !== 'ACCEPTED' || order.paymentStatus !== 'UNPAID') throw new ConflictException('STALE_OR_TERMINAL_ORDER');
       const activePayments = await tx.payment.count({ where: { ...scope(ctx), orderId: order.id, status: { in: ['PENDING','SETTLED'] } } });
