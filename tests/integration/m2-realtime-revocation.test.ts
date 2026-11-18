@@ -398,6 +398,30 @@ describe('Realtime readiness probe & transactional session/device revocation (M2
     );
     expect(burstInitial.status).toBe(201);
 
+    // Concurrent heartbeats on an active registered device must all succeed (201) without 409 P2034 conflicts
+    // and without creating duplicate KITCHEN_DEVICE_REGISTERED audits.
+    const activeHeartbeatBurst = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        httpRequest(
+          baseUrl,
+          'POST',
+          '/kitchen/devices/register',
+          {
+            Origin: TEST_ORIGIN,
+            Cookie: `session=${kitchenToken}`,
+            'Content-Type': 'application/json',
+          },
+          JSON.stringify({ deviceId: burstDeviceId }),
+        ),
+      ),
+    );
+    for (const hb of activeHeartbeatBurst) {
+      expect(hb.status).toBe(201);
+    }
+    expect(
+      await db.audit.findMany({ where: { tenantId, entityId: burstDeviceId, action: 'KITCHEN_DEVICE_REGISTERED' } }),
+    ).toHaveLength(1);
+
     const [burstRevoke, ...burstHeartbeats] = await Promise.all([
       httpRequest(baseUrl, 'POST', `/admin/kitchen/devices/${burstDeviceId}/revoke`, {
         Origin: TEST_ORIGIN,

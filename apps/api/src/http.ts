@@ -37,6 +37,26 @@ async function kitchenDevice(req: Request, ctx: Awaited<ReturnType<typeof contex
 async function auditKitchenDevice(ctx: Awaited<ReturnType<typeof context>>, id: string, action: string, details?: Record<string, unknown>) {
   await db.audit.create({ data: { tenantId: ctx.tenantId, storeId: ctx.storeId, actorId: ctx.userId, action, entityId: id, commandKey: `kitchen-device:${action}:${randomUUID()}`, correlationId: ctx.correlationId, ...(details ? { details: details as Prisma.InputJsonValue } : {}) } });
 }
+async function updateAuthorizedKitchenDeviceHeartbeat(
+  tx: Prisma.TransactionClient,
+  current: { tenantId: string; storeId: string; userId: string },
+  deviceId: string,
+): Promise<boolean> {
+  const updated = await tx.kitchenDevice.updateMany({
+    where: {
+      id: deviceId,
+      tenantId: current.tenantId,
+      storeId: current.storeId,
+      userId: current.userId,
+      revokedAt: null,
+    },
+    data: { lastSeenAt: new Date() },
+  });
+  if (updated.count === 1) return true;
+  const existing = await tx.kitchenDevice.findUnique({ where: { id: deviceId }, select: { id: true } });
+  if (existing) throw new ForbiddenException('KITCHEN_DEVICE_REVOKED_OR_OUT_OF_SCOPE');
+  return false;
+}
 function parse<S extends z.ZodTypeAny>(schema: S, value: unknown): z.output<S> {
   const result = schema.safeParse(value);
   if (!result.success) throw new BadRequestException('INVALID_INPUT');
@@ -142,24 +162,23 @@ class ApiController {
   @Post('kitchen/devices/register') async registerKitchenDevice(@Req() req: Request, @Body() body: unknown) {
     const c = await context(req); const { deviceId } = parse(kitchenDeviceSchema, body);
     if (!allowed(c.role, 'kitchen')) throw new ForbiddenException('PERMISSION_DENIED');
-    await runSerializableTransactionWithRetry(db, async tx => {
+    // Heartbeats use an atomic conditional ReadCommitted update (revokedAt IS NULL) so concurrent
+    // heartbeats serialize on the row lock via PostgreSQL EvalPlanQual without P2034 aborts.
+    const touched = await db.$transaction(async tx => {
       const current = await reauthorize(tx, c);
       if (!allowed(current.role, 'kitchen')) throw new ForbiddenException('PERMISSION_DENIED');
-      const existing = await tx.kitchenDevice.findUnique({ where: { id: deviceId } });
-      if (existing) {
-        if (existing.tenantId !== current.tenantId || existing.storeId !== current.storeId || existing.userId !== current.userId || existing.revokedAt) {
-          throw new ForbiddenException('KITCHEN_DEVICE_REVOKED_OR_OUT_OF_SCOPE');
-        }
-        const updated = await tx.kitchenDevice.updateMany({
-          where: { id: deviceId, tenantId: current.tenantId, storeId: current.storeId, userId: current.userId, revokedAt: null },
-          data: { lastSeenAt: new Date() },
-        });
-        if (updated.count !== 1) throw new ForbiddenException('KITCHEN_DEVICE_REVOKED_OR_OUT_OF_SCOPE');
-        return;
-      }
-      await tx.kitchenDevice.create({ data: { id: deviceId, tenantId: current.tenantId, storeId: current.storeId, userId: current.userId } });
-      await tx.audit.create({ data: { tenantId: current.tenantId, storeId: current.storeId, actorId: current.userId, action: 'KITCHEN_DEVICE_REGISTERED', entityId: deviceId, commandKey: `kitchen-device:KITCHEN_DEVICE_REGISTERED:${randomUUID()}`, correlationId: current.correlationId } });
-    }, { operation: 'kitchen.device.changed' });
+      return updateAuthorizedKitchenDeviceHeartbeat(tx, current, deviceId);
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 5_000, timeout: 15_000 });
+
+    if (!touched) {
+      await runSerializableTransactionWithRetry(db, async tx => {
+        const current = await reauthorize(tx, c);
+        if (!allowed(current.role, 'kitchen')) throw new ForbiddenException('PERMISSION_DENIED');
+        if (await updateAuthorizedKitchenDeviceHeartbeat(tx, current, deviceId)) return;
+        await tx.kitchenDevice.create({ data: { id: deviceId, tenantId: current.tenantId, storeId: current.storeId, userId: current.userId } });
+        await tx.audit.create({ data: { tenantId: current.tenantId, storeId: current.storeId, actorId: current.userId, action: 'KITCHEN_DEVICE_REGISTERED', entityId: deviceId, commandKey: `kitchen-device:KITCHEN_DEVICE_REGISTERED:${randomUUID()}`, correlationId: current.correlationId } });
+      }, { operation: 'kitchen.device.changed' });
+    }
     return { deviceId, authorized: true };
   }
   @Post('kitchen/sync') async syncKitchenCommands(@Req() req: Request, @Body() body: unknown) {
