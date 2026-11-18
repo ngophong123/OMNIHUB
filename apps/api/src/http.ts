@@ -137,7 +137,7 @@ class ApiController {
   @Post('items/:id/commands') async command(@Req() req: Request, @Param('id') id: string, @Body() body: unknown) {
     const c = await context(req); const device = await kitchenDevice(req, c, c.role === 'KITCHEN'); const itemId = uuid(id);
     if (device?.stationId && !await db.orderItem.findFirst({ where: { id: itemId, tenantId: c.tenantId, storeId: c.storeId, ticket: { stationId: device.stationId } }, select: { id: true } })) throw new ForbiddenException('KITCHEN_STATION_SCOPE_MISMATCH');
-    return ops.item(c, key(req), itemId, parse(commandSchema, body));
+    return ops.item(c, key(req), itemId, parse(commandSchema, body), device ? { kitchenDeviceId: device.id } : undefined);
   }
   @Post('kitchen/devices/register') async registerKitchenDevice(@Req() req: Request, @Body() body: unknown) {
     const c = await context(req); const { deviceId } = parse(kitchenDeviceSchema, body);
@@ -185,11 +185,12 @@ class ApiController {
         if (!Number.isFinite(created) || created > Date.now() + 5 * 60_000 || created < Date.now() - 30 * 24 * 60 * 60_000) throw new ConflictException('OFFLINE_COMMAND_EXPIRED');
         const item = await db.orderItem.findFirst({ where: { tenantId: c.tenantId, storeId: c.storeId, id: command.itemId, ...(device?.stationId ? { ticket: { stationId: device.stationId } } : {}) }, select: { orderId: true } });
         if (!item || item.orderId !== command.orderId) throw new ForbiddenException('KITCHEN_COMMAND_SCOPE_MISMATCH');
-        const result = await ops.item(c, command.commandId, command.itemId, { action: command.action, expectedVersion: command.expectedVersion });
+        const result = await ops.item(c, command.commandId, command.itemId, { action: command.action, expectedVersion: command.expectedVersion }, { kitchenDeviceId: device!.id });
         results.push({ commandId: command.commandId, status: 'CONFIRMED', version: result.version });
       } catch (error) {
         if (error instanceof HttpException && error.getStatus() >= 500) throw error;
         if (error instanceof HttpException && error.getStatus() === 401) throw error;
+        if (error instanceof HttpException && error.message === 'KITCHEN_DEVICE_NOT_AUTHORIZED') throw error;
         const conflict = error instanceof HttpException && error.getStatus() === 409;
         const code = error instanceof HttpException ? error.message : 'COMMAND_REJECTED';
         results.push({ commandId: command.commandId, status: conflict ? 'CONFLICT' : 'REJECTED', code });
