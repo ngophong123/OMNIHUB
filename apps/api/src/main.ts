@@ -3,17 +3,11 @@ import 'dotenv/config';
 import Redis from 'ioredis';
 import { db } from './database';
 import { attachRealtime, setRealtimeRedisHealthProbe } from './realtime';
-import { createRedisRateLimiter, setRateLimitRedisHealthProbe } from './rate-limit';
+import { configurePublicAndAuthRateLimits, setRateLimitRedisHealthProbe } from './rate-limit';
 import { validateDeployment } from './deployment-security';
 import { createConfiguredHttpApp } from './http-app';
 import { apiLogger } from './observability/logger';
 import { apiMetrics } from './observability/metrics';
-
-function configuredLimit(name: string, fallback: number, maximum: number): number {
-  const value = Number(process.env[name] ?? fallback);
-  if (!Number.isInteger(value) || value < 1 || value > maximum) throw new Error(`${name} must be an integer from 1 to ${maximum}`);
-  return value;
-}
 
 async function main() {
   validateDeployment();
@@ -32,15 +26,11 @@ async function main() {
     limiterRedisFailed = true;
   });
   setRateLimitRedisHealthProbe(() => limiterRedis.ping());
-  const windowMs = configuredLimit('RATE_LIMIT_WINDOW_SECONDS', 60, 3600) * 1000;
   const app = await createConfiguredHttpApp({
     origin,
     trustedProxies,
     configureBeforeFilters: configuredApp => {
-      configuredApp.use('/auth/login', createRedisRateLimiter(limiterRedis, { prefix: 'login', limit: configuredLimit('AUTH_LOGIN_RATE_LIMIT', 10, 100), windowMs }));
-      configuredApp.use('/public/table-sessions/orders', createRedisRateLimiter(limiterRedis, { prefix: 'qr-order', limit: configuredLimit('QR_ORDER_RATE_LIMIT', 20, 200), windowMs }));
-      configuredApp.use('/public/', createRedisRateLimiter(limiterRedis, { prefix: 'public', limit: configuredLimit('PUBLIC_API_RATE_LIMIT', 60, 1000), windowMs }));
-      configuredApp.use('/webhooks/', createRedisRateLimiter(limiterRedis, { prefix: 'webhook', limit: configuredLimit('WEBHOOK_RATE_LIMIT', 120, 5000), windowMs }));
+      configurePublicAndAuthRateLimits(configuredApp, limiterRedis);
     },
   });
   setRealtimeRedisHealthProbe(() => false);

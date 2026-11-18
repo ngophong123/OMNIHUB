@@ -1,5 +1,14 @@
 # Implementation status
 
+## Milestone 2 — Task 10: Dual-Key Auth Rate Limiting & Per-Account Lockout (2026-11-17)
+
+Branch `feat/m2-dual-key-auth-rate-limit` implements `M2-T10` (from [`M2_BACKEND_AUDIT.md`](M2_BACKEND_AUDIT.md) and [`M2_IMPLEMENTATION_PLAN.md`](M2_IMPLEMENTATION_PLAN.md), **Pilot remains NO-GO** pending remaining M2 P1/ops gates):
+
+| Workstream / Gate | Status | Evidence & Scope Boundary |
+|---|---|---|
+| Dual-key IP + per-account brute-force protection (`apps/api/src/rate-limit.ts`, `auth.ts`, `main.ts`, `metrics.ts`) | VERIFIED (Unit + PG; Redis CI pending) | Added `AUTH_LOGIN_IP_LIMIT` (default `60` req/min, fallback to `AUTH_LOGIN_RATE_LIMIT` if set) alongside deterministic cross-replica per-account failure tracking keyed by normalized-email SHA-256 digest under `~omnihub:rate:*` (`10` failures per `15` min -> `429 ACCOUNT_LOCKED_RETRY_LATER` + `Retry-After` checked before `db.user.findUnique`/`scrypt`, increment only on bad password/unknown/inactive user, non-increment on missing store membership, reset via `PTTL`+`PEXPIRE 0` on login success). Lua scripts use strictly Redis 7 ACL-allowed commands (`EVAL`, `INCR`, `PEXPIRE`, `PTTL`, zero `DEL`). Added transition-only `AUTH_ACCOUNT_LOCKED` log, bounded Prometheus labels (`prefix="login_account"`), and dedicated `10` req/min `/public/invitations/` throttling (`PUBLIC_INVITATION_RATE_LIMIT`) without generic `/public/` double-counting. |
+| `M2-T10` verification & V8 coverage gates | VERIFIED (Local) / PENDING (Redis & E2E CI) | Verified `81/81` unit tests (`8` files including `7` tests in `tests/unit/rate-limit.test.ts`), `115/115` unit + real `embedded-postgres` integration tests (`12` files; V8 `Stmts 74.1%`, `Branch 68.39%`, `Funcs 68.78%`, `Lines 83.69%`; `auth.ts` `Lines 100%`, `rate-limit.ts` `Lines 100%`), `typecheck`, `lint`, `security:hygiene`, `audit`, and `build`; `tests/redis/shared-rate-limit.test.ts` and Playwright E2E await GitHub Actions CI with Redis 7. |
+
 ## Milestone 2 — Task 09: Socket.IO Redis Adapter & Instant Revocation (2026-11-16)
 
 Branch `feat/m2-socketio-redis-adapter` implements `M2-T09` (from [`M2_BACKEND_AUDIT.md`](M2_BACKEND_AUDIT.md) and [`M2_IMPLEMENTATION_PLAN.md`](M2_IMPLEMENTATION_PLAN.md), **Pilot remains NO-GO** pending remaining M2 P0/P1/ops gates):
