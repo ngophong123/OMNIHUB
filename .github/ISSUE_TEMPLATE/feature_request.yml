@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Please align feature proposals with `docs/PRODUCT_REQUIREMENTS.md` and `docs/DOMAIN_MODEL.md`. Keep proposals scoped and concrete.
+        Please align feature proposals with `docs/internal/PRODUCT_REQUIREMENTS.md` and `docs/internal/DOMAIN_MODEL.md`. Keep proposals scoped and concrete.
   - type: dropdown
     id: area
     attributes:

@@ -16,7 +16,7 @@ Sau Milestone 1 (`e79ad6f`), OMNIHUB đã có **lõi transactional và invariant
   - Outbox worker có `FOR UPDATE SKIP LOCKED`, batch time budget `10s` trong transaction deadline `15s` (`apps/api/src/outbox.ts`), Socket.IO O(1) batched revalidation (`apps/api/src/realtime.ts`), fail-closed deployment config guard (`apps/api/src/deployment-security.ts`), và Redis Lua rate limiter (`apps/api/src/rate-limit.ts`).
 
 - **Lý do chưa đạt chuẩn Senior Production SaaS (trước khi xử lý M2):**
-  1. **Kiến trúc ứng dụng phẳng, thiếu module boundary:** Toàn bộ ~45+ endpoints, validation thủ công, raw `$transaction` cho kitchen devices, và truy vấn Prisma trực tiếp nằm chung trong một controller duy nhất [`apps/api/src/http.ts`](apps/api/src/http.ts), hoàn toàn không dùng NestJS Dependency Injection, Guards/Pipes, hay API versioning (`/v1`).
+  1. **Kiến trúc ứng dụng phẳng, thiếu module boundary:** Toàn bộ ~45+ endpoints, validation thủ công, raw `$transaction` cho kitchen devices, và truy vấn Prisma trực tiếp nằm chung trong một controller duy nhất [`apps/api/src/http.ts`](../../apps/api/src/http.ts), hoàn toàn không dùng NestJS Dependency Injection, Guards/Pipes, hay API versioning (`/v1`).
   2. **Thiếu năng lực scale ngang & resilience ở runtime:** Socket.IO chưa có `@socket.io/redis-adapter` (polling broken nếu nhiều API replicas không sticky session); `Outbox` quarantine chỉ lưu trên RAM (`Set` tối đa 1.000 IDs) không có persistent DLQ/retry counter hay retention pruning; `CommandBus` retry cả lỗi unique violation `P2002` không có jitter và có thể giữ HTTP thread tới ~80s.
   3. **Bảo mật & Identity vận hành còn khoảng trống:** Không có per-account login throttling (chỉ theo IP -> rủi ro credential stuffing qua proxy hoặc khóa nhầm toàn bộ quán ăn chung NAT); không có session revocation/list/switch-store/cleanup; `TRUSTED_PROXY_CIDRS` cấm CIDR subnet khác `/32` và `/128`; global CSRF Origin gate chặn luôn `/webhooks/*` server-to-server.
   4. **Observability & Production Ops mới ở mức log JSON tối thiểu:** Thiếu hoàn toàn metrics (`/metrics` Prometheus / OpenTelemetry), DB pool/statement timeout tuning, HTTP server timeouts, structured logger thống nhất, và payment adapter mới chỉ là sandbox stub (`CARD_PROVIDER_DISABLED_SANDBOX_NOT_CONFIGURED`).
@@ -44,18 +44,18 @@ Sau Milestone 1 (`e79ad6f`), OMNIHUB đã có **lõi transactional và invariant
 Các hạng mục sau đã được kiểm chứng trực tiếp qua code và migration, đạt tiêu chuẩn kỹ thuật tốt và chỉ cần bảo toàn hoặc mở rộng tương thích:
 
 1. **Multi-tenant Composite Foreign Keys & DB Ledger Immutability (`DONE`)**
-   - Mọi bảng nghiệp vụ chính mang `tenantId`, `storeId` và composite unique/FK trỏ về `Store(tenantId, id)` trong [`prisma/schema.prisma`](prisma/schema.prisma).
-   - PostgreSQL CHECK constraints & triggers trong [`prisma/migrations/202610210002_invariants/migration.sql`](prisma/migrations/202610210002_invariants/migration.sql), [`202610230002_cash_shift_state_machine/migration.sql`](prisma/migrations/202610230002_cash_shift_state_machine/migration.sql), [`202610240001_multi_method_payments/migration.sql`](prisma/migrations/202610240001_multi_method_payments/migration.sql) khóa cứng state machine của `Balance`, `Payment`, `CashShift`, `Refund`, `RefundDecision`, `Movement`, `Audit`, `BillSplit`.
+   - Mọi bảng nghiệp vụ chính mang `tenantId`, `storeId` và composite unique/FK trỏ về `Store(tenantId, id)` trong [`prisma/schema.prisma`](../../prisma/schema.prisma).
+   - PostgreSQL CHECK constraints & triggers trong [`prisma/migrations/202610210002_invariants/migration.sql`](../../prisma/migrations/202610210002_invariants/migration.sql), [`202610230002_cash_shift_state_machine/migration.sql`](../../prisma/migrations/202610230002_cash_shift_state_machine/migration.sql), [`202610240001_multi_method_payments/migration.sql`](../../prisma/migrations/202610240001_multi_method_payments/migration.sql) khóa cứng state machine của `Balance`, `Payment`, `CashShift`, `Refund`, `RefundDecision`, `Movement`, `Audit`, `BillSplit`.
 2. **Pure Domain Math & State Machine (`DONE`)**
-   - [`apps/api/src/domain.ts`](apps/api/src/domain.ts) & [`apps/api/src/catalog-domain.ts`](apps/api/src/catalog-domain.ts): `BigInt` cho `allocateVnd` / `convertUnit`, `Decimal` `.000` cho `composeRecipe`, scrypt `N=16384,r=8,p=1`, state transitions thuần không side-effect.
+   - [`apps/api/src/domain.ts`](../../apps/api/src/domain.ts) & [`apps/api/src/catalog-domain.ts`](../../apps/api/src/catalog-domain.ts): `BigInt` cho `allocateVnd` / `convertUnit`, `Decimal` `.000` cho `composeRecipe`, scrypt `N=16384,r=8,p=1`, state transitions thuần không side-effect.
 3. **Global Sanitized Exception Filter & Path Redaction (`DONE`)**
-   - [`apps/api/src/errors.ts`](apps/api/src/errors.ts#L57-L146): Mapping lỗi Prisma (`P2025`, `P2002`, `P2034`, `P10*`, `P2024`), NestJS `HttpException`, JSON `SyntaxError`, `entity.too.large` về envelope `{ code, correlationId }` sạch, không lộ stack/SQL/credential; [`accessLogPath`](apps/api/src/deployment-security.ts#L30-L35) redact capability tokens trên URL public.
+   - [`apps/api/src/errors.ts`](../../apps/api/src/errors.ts#L57-L146): Mapping lỗi Prisma (`P2025`, `P2002`, `P2034`, `P10*`, `P2024`), NestJS `HttpException`, JSON `SyntaxError`, `entity.too.large` về envelope `{ code, correlationId }` sạch, không lộ stack/SQL/credential; [`accessLogPath`](../../apps/api/src/deployment-security.ts#L30-L35) redact capability tokens trên URL public.
 4. **Fail-Closed Startup Security Guard & Secret Loading (`DONE`)**
-   - [`apps/api/src/deployment-security.ts`](apps/api/src/deployment-security.ts#L4-L28), [`deploy/load-secrets.cjs`](deploy/load-secrets.cjs), [`deploy/postgres-init.sh`](deploy/postgres-init.sh), [`deploy/redis-start.sh`](deploy/redis-start.sh): Tách role `omnihub_owner` / `omnihub_app` / `omnihub_backup`, Redis ACL least-privilege, Docker non-root + `read_only` + `cap_drop: ALL`.
+   - [`apps/api/src/deployment-security.ts`](../../apps/api/src/deployment-security.ts#L4-L28), [`deploy/load-secrets.cjs`](../../deploy/load-secrets.cjs), [`deploy/postgres-init.sh`](../../deploy/postgres-init.sh), [`deploy/redis-start.sh`](../../deploy/redis-start.sh): Tách role `omnihub_owner` / `omnihub_app` / `omnihub_backup`, Redis ACL least-privilege, Docker non-root + `read_only` + `cap_drop: ALL`.
 5. **Outbox Time Budget & Concurrency Locking (`DONE` trong M1)**
-   - [`apps/api/src/outbox.ts`](apps/api/src/outbox.ts#L63-L270): `FOR UPDATE SKIP LOCKED`, bounded batch budget `10s` nằm gọn trong transaction timeout `15s` với commit headroom `5s`, commit partial `deliveredAt` trước deadline.
+   - [`apps/api/src/outbox.ts`](../../apps/api/src/outbox.ts#L63-L270): `FOR UPDATE SKIP LOCKED`, bounded batch budget `10s` nằm gọn trong transaction timeout `15s` với commit headroom `5s`, commit partial `deliveredAt` trước deadline.
 6. **Atomic Redis Lua Rate Limiting Core (`DONE` phần lõi thuật toán)**
-   - [`apps/api/src/rate-limit.ts`](apps/api/src/rate-limit.ts#L5-L26): Script Lua `INCR` + `PEXPIRE` + `PTTL` atomic trên một round-trip Redis và fail-closed 503 khi Redis down.
+   - [`apps/api/src/rate-limit.ts`](../../apps/api/src/rate-limit.ts#L5-L26): Script Lua `INCR` + `PEXPIRE` + `PTTL` atomic trên một round-trip Redis và fail-closed 503 khi Redis down.
 
 ---
 
@@ -66,7 +66,7 @@ Các hạng mục sau đã được kiểm chứng trực tiếp qua code và mi
 ### MIỀN A — Architecture & Modularity
 
 #### Finding A-01 `[PARTIAL]` — Monolithic Controller & Thiếu NestJS Dependency Injection
-1. **Vị trí:** [`apps/api/src/http.ts`](apps/api/src/http.ts#L22-L316), [`apps/api/src/http-app.ts`](apps/api/src/http-app.ts#L27)
+1. **Vị trí:** [`apps/api/src/http.ts`](../../apps/api/src/http.ts#L22-L316), [`apps/api/src/http-app.ts`](../../apps/api/src/http-app.ts#L27)
 2. **Mô tả vấn đề:** `AppModule` chỉ khai báo `controllers: [ApiController]` (`http.ts#L315-L316`) với 0 `providers`. Các service (`Operations`, `CatalogOperations`, `CashShifts`, `Payments`, `QrOrdering`, `PilotAdmin`) bị khởi tạo bằng `new` tĩnh ở module scope (`http.ts#L22-L27`) gắn chặt singleton `db`. Controller `ApiController` chứa hơn 45 endpoints trên 260+ dòng, pha trộn transport parsing (`parse()`, `uuid()`, `context()`), authorization thủ công (`allowed()`), raw `db.$transaction` (`registerKitchenDevice` L108, `assignKitchenDevice` L193, `revokeKitchenDevice` L212), và read queries phức tạp (`listKitchenDevices` L160, `pilotReadiness` L171, `orders` L92, `report` L241).
 3. **Tác động production:** Không thể tách unit/module tests bằng mock/DI container sạch; vi phạm Single Responsibility; thay đổi auth/device guard dễ bỏ sót endpoint mới (như đã xảy ra với sự không đồng nhất giữa `PilotAdmin` bypass `CommandBus` và `Operations`); khó áp dụng interceptors/guards/OpenAPI generation theo từng bounded context khi đội ngũ mở rộng.
 4. **Mức độ ưu tiên:** `P1`
@@ -78,7 +78,7 @@ Các hạng mục sau đã được kiểm chứng trực tiếp qua code và mi
 7. **Tests cần có:** Integration tests kiểm tra NestJS DI bootstrap thành công với `Test.createTestingModule`, xác nhận toàn bộ guards (`401`/`403`) và endpoints cũ hoạt động không regression.
 
 #### Finding A-02 `[RISK]` — Thiếu tầng Service cho Kitchen Device lifecycle & Audit ngoài `CommandBus`
-1. **Vị trí:** [`apps/api/src/http.ts`](apps/api/src/http.ts#L35-L37), [`apps/api/src/http.ts`](apps/api/src/http.ts#L105-L220)
+1. **Vị trí:** [`apps/api/src/http.ts`](../../apps/api/src/http.ts#L35-L37), [`apps/api/src/http.ts`](../../apps/api/src/http.ts#L105-L220)
 2. **Mô tả vấn đề:** `auditKitchenDevice` (`http.ts#L35-L37`) ghi `Audit` bằng random UUID commandKey (`kitchen-device:${action}:${randomUUID()}`) **bên ngoài** transaction của nghiệp vụ (`syncKitchenCommands` L157), không dùng `CommandBus`, và `registerKitchenDevice` / `assignKitchenDevice` / `revokeKitchenDevice` (`L108-L218`) tự viết `db.$transaction` trong controller nhưng **không ghi bản ghi `Outbox`**, nên realtime clients hoặc các replica không nhận được sự kiện thu hồi/gán lại trạm.
 3. **Tác động production:** Khi admin revoke một thiết bị bếp (`POST /admin/kitchen/devices/:id/revoke`), thiết bị đó tiếp tục nhận WebSocket events tối đa 30 giây (đến chu kỳ `revalidateRealtimeSockets`) hoặc khi client retry sync không có idempotency key thật sự sẽ tạo nhiều bản ghi audit trùng lặp.
 4. **Mức độ ưu tiên:** `P1`
@@ -93,7 +93,7 @@ Các hạng mục sau đã được kiểm chứng trực tiếp qua code và mi
 ### MIỀN B — Authentication, Authorization & Multi-Tenancy
 
 #### Finding B-01 `[RISK]` — Rate Limit Auth chỉ theo IP, thiếu Per-Account Lockout & Exponential Backoff
-1. **Vị trí:** [`apps/api/src/main.ts`](apps/api/src/main.ts#L38), [`apps/api/src/rate-limit.ts`](apps/api/src/rate-limit.ts#L33-L34), [`apps/api/src/auth.ts`](apps/api/src/auth.ts#L23-L35)
+1. **Vị trí:** [`apps/api/src/main.ts`](../../apps/api/src/main.ts#L38), [`apps/api/src/rate-limit.ts`](../../apps/api/src/rate-limit.ts#L33-L34), [`apps/api/src/auth.ts`](../../apps/api/src/auth.ts#L23-L35)
 2. **Mô tả vấn đề:** `/auth/login` hiện chỉ giới hạn `10 requests / 60s` trên **một địa chỉ IP** (`digest(address)` ở `rate-limit.ts#L34`), hoàn toàn không đếm số lần sai mật khẩu theo `(email, storeId)` hoặc toàn tài khoản `userId`. Ngược lại, một quán ăn F&B có nhiều nhân viên thu ngân/bếp/quản lý dùng chung **1 IP WAN (NAT)** có thể bị khóa chéo lẫn nhau chỉ vì một thiết bị nhập sai hoặc mở nhiều tab/session cùng lúc (`10 req/60s` trên 1 IP NAT). Đồng thời kẻ tấn công dùng distributed IPs/botnet có thể thử không giới hạn số lần trên 1 `email` mục tiêu.
 3. **Tác động production:** Hai rủi ro đối nghịch cùng xảy ra: (a) Denial-of-Service đối với quán ăn thật đi qua chung NAT/4G router, (b) Credential stuffing / password spraying từ nhiều IP vào tài khoản `OWNER`/`MANAGER` mà hệ thống không khóa hay cảnh báo.
 4. **Mức độ ưu tiên:** `P0`
@@ -106,7 +106,7 @@ Các hạng mục sau đã được kiểm chứng trực tiếp qua code và mi
 7. **Tests cần có:** Redis integration test kiểm thử brute-force 1 email từ nhiều `X-Forwarded-For` bị chặn, và multi-user trên cùng IP không tự khóa oan tài khoản hợp lệ.
 
 #### Finding B-02 `[MISSING]` — Thiếu Session Lifecycle Management (List/Revoke All, Store Switching, TTL Cleanup)
-1. **Vị trí:** [`apps/api/src/auth.ts`](apps/api/src/auth.ts#L23-L35), [`apps/api/src/http.ts`](apps/api/src/http.ts#L62-L72), [`prisma/schema.prisma`](prisma/schema.prisma#L45-L60)
+1. **Vị trí:** [`apps/api/src/auth.ts`](../../apps/api/src/auth.ts#L23-L35), [`apps/api/src/http.ts`](../../apps/api/src/http.ts#L62-L72), [`prisma/schema.prisma`](../../prisma/schema.prisma#L45-L60)
 2. **Mô tả vấn đề:** Hệ thống chỉ có `POST /auth/login` (8 tiếng cố định, không sliding refresh), `GET /auth/me`, và `POST /auth/logout` (chỉ xóa `session` cookie hiện tại). Thiếu hoàn toàn:
    - API thu hồi toàn bộ phiên đăng nhập của user (`POST /auth/logout-all` hoặc `DELETE /admin/users/:id/sessions` khi nhân viên nghỉ việc / mất máy POS).
    - API chuyển chi nhánh (`POST /auth/switch-store`) cho user/owner có nhiều `Membership` ở nhiều `Store` mà không phải nhập lại mật khẩu.
@@ -123,7 +123,7 @@ Các hạng mục sau đã được kiểm chứng trực tiếp qua code và mi
 7. **Tests cần có:** Integration tests cho `logout-all`, `revoke-sessions`, `switch-store` (chặn cross-tenant switch), và batch session cleanup.
 
 #### Finding B-03 `[RISK]` — `PilotAdmin` tạo/thu hồi/chấp nhận invitation có race TOCTOU & thiếu correlationId
-1. **Vị trí:** [`apps/api/src/pilot-admin.ts`](apps/api/src/pilot-admin.ts#L16-L30), [`apps/api/src/pilot-admin.ts`](apps/api/src/pilot-admin.ts#L53-L71)
+1. **Vị trí:** [`apps/api/src/pilot-admin.ts`](../../apps/api/src/pilot-admin.ts#L16-L30), [`apps/api/src/pilot-admin.ts`](../../apps/api/src/pilot-admin.ts#L53-L71)
 2. **Mô tả vấn đề:**
    - `createInvitation` kiểm tra `existingUser` và `pending` bằng query ngoài transaction (`L17-L20`), sau đó mới mở `Serializable` tx (`L22`) mà không kiểm tra lại bên trong tx và DB không có partial unique index cho pending invitations -> 2 requests đồng thời có thể tạo 2 invitation `PENDING` cùng email.
    - `acceptInvitation` (`L53-L71`) chạy ngoài `CommandBus`, truyền cứng `correlationId: ''` vào `Audit` (`L68`), và kiểm tra mật khẩu `existing` (`L59`) ngoài transaction trước khi khóa/claim invitation.
@@ -140,7 +140,7 @@ Các hạng mục sau đã được kiểm chứng trực tiếp qua code và mi
 7. **Tests cần có:** Integration tests cho concurrent `createInvitation`, `acceptInvitation` correlationId propagation, và rate limit `/public/invitations/:token/accept`.
 
 #### Finding B-04 `[RISK]` — `deployment-security.ts` từ chối mọi proxy CIDR khác `/32` và `/128`
-1. **Vị trí:** [`apps/api/src/deployment-security.ts`](apps/api/src/deployment-security.ts#L12-L17)
+1. **Vị trí:** [`apps/api/src/deployment-security.ts`](../../apps/api/src/deployment-security.ts#L12-L17)
 2. **Mô tả vấn đề:** Kiểm tra `TRUSTED_PROXY_CIDRS` chỉ chấp nhận không có prefix hoặc prefix đúng bằng `32` (IPv4) / `128` (IPv6) (`Number(prefix) !== (family === 4 ? 32 : 128)`). Mọi subnet hợp lệ trong thực tế như AWS VPC ALB (`10.0.0.0/16`), Docker bridge (`172.29.87.0/24`), Kubernetes pod CIDR (`10.244.0.0/16`), hoặc Cloudflare IP ranges (`/20`, `/22`, `/32`) đều làm API crash khi boot trong `NODE_ENV=production` với `UNSAFE_DEPLOYMENT_TRUSTED_PROXY_CIDRS`.
 3. **Tác động production:** Không thể deploy OMNIHUB phía sau cloud load balancer / reverse proxy autoscaling hoặc Kubernetes ingress dùng dải IP động theo subnet, trừ khi gắn cứng từng IP `/32` thủ công.
 4. **Mức độ ưu tiên:** `P1`
@@ -155,7 +155,7 @@ Các hạng mục sau đã được kiểm chứng trực tiếp qua code và mi
 ### MIỀN C — Database & Data Integrity
 
 #### Finding C-01 `[RISK]` — Thiếu Index cho truy vấn lịch sử Movement theo Store & Time-series
-1. **Vị trí:** [`prisma/schema.prisma`](prisma/schema.prisma#L343), [`apps/api/src/http.ts`](apps/api/src/http.ts#L238), [`apps/api/src/catalog-operations.ts`](apps/api/src/catalog-operations.ts#L285-L290)
+1. **Vị trí:** [`prisma/schema.prisma`](../../prisma/schema.prisma#L343), [`apps/api/src/http.ts`](../../apps/api/src/http.ts#L238), [`apps/api/src/catalog-operations.ts`](../../apps/api/src/catalog-operations.ts#L285-L290)
 2. **Mô tả vấn đề:** Model `Movement` hiện chỉ có `@@index([tenantId, storeId, ingredientId, createdAt])` (dòng 343) và `@@unique([tenantId, storeId, commandKey, itemId, ingredientId, kind])`. Không có index bắt đầu bằng `(tenantId, storeId, createdAt)` hay `(tenantId, storeId, kind, createdAt)`. Trong khi đó cả `GET /inventory/movements` (`http.ts#L238`) và `GET /admin/inventory/movements` (`catalog-operations.ts#L286-L289`) đều lọc theo `(tenantId, storeId)` và sắp xếp `ORDER BY "createdAt" DESC`.
 3. **Tác động production:** Khi một cửa hàng tích lũy hàng trăm nghìn hoặc hàng triệu dòng `Movement`, PostgreSQL buộc phải đọc toàn bộ các dòng thuộc `(tenantId, storeId)` theo index đầu rồi sort trên disk/memory để lấy `ORDER BY createdAt DESC LIMIT 100`. Gây tăng CPU/IOPS PostgreSQL và latency endpoint inventory/admin tăng tuyến tính theo thời gian vận hành.
 4. **Mức độ ưu tiên:** `P1`
@@ -165,7 +165,7 @@ Các hạng mục sau đã được kiểm chứng trực tiếp qua code và mi
 7. **Tests cần có:** Migration check + integration test verify schema index và query plan hoặc functional pagination test trên `movements`.
 
 #### Finding C-02 `[RISK]` — Kiểm tra trùng tên (`uniqueName`) bằng đọc toàn bộ bảng vào RAM + lỗ hổng race/soft-delete
-1. **Vị trí:** [`apps/api/src/catalog-operations.ts`](apps/api/src/catalog-operations.ts#L9-L11), [`catalog-operations.ts`](apps/api/src/catalog-operations.ts#L21-L22), [`#L33-L34`](apps/api/src/catalog-operations.ts#L33-L34), [`#L53-L54`](apps/api/src/catalog-operations.ts#L53-L54), [`#L80`](apps/api/src/catalog-operations.ts#L80), [`#L147`](apps/api/src/catalog-operations.ts#L147), [`#L162`](apps/api/src/catalog-operations.ts#L162), [`#L211`](apps/api/src/catalog-operations.ts#L211), [`#L230`](apps/api/src/catalog-operations.ts#L230), [`#L246`](apps/api/src/catalog-operations.ts#L246)
+1. **Vị trí:** [`apps/api/src/catalog-operations.ts`](../../apps/api/src/catalog-operations.ts#L9-L11), [`catalog-operations.ts`](../../apps/api/src/catalog-operations.ts#L21-L22), [`#L33-L34`](../../apps/api/src/catalog-operations.ts#L33-L34), [`#L53-L54`](../../apps/api/src/catalog-operations.ts#L53-L54), [`#L80`](../../apps/api/src/catalog-operations.ts#L80), [`#L147`](../../apps/api/src/catalog-operations.ts#L147), [`#L162`](../../apps/api/src/catalog-operations.ts#L162), [`#L211`](../../apps/api/src/catalog-operations.ts#L211), [`#L230`](../../apps/api/src/catalog-operations.ts#L230), [`#L246`](../../apps/api/src/catalog-operations.ts#L246)
 2. **Mô tả vấn đề:** Mọi thao tác tạo/sửa `Category`, `Station`, `Ingredient`, `Product`, `ProductVariant`, `ModifierGroup`, `Modifier` đều `findMany` lấy hết danh sách `name` của tenant+store vào Node.js rồi chạy JS `localeCompare(..., { sensitivity: 'accent' })`. Ngoài chi phí memory/query O(N) mỗi lần lưu:
    - `createCategory` (`L21`) và `updateCategory` (`L33`) quên lọc `deletedAt: null` khi lấy `peers`, nên category đã bị archive/soft-delete vẫn chặn vĩnh viễn việc tạo lại tên đó! (Trong khi `saveStation` L53 và các entity khác có `deletedAt: null`).
    - Không có partial unique index trong PostgreSQL (`WHERE "deletedAt" IS NULL`), nên ngoài `Serializable` conflict thỉnh thoảng (nếu predicate lock phủ đúng hoặc lỡ đổi isolation level), tính duy nhất không được đảm bảo ở tầng DB.
@@ -178,7 +178,7 @@ Các hạng mục sau đã được kiểm chứng trực tiếp qua code và mi
 7. **Tests cần có:** Integration tests: archive category -> tạo lại cùng tên thành công; tạo song song cùng tên khác case (`"Coffee"` vs `"coffee"`) -> một thành công, một trả `409`.
 
 #### Finding C-03 `[RISK]` — Lock Acquisition Order không đồng nhất giữa các service tài chính (`Order`, `Payment`, `CashShift`, `Refund`)
-1. **Vị trí:** [`apps/api/src/payments.ts`](apps/api/src/payments.ts#L33-L45), [`payments.ts`](apps/api/src/payments.ts#L67-L68), [`payments.ts`](apps/api/src/payments.ts#L118), [`payments.ts`](apps/api/src/payments.ts#L137-L144), [`apps/api/src/operations.ts`](apps/api/src/operations.ts#L93-L100), [`operations.ts`](apps/api/src/operations.ts#L120-L163), [`apps/api/src/cash-shifts.ts`](apps/api/src/cash-shifts.ts#L45-L71)
+1. **Vị trí:** [`apps/api/src/payments.ts`](../../apps/api/src/payments.ts#L33-L45), [`payments.ts`](../../apps/api/src/payments.ts#L67-L68), [`payments.ts`](../../apps/api/src/payments.ts#L118), [`payments.ts`](../../apps/api/src/payments.ts#L137-L144), [`apps/api/src/operations.ts`](../../apps/api/src/operations.ts#L93-L100), [`operations.ts`](../../apps/api/src/operations.ts#L120-L163), [`apps/api/src/cash-shifts.ts`](../../apps/api/src/cash-shifts.ts#L45-L71)
 2. **Mô tả vấn đề:** Các transaction giữ nhiều row locks theo thứ tự khác nhau:
    - `Payments.record` (`payments.ts#L33,44`): lock `Order` -> `CashShift`.
    - `Operations.cash` (`operations.ts#L150-L160`): đọc `Order` -> `Payment` -> lock `CashShift` -> update `Order` (lấy `Order` share/SIREAD trước hoặc update cuối sau khi giữ lock `CashShift`).
@@ -194,7 +194,7 @@ Các hạng mục sau đã được kiểm chứng trực tiếp qua code và mi
 7. **Tests cần có:** Integration concurrency tests chạy `Promise.all` đồng thời các luồng trên cùng store/shift/order và kiểm tra zero `40P01` deadlocks + bảo toàn invariant số dư.
 
 #### Finding C-04 `[RISK]` — `decideRefund` buộc Manager duyệt hoàn tiền mặt phải đang tự mở ca `CashShift` của chính mình
-1. **Vị trí:** [`apps/api/src/payments.ts`](apps/api/src/payments.ts#L143-L148), [`apps/api/src/payments.ts`](apps/api/src/payments.ts#L156)
+1. **Vị trí:** [`apps/api/src/payments.ts`](../../apps/api/src/payments.ts#L143-L148), [`apps/api/src/payments.ts`](../../apps/api/src/payments.ts#L156)
 2. **Mô tả vấn đề:** Khi duyệt hoàn tiền phương thức `CASH` (`decideRefund`), query kiểm tra `"cashierId" = current.userId AND status = 'OPEN' FOR UPDATE` (L144). Nghĩa là chính người Manager bấm duyệt (`current.userId`) bắt buộc phải đang có ca thu ngân mở đứng tên **chính mình**; nếu tiền mặt hoàn từ két/ca của nhân viên thu ngân (`payment.cashShiftId` hoặc ca đang mở trên quầy), Manager không thể duyệt hoàn tiền mặt nếu Manager không tự mở một ca thu ngân riêng! Hơn nữa `CashMovement` được tạo với `commandKey: `${key}:cash`` thay vì liên kết rõ ràng vào ca gốc hay ca được chỉ định.
 3. **Tác động production:** Đứt gãy quy trình vận hành nhà hàng thực tế: cashier mở ca thu tiền, khách yêu cầu hoàn tiền mặt, manager duyệt hoàn tiền nhưng bị chặn `OPEN_CASH_SHIFT_REQUIRED_FOR_CASH_REFUND` hoặc buộc manager mở ca giả dẫn tới sai lệch đối soát tiền mặt cuối ca của cashier thật (tiền trong két của cashier bị trừ thực tế nhưng sổ sách ghi trừ vào ca riêng của manager!).
 4. **Mức độ ưu tiên:** `P1`
@@ -204,10 +204,10 @@ Các hạng mục sau đã được kiểm chứng trực tiếp qua code và mi
 7. **Tests cần có:** Integration tests cho manager duyệt hoàn tiền mặt trên ca đang mở của cashier và case ca đã đóng.
 
 #### Finding C-05 `[MISSING]` — Thiếu cơ chế retention / archival / cleanup cho các bảng tăng trưởng vô hạn (`Audit`, `CommandReceipt`, `Outbox`, `Session`, `TableSession`) & thiếu cấu hình `Database` pool / timeout
-1. **Vị trí:** [`prisma/schema.prisma`](prisma/schema.prisma#L45-L60), [`#L228-L243`](prisma/schema.prisma#L228-L243), [`#L524-L565`](prisma/schema.prisma#L524-L565), [`apps/api/src/database.ts`](apps/api/src/database.ts#L1-L5)
+1. **Vị trí:** [`prisma/schema.prisma`](../../prisma/schema.prisma#L45-L60), [`#L228-L243`](../../prisma/schema.prisma#L228-L243), [`#L524-L565`](../../prisma/schema.prisma#L524-L565), [`apps/api/src/database.ts`](../../apps/api/src/database.ts#L1-L5)
 2. **Mô tả vấn đề:**
    - `CommandReceipt` giữ vĩnh viễn toàn bộ idempotency payloads/responses không có TTL pruning; `Outbox` giữ vĩnh viễn các dòng đã `deliveredAt IS NOT NULL`; `Session` và `TableSession` không có job dọn dẹp các phiên đã hết hạn.
-   - [`apps/api/src/database.ts`](apps/api/src/database.ts#L5) khởi tạo `new PrismaClient()` mặc định không cấu hình connection pool fallback, không log slow queries (`$on('query')` / threshold), và không cài đặt `statement_timeout` hoặc `idle_in_transaction_session_timeout` cho role ứng dụng `omnihub_app` trong [`deploy/postgres-init.sh`](deploy/postgres-init.sh#L11-L20).
+   - [`apps/api/src/database.ts`](../../apps/api/src/database.ts#L5) khởi tạo `new PrismaClient()` mặc định không cấu hình connection pool fallback, không log slow queries (`$on('query')` / threshold), và không cài đặt `statement_timeout` hoặc `idle_in_transaction_session_timeout` cho role ứng dụng `omnihub_app` trong [`deploy/postgres-init.sh`](../../deploy/postgres-init.sh#L11-L20).
 3. **Tác động production:** Sau vài tháng chạy production, table bloat trên `Outbox` / `CommandReceipt` / `Session` làm tăng dung lượng backup `pg_dump` và thời gian vacuum; một query treo hoặc giao dịch lỗi có thể giữ connection / lock vô thời hạn nếu không có `statement_timeout` & `idle_in_transaction_session_timeout`.
 4. **Mức độ ưu tiên:** `P1`
 5. **Đề xuất giải pháp:**
@@ -219,7 +219,7 @@ Các hạng mục sau đã được kiểm chứng trực tiếp qua code và mi
 7. **Tests cần có:** Integration tests kiểm tra cleanup job chỉ xóa records quá hạn retention, không chạm records còn hạn hoặc bảng immutable (`Audit`, `Movement`, `Payment`).
 
 #### Finding C-06 `[PARTIAL]` — Store timezone khóa cứng `'Asia/Ho_Chi_Minh'`
-1. **Vị trí:** [`apps/api/src/domain.ts`](apps/api/src/domain.ts#L56), [`prisma/migrations/202610210002_invariants/migration.sql`](prisma/migrations/202610210002_invariants/migration.sql#L10)
+1. **Vị trí:** [`apps/api/src/domain.ts`](../../apps/api/src/domain.ts#L56), [`prisma/migrations/202610210002_invariants/migration.sql`](../../prisma/migrations/202610210002_invariants/migration.sql#L10)
 2. **Mô tả vấn đề:** `businessDate()` ném lỗi nếu `timezone !== 'Asia/Ho_Chi_Minh'` và DB constraint `store_business_clock` khóa cứng `timezone = 'Asia/Ho_Chi_Minh'`.
 3. **Tác động production:** Hoàn toàn ổn cho pilot Việt Nam hiện tại, nhưng sẽ chặn mở rộng thị trường quốc tế nếu không mở rộng `Intl.DateTimeFormat` theo danh sách IANA timezone hợp lệ.
 4. **Mức độ ưu tiên:** `P3`
@@ -232,11 +232,11 @@ Các hạng mục sau đã được kiểm chứng trực tiếp qua code và mi
 ### MIỀN D — Distributed Systems, Concurrency & Reliability
 
 #### Finding D-01 `[MISSING]` — Socket.IO thiếu `@socket.io/redis-adapter`, nuốt lỗi Redis subscriber, và không sync revoke tức thời giữa replicas
-1. **Vị trí:** [`apps/api/src/realtime.ts`](apps/api/src/realtime.ts#L288-L380)
+1. **Vị trí:** [`apps/api/src/realtime.ts`](../../apps/api/src/realtime.ts#L288-L380)
 2. **Mô tả vấn đề:**
    - `attachRealtime` (`realtime.ts#L289-L292`) khởi tạo Socket.IO `Server` mặc định (in-memory adapter), chỉ dùng một `Redis` subscriber tự viết lắng nghe kênh `omnihub.events` (`#L349-L365`). Dù mỗi API replica đều nhận message Pub/Sub để emit về socket local của mình, việc thiếu `@socket.io/redis-adapter` (hoặc HTTP sticky sessions ở proxy/LB) làm **HTTP long-polling handshake của Socket.IO thất bại (`400 Session ID unknown`)** khi request polling đi qua nhiều API replicas qua load balancer không sticky.
    - `subscriber.on('error', () => {})` (`L350-L352`) và `catch` tại `L362-L364` nuốt sạch mọi lỗi Redis disconnect hoặc lỗi DB trong `broadcastOperationalEvent` mà **không log bất kỳ cảnh báo nào**.
-   - Ngoài ra, kiểm tra `ready()` ở [`apps/api/src/http.ts`](apps/api/src/http.ts#L51-L55) chỉ kiểm tra `limiterRedis.ping()` mà không kiểm tra trạng thái kết nối của `realtime` Redis subscriber (`subscriber.status === 'ready'`).
+   - Ngoài ra, kiểm tra `ready()` ở [`apps/api/src/http.ts`](../../apps/api/src/http.ts#L51-L55) chỉ kiểm tra `limiterRedis.ping()` mà không kiểm tra trạng thái kết nối của `realtime` Redis subscriber (`subscriber.status === 'ready'`).
 3. **Tác động production:** Deploy >= 2 API instances phía sau LB (K8s Service / ALB / multi-upstream Caddy) khiến client kết nối Socket.IO fallback polling rớt liên tục; nếu Redis subscriber đứt âm thầm nhưng `limiterRedis` sống (hoặc reconnect chậm), API vẫn báo `/ready` 200 trong khi realtime bị mù sự kiện mà không có log nào trong stderr/stdout.
 4. **Mức độ ưu tiên:** `P0`
 5. **Đề xuất giải pháp:**
@@ -249,10 +249,10 @@ Các hạng mục sau đã được kiểm chứng trực tiếp qua code và mi
 7. **Tests cần có:** Redis + multi-replica API integration test kiểm chứng Socket.IO client kết nối qua replica A vẫn nhận được broadcast/session invalidation hoặc handshake thành công qua nhiều replicas.
 
 #### Finding D-02 `[RISK]` — Outbox `quarantinedIds` chỉ nằm trên RAM (`Set` max 1000) và `worker.ts` bật `enableOfflineQueue` ngầm
-1. **Vị trí:** [`apps/api/src/outbox.ts`](apps/api/src/outbox.ts#L14), [`outbox.ts`](apps/api/src/outbox.ts#L311), [`apps/api/src/worker.ts`](apps/api/src/worker.ts#L9-L10)
+1. **Vị trí:** [`apps/api/src/outbox.ts`](../../apps/api/src/outbox.ts#L14), [`outbox.ts`](../../apps/api/src/outbox.ts#L311), [`apps/api/src/worker.ts`](../../apps/api/src/worker.ts#L9-L10)
 2. **Mô tả vấn đề:**
    - Khi phát hiện bản ghi Outbox lỗi schema (`!parsed.success` / invalid payload), worker thêm `row.id` vào `quarantinedIds` trên RAM (`outbox.ts#L311`, giới hạn `MAX_QUARANTINE_IDS = 1_000` tại `#L14`). Không có cột `attempts`, `lastError`, hay `quarantinedAt` trong bảng `Outbox` (`prisma/schema.prisma#L552-L565`). Mỗi khi worker container restart/deploy, toàn bộ poison messages chưa có `deliveredAt` lại được query và xử lý lại từ đầu; nếu vượt 1.000 poison rows, các dòng cũ tiếp tục lặp lại vô tận.
-   - Ở [`apps/api/src/worker.ts`](apps/api/src/worker.ts#L9), `new Redis(REDIS_URL, { maxRetriesPerRequest: 1 })` không đặt `enableOfflineQueue: false` (khác với `limiterRedis` ở `main.ts#L20`) và `redis.on('error', () => undefined)` (`L10`) nuốt mọi lỗi kết nối Redis ngoài vòng batch.
+   - Ở [`apps/api/src/worker.ts`](../../apps/api/src/worker.ts#L9), `new Redis(REDIS_URL, { maxRetriesPerRequest: 1 })` không đặt `enableOfflineQueue: false` (khác với `limiterRedis` ở `main.ts#L20`) và `redis.on('error', () => undefined)` (`L10`) nuốt mọi lỗi kết nối Redis ngoài vòng batch.
 3. **Tác động production:** Một hoặc nhiều poison event (ví dụ do migration/contract mismatch hoặc schema mới chưa đồng bộ) không được đưa vào Dead-Letter state bền vững trên DB -> gây ồn cảnh báo và lãng phí DB/worker cycles sau mỗi lần restart; khi Redis mất kết nối, ioredis offline queue có thể tích tụ commands chờ trong RAM thay vì fail-fast vào cơ chế backoff của `outbox.ts`.
 4. **Mức độ ưu tiên:** `P1`
 5. **Đề xuất giải pháp:**
@@ -264,7 +264,7 @@ Các hạng mục sau đã được kiểm chứng trực tiếp qua code và mi
 7. **Tests cần có:** Integration tests: (1) poison Outbox row chuyển `deadLetteredAt != null` và worker restart không xử lý lại; (2) worker offline Redis queue disabled fail-fast vào backoff.
 
 #### Finding D-03 `[RISK]` — `CommandBus` retry cả lỗi `P2002`, không có Jitter, và có thể giữ HTTP request tới ~80 giây
-1. **Vị trí:** [`apps/api/src/commands.ts`](apps/api/src/commands.ts#L15-L43), [`commands.ts`](apps/api/src/commands.ts#L46-L74)
+1. **Vị trí:** [`apps/api/src/commands.ts`](../../apps/api/src/commands.ts#L15-L43), [`commands.ts`](../../apps/api/src/commands.ts#L46-L74)
 2. **Mô tả vấn đề:**
    - Cả `command` (`#L35`) và `publicCommand` (`#L66`) retry tối đa 4 lần cho `P2034` (serialization failure), `P2010` (`40001`, `40P01`), **và cả `P2002` (Unique constraint violation)** với linear backoff cố định `20 * (attempt + 1)` ms (`#L37`, `#L68`) — **không có random jitter**.
    - Nếu `P2002` xảy ra do vi phạm unique constraint nghiệp vụ thật (ví dụ `CashRegister.name` trùng, `StockReceipt.reference` trùng, `RestaurantTable.name` trùng, hoặc `externalReference` trùng trên luồng khác chưa check), hệ thống chạy lại toàn bộ `Serializable` transaction 4 lần vô ích trước khi ném `409 CONCURRENT_CHANGE_RETRY_SAME_KEY` thay vì phân biệt `P2002` là duplicate resource vs `CommandReceipt` race!
@@ -283,7 +283,7 @@ Các hạng mục sau đã được kiểm chứng trực tiếp qua code và mi
 7. **Tests cần có:** Unit + integration tests kiểm chứng canonical hash, no-retry on business `P2002`, và jittered retry + overall deadline cho `P2034`.
 
 #### Finding D-04 `[RISK]` — `QrOrdering.createTable` & `regenerate` tự phá cơ chế Idempotent Retry (`409 QR_CREATED_RETRY_WITH_NEW_KEY`)
-1. **Vị trí:** [`apps/api/src/qr-ordering.ts`](apps/api/src/qr-ordering.ts#L20-L28), [`qr-ordering.ts`](apps/api/src/qr-ordering.ts#L40-L51)
+1. **Vị trí:** [`apps/api/src/qr-ordering.ts`](../../apps/api/src/qr-ordering.ts#L20-L28), [`qr-ordering.ts`](../../apps/api/src/qr-ordering.ts#L40-L51)
 2. **Mô tả vấn đề:** `createTable` và `regenerate` tạo `credential = token()` bên ngoài `this.command(...)` và gán biến closure `exposedToken = credential` bên trong callback `work` (`L24, L47`). Nếu request bị rớt mạng ở lượt response rồi client/POS retry đúng chuẩn với cùng `Idempotency-Key`, `CommandBus` trả về `receipt.response` mà không chạy `work` -> `exposedToken === ''` -> API ném **`409 QR_CREATED_RETRY_WITH_NEW_KEY` / `QR_ROTATED_RETRY_WITH_NEW_KEY`**! Điều này làm hỏng hợp đồng `Idempotency-Key` và khiến client tạo bàn bị thừa bàn rác hoặc phải quay vòng QR.
 3. **Tác động production:** Mạng Wi-Fi quán ăn chập chờn khiến client retry tạo bàn hoặc rotate QR bị fail 409; retry với key mới tạo ra bản ghi bàn trùng hoặc xoay mất token vừa in trên UI.
 4. **Mức độ ưu tiên:** `P2`
@@ -297,7 +297,7 @@ Các hạng mục sau đã được kiểm chứng trực tiếp qua code và mi
 ### MIỀN E — API Design & Runtime Reliability
 
 #### Finding E-01 `[MISSING]` — Thiếu API Versioning, Endpoint trùng lặp & Unbounded List Endpoints
-1. **Vị trí:** [`apps/api/src/http.ts`](apps/api/src/http.ts#L48), [`http.ts`](apps/api/src/http.ts#L96), [`http.ts`](apps/api/src/http.ts#L162), [`http.ts`](apps/api/src/http.ts#L229-L239), [`http.ts`](apps/api/src/http.ts#L266), [`http.ts`](apps/api/src/http.ts#L288-L296), [`apps/api/src/cash-shifts.ts`](apps/api/src/cash-shifts.ts#L21), [`apps/api/src/catalog-operations.ts`](apps/api/src/catalog-operations.ts#L139-L142), [`#L285-L290`](apps/api/src/catalog-operations.ts#L285-L290)
+1. **Vị trí:** [`apps/api/src/http.ts`](../../apps/api/src/http.ts#L48), [`http.ts`](../../apps/api/src/http.ts#L96), [`http.ts`](../../apps/api/src/http.ts#L162), [`http.ts`](../../apps/api/src/http.ts#L229-L239), [`http.ts`](../../apps/api/src/http.ts#L266), [`http.ts`](../../apps/api/src/http.ts#L288-L296), [`apps/api/src/cash-shifts.ts`](../../apps/api/src/cash-shifts.ts#L21), [`apps/api/src/catalog-operations.ts`](../../apps/api/src/catalog-operations.ts#L139-L142), [`#L285-L290`](../../apps/api/src/catalog-operations.ts#L285-L290)
 2. **Mô tả vấn đề:**
    - **Không có API versioning:** Tất cả routes mount trực tiếp ở root (`@Controller()`, không có `/api/v1` hay `/v1`).
    - **Endpoint trùng lặp / hành vi khác nhau:** `GET /inventory/movements` (`http.ts#L235-L239`) trả mảng cố định `take: 200` không phân trang, trong khi `GET /admin/inventory/movements` (`http.ts#L312` -> `catalog.movements`) trả `{ rows, total, page, pageSize, pages }` có filter/pagination.
@@ -315,10 +315,10 @@ Các hạng mục sau đã được kiểm chứng trực tiếp qua code và mi
 7. **Tests cần có:** Integration tests kiểm tra pagination (`cursor`/`pageSize`), cap tối đa, và response shape của các list endpoints.
 
 #### Finding E-02 `[RISK]` — Thiếu HTTP Server Timeouts, Explicit Payload Size Guard & Global Origin Gate xung đột với `/webhooks/*`
-1. **Vị trí:** [`apps/api/src/main.ts`](apps/api/src/main.ts#L41-L44), [`apps/api/src/http-app.ts`](apps/api/src/http-app.ts#L27-L66), [`apps/api/src/http.ts`](apps/api/src/http.ts#L267-L270)
+1. **Vị trí:** [`apps/api/src/main.ts`](../../apps/api/src/main.ts#L41-L44), [`apps/api/src/http-app.ts`](../../apps/api/src/http-app.ts#L27-L66), [`apps/api/src/http.ts`](../../apps/api/src/http.ts#L267-L270)
 2. **Mô tả vấn đề:**
-   - [`main.ts`](apps/api/src/main.ts#L44) gọi `app.listen(...)` mà không cấu hình Node `http.Server` timeouts (`requestTimeout`, `headersTimeout`, `keepAliveTimeout` — lưu ý Caddy/ALB keep-alive races cần `keepAliveTimeout > proxy keepalive` hoặc cấu hình rõ ràng), cũng không đặt explicit Express JSON body limit trong `http-app.ts` (hiện phụ thuộc default ngầm của `body-parser` NestJS).
-   - [`http-app.ts#L60-L64`](apps/api/src/http-app.ts#L60-L64) chặn toàn bộ non-GET/HEAD/OPTIONS nếu `req.get('origin') !== origin` — bao gồm cả `/webhooks/*` (dù `main.ts#L41` đã gắn sẵn rate limiter riêng cho `/webhooks/`). Khi tích hợp payment gateway thật (VNPay/MoMo/PayOS/Stripe/etc.), webhook server-to-server **không gửi header `Origin`** nên sẽ bị `403 ORIGIN_DENIED` trừ khi có bypass riêng kèm HMAC/signature + replay verification.
+   - [`main.ts`](../../apps/api/src/main.ts#L44) gọi `app.listen(...)` mà không cấu hình Node `http.Server` timeouts (`requestTimeout`, `headersTimeout`, `keepAliveTimeout` — lưu ý Caddy/ALB keep-alive races cần `keepAliveTimeout > proxy keepalive` hoặc cấu hình rõ ràng), cũng không đặt explicit Express JSON body limit trong `http-app.ts` (hiện phụ thuộc default ngầm của `body-parser` NestJS).
+   - [`http-app.ts#L60-L64`](../../apps/api/src/http-app.ts#L60-L64) chặn toàn bộ non-GET/HEAD/OPTIONS nếu `req.get('origin') !== origin` — bao gồm cả `/webhooks/*` (dù `main.ts#L41` đã gắn sẵn rate limiter riêng cho `/webhooks/`). Khi tích hợp payment gateway thật (VNPay/MoMo/PayOS/Stripe/etc.), webhook server-to-server **không gửi header `Origin`** nên sẽ bị `403 ORIGIN_DENIED` trừ khi có bypass riêng kèm HMAC/signature + replay verification.
    - `GET /admin/tables/qr-code` (`http.ts#L269`) vẫn cho fallback đọc `?token=` từ query string (`req.get('X-QR-Token') ?? token`), làm tăng nguy cơ lộ QR capability secret vào browser history / analytics / proxy nếu bật log sau này (ngay cả khi Caddyfile đang tắt access log).
 3. **Tác động production:** Slowloris / slow-body client có thể giữ kết nối API; giữ nguyên Origin gate sẽ chặn toàn bộ payment webhook khi mở cổng thanh toán; query `?token=` trái chuẩn security-by-design của chính codebase.
 4. **Mức độ ưu tiên:** `P1`
@@ -336,10 +336,10 @@ Các hạng mục sau đã được kiểm chứng trực tiếp qua code và mi
 ### MIỀN F — Observability, Logging, Metrics & Error Handling
 
 #### Finding F-01 `[MISSING]` — Hoàn toàn thiếu Metrics, Tracing & Saturation Telemetry (Prometheus / OpenTelemetry)
-1. **Vị trí:** [`apps/api/src/main.ts`](apps/api/src/main.ts), [`apps/api/src/http-app.ts`](apps/api/src/http-app.ts#L53-L58), [`apps/api/src/outbox.ts`](apps/api/src/outbox.ts#L326-L380), [`apps/api/src/rate-limit.ts`](apps/api/src/rate-limit.ts#L41-L50)
+1. **Vị trí:** [`apps/api/src/main.ts`](../../apps/api/src/main.ts), [`apps/api/src/http-app.ts`](../../apps/api/src/http-app.ts#L53-L58), [`apps/api/src/outbox.ts`](../../apps/api/src/outbox.ts#L326-L380), [`apps/api/src/rate-limit.ts`](../../apps/api/src/rate-limit.ts#L41-L50)
 2. **Mô tả vấn đề:** Toàn bộ backend không có một metric hay trace nào:
    - Không có endpoint `/metrics` (hoặc Prometheus exporter / OTel SDK).
-   - Không đo HTTP latency histograms (p50/p95/p99), error rate theo route/code, rate-limit `429`/`503` counters (hiện [`rate-limit.ts#L41-L50`](apps/api/src/rate-limit.ts#L41-L50) trả `429`/`503` hoàn toàn **im lặng không log, không metric**).
+   - Không đo HTTP latency histograms (p50/p95/p99), error rate theo route/code, rate-limit `429`/`503` counters (hiện [`rate-limit.ts#L41-L50`](../../apps/api/src/rate-limit.ts#L41-L50) trả `429`/`503` hoàn toàn **im lặng không log, không metric**).
    - Không đo Outbox lag (`oldestUndeliveredAgeSeconds`, `pendingCount`, `deadLetterCount`), `CommandBus` `P2034` retry frequency, số Socket.IO active connections, hoặc PostgreSQL pool exhaustion (`P2024`).
 3. **Tác động production:** Vận hành mù mờ ("blind flying"): không biết API đang chậm vì DB pool nghẽn, transaction retry `P2034` tăng đột biến, brute-force đang đánh vào login (`429`), hay Outbox worker tụt hậu vài phút phía sau giao dịch POS trước khi khách phàn nàn màn hình bếp không cập nhật.
 4. **Mức độ ưu tiên:** `P0`
@@ -353,10 +353,10 @@ Các hạng mục sau đã được kiểm chứng trực tiếp qua code và mi
 7. **Tests cần có:** Integration tests kiểm chứng `GET /metrics` ghi nhận tăng counters khi gửi HTTP request, trigger `429`, và tạo/deliver Outbox row.
 
 #### Finding F-02 `[PARTIAL]` — Structured Logging phân tán bằng `console.*`, thiếu Context chuẩn và làm rơi `correlationId`
-1. **Vị trí:** [`apps/api/src/http-app.ts`](apps/api/src/http-app.ts#L57), [`apps/api/src/errors.ts`](apps/api/src/errors.ts#L131), [`apps/api/src/main.ts`](apps/api/src/main.ts#L24-L58), [`apps/api/src/outbox.ts`](apps/api/src/outbox.ts#L343-L375), [`apps/api/src/pilot-admin.ts`](apps/api/src/pilot-admin.ts#L68), [`apps/api/src/realtime.ts`](apps/api/src/realtime.ts#L350-L364)
+1. **Vị trí:** [`apps/api/src/http-app.ts`](../../apps/api/src/http-app.ts#L57), [`apps/api/src/errors.ts`](../../apps/api/src/errors.ts#L131), [`apps/api/src/main.ts`](../../apps/api/src/main.ts#L24-L58), [`apps/api/src/outbox.ts`](../../apps/api/src/outbox.ts#L343-L375), [`apps/api/src/pilot-admin.ts`](../../apps/api/src/pilot-admin.ts#L68), [`apps/api/src/realtime.ts`](../../apps/api/src/realtime.ts#L350-L364)
 2. **Mô tả vấn đề:**
    - Không có `LoggerService` dùng chung: một số nơi in `console.log(JSON.stringify(...))` có `timestamp` (`errors.ts#L132`), nơi khác không có `timestamp` (`http-app.ts#L57`, `main.ts#L24,28,45`, `outbox.ts#L343`).
-   - [`http-app.ts#L48`](apps/api/src/http-app.ts#L48) luôn tự sinh `randomUUID()` mới cho `correlationId`, bỏ qua request header `X-Correlation-ID` / `X-Request-ID` / `traceparent` hợp lệ (nếu client/proxy gửi vào để trace end-to-end), và không lưu `correlationId` vào `AsyncLocalStorage` nên các tầng sâu không tự truy cập được (dẫn tới `pilot-admin.ts#L68` ghi cứng `correlationId: ''` vào `Audit`).
+   - [`http-app.ts#L48`](../../apps/api/src/http-app.ts#L48) luôn tự sinh `randomUUID()` mới cho `correlationId`, bỏ qua request header `X-Correlation-ID` / `X-Request-ID` / `traceparent` hợp lệ (nếu client/proxy gửi vào để trace end-to-end), và không lưu `correlationId` vào `AsyncLocalStorage` nên các tầng sâu không tự truy cập được (dẫn tới `pilot-admin.ts#L68` ghi cứng `correlationId: ''` vào `Audit`).
    - Các hàm background/auth như `rate-limit.ts` (`503`), `auth.ts` (`login` failed), `realtime.ts` (`subscriber.on('error')`, broadcast failure) không có log JSON.
 3. **Tác động production:** Khó correlate log giữa Caddy/LB, Next.js SSR, API HTTP access log, Outbox worker, và DB `Audit` table; lỗi Redis realtime và rate-limit 503 không xuất hiện trong log pipeline.
 4. **Mức độ ưu tiên:** `P1`
@@ -375,7 +375,7 @@ Các hạng mục sau đã được kiểm chứng trực tiếp qua code và mi
 ### MIỀN G — Production Readiness & Operations
 
 #### Finding G-01 `[RISK]` — Khoảng trống Backup/DR: Chỉ dùng `pg_dump` (RPO >= 5–15 phút, không có WAL PITR), lệch phiên bản PostgreSQL giữa CI (17) và Staging (18)
-1. **Vị trí:** [`deploy/backup/backup.sh`](deploy/backup/backup.sh#L8-L62), [`deploy/compose.staging.yml`](deploy/compose.staging.yml#L25), [`deploy/compose.staging.yml`](deploy/compose.staging.yml#L162-L163), [`.github/workflows/ci.yml`](.github/workflows/ci.yml#L17)
+1. **Vị trí:** [`deploy/backup/backup.sh`](../../deploy/backup/backup.sh#L8-L62), [`deploy/compose.staging.yml`](../../deploy/compose.staging.yml#L25), [`deploy/compose.staging.yml`](../../deploy/compose.staging.yml#L162-L163), [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml#L17)
 2. **Mô tả vấn đề:**
    - Chiến lược backup hiện tại chạy `pg_dump --format=custom` mỗi `300s` (`BACKUP_INTERVAL_SECONDS=300`), cảnh báo stale ở `900s`. Hệ thống **chưa bật PostgreSQL WAL archiving / Point-in-Time Recovery (PITR)** (ví dụ `pgBackRest` hoặc `WAL-G`), nên khi gặp sự cố phần cứng/corruption/xóa nhầm dữ liệu giữa kỳ dump, toàn bộ giao dịch POS/thanh toán trong tối đa 5–15 phút cuối có nguy cơ mất trắng; đồng thời khi bảng lớn lên, `pg_dump` full mỗi 5 phút sẽ gây I/O và snapshot pressure kéo dài.
    - Version drift rõ rệt: CI (`.github/workflows/ci.yml#L17, #L101`) test trên `postgres:17-alpine` trong khi Staging (`deploy/compose.staging.yml#L25`) chạy `postgres:18-alpine`, còn root `package.json` `devDependencies` dùng `embedded-postgres: 18.4.0-beta.17` (phiên bản beta!).
@@ -391,7 +391,7 @@ Các hạng mục sau đã được kiểm chứng trực tiếp qua code và mi
 7. **Tests cần có:** Restore drill script test khôi phục thành công tại checkpoint timestamp mới hơn base backup (PITR) và CI pipeline green trên đúng major version Postgres đồng nhất.
 
 #### Finding G-02 `[MISSING]` — Cổng thanh toán Card mới là Sandbox Stub, chưa có Webhook Verification Pipeline
-1. **Vị trí:** [`apps/api/src/card-provider.ts`](apps/api/src/card-provider.ts#L1-L17), [`apps/api/src/payments.ts`](apps/api/src/payments.ts#L28-L32), [`apps/api/src/http-app.ts`](apps/api/src/http-app.ts#L60)
+1. **Vị trí:** [`apps/api/src/card-provider.ts`](../../apps/api/src/card-provider.ts#L1-L17), [`apps/api/src/payments.ts`](../../apps/api/src/payments.ts#L28-L32), [`apps/api/src/http-app.ts`](../../apps/api/src/http-app.ts#L60)
 2. **Mô tả vấn đề:** `LabeledCardSandboxAdapter.authorize()` (`card-provider.ts#L11-L15`) luôn ném `503 CARD_PROVIDER_DISABLED_SANDBOX_NOT_CONFIGURED`. Không có interface/adapter thanh toán thực tế (hoặc QR động VietQR/PayOS/VNPay/Stripe), không có webhook ingestion controller, HMAC signature verification, timestamp replay window, hay reconciliation job cho các `BANK_TRANSFER`/`CARD` payment bị treo ở trạng thái `PENDING`.
 3. **Tác động production:** Chưa thể thu tiền tự động qua cổng thanh toán/thẻ trong production (chỉ ghi `CASH` hoặc manual `BANK_TRANSFER` cần manager duyệt tay từng giao dịch); giao dịch `PENDING` bị bỏ quên sẽ treo vô thời hạn nếu khách hủy ngang.
 4. **Mức độ ưu tiên:** `P2` (nếu pilot chỉ chạy Cash + Manual Bank Transfer thì là `P2` cho M2, nâng lên `P0` nếu bật Card/QR auto-reconcile).
@@ -407,8 +407,8 @@ Các hạng mục sau đã được kiểm chứng trực tiếp qua code và mi
 ### MIỀN H — Testing Architecture & Gaps
 
 #### Finding H-01 `[PARTIAL]` — Coverage Threshold ở CI quá thấp (45–55%) và bỏ trống hoàn toàn các file nghiệp vụ/runtime cốt lõi
-1. **Vị trí:** [`vitest.config.ts`](vitest.config.ts#L9-L26), [`tests/`](tests/)
-2. **Mô tả vấn đề:** Tại thời điểm audit baseline (`e79ad6f`), bộ test gồm 50 unit test cases thực thi qua 6 file (41 khai báo tĩnh trước khi Vitest mở rộng `it.each` gồm 9 case trong `tests/unit/deployment-security.test.ts` -> thực chạy `3 + 16 + 10 + 12 + 3 + 6 = 50`), 32 PostgreSQL integration tests (2 file), 2 Redis integration tests (2 file), 10 E2E Playwright tests (1 file), và 3 shell script tests cho backup. Tuy nhiên [`vitest.config.ts#L11-L13`](vitest.config.ts#L11-L13) chỉ ép ngưỡng CI tổng thể ở mức:
+1. **Vị trí:** [`vitest.config.ts`](../../vitest.config.ts#L9-L26), [`tests/`](../../tests/)
+2. **Mô tả vấn đề:** Tại thời điểm audit baseline (`e79ad6f`), bộ test gồm 50 unit test cases thực thi qua 6 file (41 khai báo tĩnh trước khi Vitest mở rộng `it.each` gồm 9 case trong `tests/unit/deployment-security.test.ts` -> thực chạy `3 + 16 + 10 + 12 + 3 + 6 = 50`), 32 PostgreSQL integration tests (2 file), 2 Redis integration tests (2 file), 10 E2E Playwright tests (1 file), và 3 shell script tests cho backup. Tuy nhiên [`vitest.config.ts#L11-L13`](../../vitest.config.ts#L11-L13) chỉ ép ngưỡng CI tổng thể ở mức:
    - `lines: 55`, `statements: 45`, `branches: 48`, `functions: 45`
    - Các per-file thresholds (`L14-L22`) chỉ áp lên các file nhỏ (`auth.ts`, `domain.ts`, `catalog-domain.ts`, `rate-limit.ts`, `deployment-security.ts`, `card-provider.ts`, `contracts`), `commands.ts` chỉ yêu cầu `branches: 50, lines: 65`, trong khi **100% các module nặng nhất đều không có per-file coverage threshold**: `http.ts`, `http-app.ts`, `main.ts`, `operations.ts`, `payments.ts`, `cash-shifts.ts`, `catalog-operations.ts`, `qr-ordering.ts`, `pilot-admin.ts`, `realtime.ts`, `outbox.ts`, `worker.ts`, `errors.ts`.
 3. **Tác động production:** Bug hoặc branch xử lý lỗi mới thêm vào controller, payments, refunds, cash shifts, hay realtime có thể rớt coverage xuống rất thấp mà CI `verify` vẫn xanh.
@@ -419,7 +419,7 @@ Các hạng mục sau đã được kiểm chứng trực tiếp qua code và mi
 7. **Tests cần có:** Bổ sung unit & integration tests phủ các nhánh thiếu của `payments.ts`, `cash-shifts.ts`, `catalog-operations.ts`, `qr-ordering.ts`, `pilot-admin.ts`, `errors.ts`, `http.ts`.
 
 #### Finding H-02 `[MISSING]` — Thiếu Concurrency Deadlock Stress Tests, Multi-Replica Realtime Polling Tests, Load/Soak Tests & Security/Abuse Tests chuyên sâu
-1. **Vị trí:** [`tests/integration/`](tests/integration/), [`tests/redis/`](tests/redis/)
+1. **Vị trí:** [`tests/integration/`](../../tests/integration/), [`tests/redis/`](../../tests/redis/)
 2. **Mô tả vấn đề:**
    - `tests/redis/api-replicas.test.ts` mới chỉ kiểm tra **shared rate limit** giữa 2 API processes trên endpoint `/auth/login` (`L29-L61`), hoàn toàn **chưa test Socket.IO multi-replica** (polling + WebSocket + Outbox event broadcast giữa nhiều API processes).
    - Thiếu concurrency stress tests mô phỏng xung đột deadlock thực tế (hàng chục requests `record CASH`, `decideRefund`, `close shift`, `accept order`, `item START/CANCEL` chạy đồng thời).

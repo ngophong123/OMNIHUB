@@ -54,7 +54,7 @@ Examples:
 
 - Keep PRs **focused, scoped, and reviewable** — avoid mixing unrelated refactors with feature or documentation changes.
 - Complete all sections of [.github/pull_request_template.md](.github/pull_request_template.md).
-- Update relevant technical documentation (`docs/IMPLEMENTATION_STATUS.md`, `docs/TESTING.md`, `docs/API_DOCUMENTATION.md`, schema/lifecycle docs) whenever behavior, schemas, or verified test status changes.
+- Update relevant technical documentation (`docs/internal/IMPLEMENTATION_STATUS.md`, `docs/internal/TESTING.md`, `docs/internal/API_DOCUMENTATION.md`, schema/lifecycle docs) whenever behavior, schemas, or verified test status changes.
 - **Never commit** `.env`, `.local/`, `.tmp/`, build outputs (`.next/`, `dist/`), database dumps, logs, or Playwright trace artifacts.
 - Do not expand CI scope, database schemas, or application behavior silently inside documentation-only PRs.
 
@@ -64,10 +64,10 @@ Examples:
 
 Every change touching runtime code, schemas, or deployment scripts should be reviewed against OMNIHUB invariants:
 
-- **Tenant & Store Isolation:** Every query, mutation, and socket room must enforce authenticated `(tenantId, storeId)` scope inside both controller/service boundaries and database constraints ([docs/AUTHORIZATION_MATRIX.md](docs/AUTHORIZATION_MATRIX.md)).
+- **Tenant & Store Isolation:** Every query, mutation, and socket room must enforce authenticated `(tenantId, storeId)` scope inside both controller/service boundaries and database constraints ([docs/internal/AUTHORIZATION_MATRIX.md](docs/internal/AUTHORIZATION_MATRIX.md)).
 - **Transaction & Concurrency Safety:** Multi-row stock, order, shift, and payment writes must run in PostgreSQL serializable transactions with bounded retry handling, sorted locking where applicable, and `CommandReceipt` idempotency ([docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)).
-- **Exact Arithmetic:** Use `Decimal(18,3)` for ingredient quantities and integer VND (no floating-point currency math) ([docs/DOMAIN_MODEL.md](docs/DOMAIN_MODEL.md)).
-- **Fail-Closed Security:** Do not bypass origin verification, capability hashing, Redis outage protection, or production startup validation ([docs/SECURITY.md](docs/SECURITY.md)).
+- **Exact Arithmetic:** Use `Decimal(18,3)` for ingredient quantities and integer VND (no floating-point currency math) ([docs/internal/DOMAIN_MODEL.md](docs/internal/DOMAIN_MODEL.md)).
+- **Fail-Closed Security:** Do not bypass origin verification, capability hashing, Redis outage protection, or production startup validation ([docs/internal/SECURITY.md](docs/internal/SECURITY.md)).
 - **Honest Verification Claims:** Report exact commands run, exact outcomes, and known limitations.
 
 ---
@@ -120,7 +120,7 @@ A PR is ready for review when:
 
 - Never post `.env` values, connection strings, tokens, cookies, database dumps, or private test traces in issues or PR comments.
 - If you discover a security flaw in OMNIHUB, contact the repository maintainer privately via GitHub security/private channels before public disclosure, and include reproduction steps, affected files, and impact assessment.
-- Review [docs/SECURITY.md](docs/SECURITY.md), [docs/QR_ORDERING_SECURITY.md](docs/QR_ORDERING_SECURITY.md), and [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for existing security assumptions and out-of-scope pilot gates.
+- Review [docs/internal/SECURITY.md](docs/internal/SECURITY.md), [docs/internal/QR_ORDERING_SECURITY.md](docs/internal/QR_ORDERING_SECURITY.md), and [docs/internal/DEPLOYMENT.md](docs/internal/DEPLOYMENT.md) for existing security assumptions and out-of-scope pilot gates.
 
 ---
 

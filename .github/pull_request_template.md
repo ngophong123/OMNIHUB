@@ -42,7 +42,7 @@ Details / observed results:
 ## Security & Data Integrity Checklist
 
 - [ ] No secrets, `.env`, `.local/`, `.tmp/`, dumps, logs, or test traces committed.
-- [ ] Tenant/store scope and authorization boundaries preserved (`docs/AUTHORIZATION_MATRIX.md`).
+- [ ] Tenant/store scope and authorization boundaries preserved (`docs/internal/AUTHORIZATION_MATRIX.md`).
 - [ ] Transactional invariants, idempotency, and audit/outbox behavior intact (if applicable).
 - [ ] Documentation accurately distinguishes verified vs historical vs planned capabilities.
 
