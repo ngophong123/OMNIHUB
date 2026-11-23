@@ -323,11 +323,11 @@ Controlled pilot environment provisioning and evidence collection: restore Docke
 
 ## Earlier blocked infrastructure attempt — 2026-10-22
 
-This section supersedes any older environment-specific Docker/Redis diagnosis above. The current execution environment is a restricted `ADMIN\CodexSandboxUsers` account, not a Windows administrator.
+This section supersedes any older environment-specific Docker/Redis diagnosis above. The execution environment at the time was a restricted Windows standard user account, not a Windows administrator.
 
 | Requirement | Status | Evidence from this run |
 |---|---|---|
-| Docker Desktop installation | VERIFIED | Docker CLI 29.1.2 is installed at `C:\Program Files\Docker\Docker\resources\bin\docker.exe`. |
+| Docker Desktop installation | VERIFIED | Docker CLI 29.1.2 was installed locally. |
 | Docker Engine/service recovery | BLOCKED | `com.docker.service` exists, is `STOPPED` (demand start, LocalSystem); starting it returned access denied. `docker info` against `npipe:////./pipe/docker_engine` returned permission denied. The current account cannot read the normal Docker config or access the named pipe. No containers or volumes were changed. |
 | WSL2 status | BLOCKED | WSL 3.0.3 and kernel 6.1.18 are installed; `WslService` is running, while `LxssManager` is stopped/manual. `wsl --status` and distro enumeration return `WSL/EnumerateDistros/Service/E_ACCESSDENIED`. No distro was changed or unregistered. |
 | Redis runtime / real connectivity | BLOCKED | No local Redis/Memurai executable was found; `127.0.0.1:6379` is unreachable. No test was connected to an unknown or production Redis. |
