@@ -16,7 +16,7 @@ flowchart LR
   Clients["Staff Web / KDS PWA / QR Guest"]
   Web["apps/web\nNext.js 16 App Router"]
   API["apps/api\nNestJS REST + Socket.IO"]
-  PG[("PostgreSQL 17/18\nAuthoritative State + Outbox")]
+  PG[("PostgreSQL 17 (CI / local)\nAuthoritative State + Outbox")]
   Worker["Outbox Worker\napps/api/src/worker.ts"]
   Redis[("Redis 7\nLua Rate Limits + Pub/Sub + Socket.IO Adapter")]
 
@@ -40,7 +40,7 @@ flowchart LR
 
 ## Data Authority & Concurrency Controls
 
-- **PostgreSQL as Single Source of Truth:** All business mutations commit to PostgreSQL via Prisma (`6.19`). Multi-row inventory, order, payment, shift, and kitchen-device mutations run in `Serializable` transactions wrapped by `runSerializableTransactionWithRetry` (`apps/api/src/database.ts`), which retries strictly on Prisma `P2034` serialization conflicts (max 3 attempts with bounded jittered backoff) before returning `409`.
+- **PostgreSQL as Single Source of Truth:** All business mutations commit to PostgreSQL via Prisma (`6.19`) — PostgreSQL `17` in CI (`.github/workflows/ci.yml`) and local Docker Compose (`docker-compose.yml`); local staging and backup containers currently use PostgreSQL `18` (`deploy/compose.staging.yml`, `deploy/backup/Dockerfile`). Multi-row inventory, order, payment, shift, and kitchen-device mutations run in `Serializable` transactions wrapped by `runSerializableTransactionWithRetry` (`apps/api/src/database.ts`), which retries strictly on Prisma `P2034` serialization conflicts (max 3 attempts with bounded jittered backoff) before returning `409`.
 - **Deadlock Prevention & Database Invariants:** Ingredient reservations lock rows in deterministic sorted `ingredientId` order and enforce atomic conditional updates (`"onHand" - "reserved" >= quantity`). Database `CHECK` constraints enforce `onHand >= reserved >= 0` and integer VND bounds, while PostgreSQL triggers (`reject_ledger_mutation()`) make `Movement`, `Audit`, and `Payment` rows append-only.
 - **Idempotency:** Mutating endpoints require an `Idempotency-Key` stored in `CommandReceipt` scoped to `(tenantId, storeId, key)` with a SHA-256 request digest. Identical replays return the original result without duplicating side effects; key reuse with a different payload returns `409`.
 - **High-Frequency Kitchen Heartbeats:** Registered kitchen device heartbeats (`POST /kitchen/devices/register`) use an atomic conditional `ReadCommitted` `updateMany` (`WHERE revokedAt IS NULL`) so concurrent heartbeats serialize on the row lock via PostgreSQL `EvalPlanQual` without triggering `P2034` bursts, while initial registration, station assignment, and revocation remain `Serializable`.
