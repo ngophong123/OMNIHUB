@@ -88,20 +88,6 @@ Verify locally: `http://127.0.0.1:4000/health` (`200`), `http://127.0.0.1:4000/r
 - Provision and verify off-machine encrypted backup recovery and external alerting.
 - Integrate a real payment provider with signed webhook verification and complete pilot UAT.
 
-## Owner Notes
-
-### Why I built this
-- What restaurant operations problem or engineering challenge motivated you to start OMNIHUB?
-
-### What I learned
-- Which lessons around PostgreSQL transactions, Redis realtime coordination, or TypeScript monorepos stood out most?
-
-### What I would improve
-- Looking back, which architectural trade-off or module boundary would you revisit first?
-
-### Hardest bugs
-- Which concurrency, serialization, or offline-sync bug took the most effort to isolate and fix?
-
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md) — Monorepo structure, concurrency model, outbox realtime, and security boundaries.
