@@ -8,9 +8,9 @@ This document describes the unified structured logging and asynchronous executio
 
 | Module | Responsibility |
 |---|---|
-| [`apps/api/src/observability/request-context.ts`](../apps/api/src/observability/request-context.ts) | `AsyncLocalStorage<ExecutionContext>` store, validated correlation ID generation (`resolveCorrelationId`), scoped execution (`runWithLogContext`), lookup (`getLogContext`), and in-flight enrichment (`updateLogContext`). |
-| [`apps/api/src/observability/logger.ts`](../apps/api/src/observability/logger.ts) | `StructuredLogger` implementation, `LOG_LEVEL` resolution (`debug`/`info`/`warn`/`error`/`fatal`), category helpers (`app`, `security`, `ops`), denylist + optional allowlist field sanitization, pattern scrubbing, failure-safe sink dispatch, and async `flush()` / `close()`. Exports shared singletons `apiLogger` and `workerLogger`. |
-| [`apps/api/src/observability/http-middleware.ts`](../apps/api/src/observability/http-middleware.ts) | Express HTTP middleware `createHttpSecurityLoggingMiddleware` establishing per-request `AsyncLocalStorage` scope, validated `X-Correlation-ID` response headers, Origin CSRF gate logging (`ORIGIN_DENIED`), and `HTTP_ACCESS` completion logging with post-auth tenant/store/user context. |
+| [`apps/api/src/observability/request-context.ts`](../../apps/api/src/observability/request-context.ts) | `AsyncLocalStorage<ExecutionContext>` store, validated correlation ID generation (`resolveCorrelationId`), scoped execution (`runWithLogContext`), lookup (`getLogContext`), and in-flight enrichment (`updateLogContext`). |
+| [`apps/api/src/observability/logger.ts`](../../apps/api/src/observability/logger.ts) | `StructuredLogger` implementation, `LOG_LEVEL` resolution (`debug`/`info`/`warn`/`error`/`fatal`), category helpers (`app`, `security`, `ops`), denylist + optional allowlist field sanitization, pattern scrubbing, failure-safe sink dispatch, and async `flush()` / `close()`. Exports shared singletons `apiLogger` and `workerLogger`. |
+| [`apps/api/src/observability/http-middleware.ts`](../../apps/api/src/observability/http-middleware.ts) | Express HTTP middleware `createHttpSecurityLoggingMiddleware` establishing per-request `AsyncLocalStorage` scope, validated `X-Correlation-ID` response headers, Origin CSRF gate logging (`ORIGIN_DENIED`), and `HTTP_ACCESS` completion logging with post-auth tenant/store/user context. |
 
 ---
 
@@ -50,12 +50,12 @@ Every emitted record is serialized as a single-line JSON object via `JSON.string
 ### HTTP Path
 1. `createHttpSecurityLoggingMiddleware` reads incoming `x-correlation-id` or `x-request-id` headers and validates them against `/^[A-Za-z0-9._-]{8,64}$/`. Unsafe, empty, oversized, or control-character/CRLF inputs are discarded and replaced with a fresh `randomUUID()` (UUID v4) to prevent log forging.
 2. The validated ID is echoed on the `x-correlation-id` response header and bound to a per-request `AsyncLocalStorage` store (`service: 'omnihub-api'`, `component: 'http'`).
-3. When `authenticate(...)` or `login(...)` succeeds in [`apps/api/src/auth.ts`](../apps/api/src/auth.ts), `updateLogContext({ tenantId, storeId, userId })` enriches the active request store.
+3. When `authenticate(...)` or `login(...)` succeeds in [`apps/api/src/auth.ts`](../../apps/api/src/auth.ts), `updateLogContext({ tenantId, storeId, userId })` enriches the active request store.
 4. On response `finish`, `HTTP_ACCESS` executes inside the captured `requestContext` so `tenantId`, `storeId`, `userId`, and sanitized `path` are emitted reliably without manual parameter threading through domain services.
 5. `pilot-admin.ts#acceptInvitation` falls back to `getLogContext()?.correlationId ?? ''` when no explicit correlation ID is supplied so HTTP `Audit` records preserve the request correlation ID.
 
 ### Background Outbox Worker Path
-- In [`apps/api/src/outbox.ts`](../apps/api/src/outbox.ts), each `loop.step()` polling cycle runs inside `runWithLogContext({ correlationId: randomUUID(), service: 'omnihub-worker', component: 'outbox-worker', jobName: 'outbox-batch', batchId: randomUUID() }, ...)`.
+- In [`apps/api/src/outbox.ts`](../../apps/api/src/outbox.ts), each `loop.step()` polling cycle runs inside `runWithLogContext({ correlationId: randomUUID(), service: 'omnihub-worker', component: 'outbox-worker', jobName: 'outbox-batch', batchId: randomUUID() }, ...)`.
 - Batch retry/recovery logs automatically inherit `jobName` and `batchId`, while per-event logs (`OUTBOX_PUBLISHED`, `OUTBOX_EVENT_INVALID`) explicitly pass `correlationId: row.correlationId` so operators can trace a single order mutation end-to-end from HTTP ingress through transactional outbox publication.
 
 ---
@@ -69,7 +69,7 @@ Sanitization combines key-based denylisting, pattern scrubbing, object normaliza
 3. **String & URL scrubbing (`scrubSensitiveString`):**
    - Fields named `path`, `url`, or `originalUrl` (plus `URL` / `URLSearchParams` instances) strip query strings, redact URL embedded credentials, mask `/public/qr/:credential`, `/public/order-status/:trackingToken`, and `/public/invitations/:token`, and run the full secret scrubber afterward so full `https://...` URLs cannot bypass credential or token redaction.
    - Inline credentials (`URL` `user:pass@` or username-less `:pass@`, `Bearer`/`Basic` auth headers, sensitive `session=`/`token=`/`signature=` cookie or query key=value pairs, 64-character hex tokens, high-confidence token prefixes, PEM private key headers) are redacted.
-   - Login failures in [`apps/api/src/auth.ts`](../apps/api/src/auth.ts) log `accountTag` computed via `authEmailHmacPrefix(...)` — domain-separated keyed HMAC-SHA256 (`LOG_HMAC_SECRET` / `QR_TOKEN_SECRET`, or per-process CSPRNG key when unconfigured) truncated to `16` hex characters rather than deterministic unsalted SHA-256.
+   - Login failures in [`apps/api/src/auth.ts`](../../apps/api/src/auth.ts) log `accountTag` computed via `authEmailHmacPrefix(...)` — domain-separated keyed HMAC-SHA256 (`LOG_HMAC_SECRET` / `QR_TOKEN_SECRET`, or per-process CSPRNG key when unconfigured) truncated to `16` hex characters rather than deterministic unsalted SHA-256.
 4. **Safe value normalization (`sanitizeLogValue`):** `Error` objects normalize strictly to `{ errorType: error.name }` (omitting stacks and arbitrary error messages), `Buffer` / `ArrayBufferView` binaries normalize to `"[Binary Redacted]"`, circular references normalize to `"[Circular]"`, objects deeper than depth `6` stop at `"[MaxDepth]"`, `BigInt` serializes as a string, and `Date` validates via `toISOString()`.
 
 ---
@@ -78,4 +78,4 @@ Sanitization combines key-based denylisting, pattern scrubbing, object normaliza
 
 - **Dynamic level filtering (`LOG_LEVEL`):** `resolveLogLevel(process.env.LOG_LEVEL)` defaults to `'info'`. Records below the active threshold return immediately on line 1 of `StructuredLogger.log(...)` before calling `getLogContext()`, allocating `LogRecord`, running recursive sanitization, or calling `JSON.stringify`.
 - **Non-throwing & backpressure guarantee:** Serialization or `sink.write` failures (sync or async) are caught internally, counted via `getFailureCount()`, routed to `onWriteError` or a minimal JSON `LOGGING_WRITE_FAILED` fallback on `process.stderr`, and **never** propagate exceptions into HTTP handlers or outbox transactions. Pending asynchronous sink writes are capped (`maxPendingWrites`, default `1000`) to prevent unbounded memory growth under sink stalls, and `flush()` / `close()` enforce bounded wait timeouts (`flushTimeoutMs`, default `5000 ms`).
-- **Idempotent graceful shutdown:** `close()` shares a single in-flight `Promise` across concurrent/repeated calls, stops accepting new logs immediately on closing, invokes `sink.close()` at most once, and is awaited before clearing process shutdown deadlines in [`apps/api/src/main.ts`](../apps/api/src/main.ts) and [`apps/api/src/worker.ts`](../apps/api/src/worker.ts).
+- **Idempotent graceful shutdown:** `close()` shares a single in-flight `Promise` across concurrent/repeated calls, stops accepting new logs immediately on closing, invokes `sink.close()` at most once, and is awaited before clearing process shutdown deadlines in [`apps/api/src/main.ts`](../../apps/api/src/main.ts) and [`apps/api/src/worker.ts`](../../apps/api/src/worker.ts).
