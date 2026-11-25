@@ -1,6 +1,6 @@
 # OMNIHUB
 
-Restaurant operations platform connecting POS orders, kitchen workflows, inventory, and checkout.
+A restaurant operations app for POS orders, kitchen workflows, inventory, and checkout.
 
 [![checks](https://github.com/ngophong123/OMNIHUB/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ngophong123/OMNIHUB/actions/workflows/ci.yml)
 [![security](https://github.com/ngophong123/OMNIHUB/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/ngophong123/OMNIHUB/actions/workflows/security.yml)
@@ -11,21 +11,37 @@ Restaurant operations platform connecting POS orders, kitchen workflows, invento
 |---|---|
 | ![Order Management](docs/assets/portfolio/order-management.png) | ![Kitchen Display](docs/assets/portfolio/kitchen-display.png) |
 
-## Overview
+## What it does
 
-- **Problem:** Restaurant operations break down when concurrent POS/QR orders oversell shared ingredients, network drops stall kitchen displays, or partial payments and shift closes drift from ledger totals.
-- **Engineering approach:** Keep PostgreSQL as the single transactional source of truth (`Serializable` writes, append-only ledgers, transactional outbox), use Redis strictly for atomic rate limits and multi-replica realtime fan-out, and apply `(tenantId, storeId)` scoping to tenant/store-scoped data access and server-selected socket rooms.
-- Verified against real PostgreSQL, Redis, and Chromium browser suites (`85` unit, `36` PostgreSQL integration, `9` Redis replica/rate-limit, and `10` Playwright E2E workflows) with CodeQL and dependency audits in GitHub Actions.
+OMNIHUB handles the flow from POS and QR orders to kitchen preparation, payment, and shift close. It addresses a few practical problems: concurrent orders competing for the same stock, kitchen screens losing connectivity, and payment totals drifting from shift records.
 
-## Engineering Highlights
+PostgreSQL stores transactional state. The API uses `Serializable` transactions, append-only ledgers, and a transactional outbox. Redis handles rate limits and realtime fan-out across API replicas. Tenant- and store-scoped access uses `(tenantId, storeId)`; the server selects socket rooms.
 
-- **Inventory oversell protection & deterministic ingredient locking:** Concurrent orders aggregate recipe needs in `Decimal(18,3)` base units, lock ingredients in sorted ID order, and apply conditional updates (`onHand - reserved >= quantity`) inside `Serializable` transactions backed by PostgreSQL `CHECK` constraints and append-only triggers ([`operations.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/apps/api/src/operations.ts#L57-L76), [`migration.sql`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/prisma/migrations/202610210002_invariants/migration.sql#L1-L26), [`operations.test.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/tests/integration/operations.test.ts)).
-- **Transactional outbox & multi-replica realtime:** Mutations commit `Outbox`, `Audit`, and `CommandReceipt` rows in the same PostgreSQL transaction; a standalone worker claims batches via `FOR UPDATE SKIP LOCKED` within a bounded time budget and publishes to Redis Pub/Sub with at-least-once delivery. API replicas fan out via `@socket.io/redis-adapter` and use a bounded process-local FIFO cache of up to `2,048` event IDs (`MAX_SEEN_EVENT_IDS = 2048`) to suppress recently seen duplicates; the cache is in-memory, is not durable, and is cleared on process restart. Socket events are invalidation signals; clients re-fetch authoritative REST state ([`commands.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/apps/api/src/commands.ts#L39-L58), [`outbox.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/apps/api/src/outbox.ts#L150-L240), [`realtime.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/apps/api/src/realtime.ts#L877-L898), [`realtime-replicas.test.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/tests/redis/realtime-replicas.test.ts#L157-L174)).
-- **Offline KDS replay & revocation concurrency:** The KDS PWA caches tickets and queues ordered `START`/`READY` commands in IndexedDB (`omnihub-kitchen-v1`), stopping per-order replay on version conflicts (`CONFLICT`/`BLOCKED`). Heartbeats use atomic conditional `ReadCommitted` updates (`revokedAt IS NULL`) to avoid `P2034` bursts, while registration/revocation stay `Serializable` and item commands lock active devices `FOR SHARE` ([`kitchen-offline.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/apps/web/src/app/kitchen-offline.ts#L14-L105), [`http.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/apps/api/src/http.ts#L40-L59), [`http.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/apps/api/src/http.ts#L162-L221), [`workflow.spec.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/tests/e2e/workflow.spec.ts#L272-L329), [`m2-realtime-revocation.test.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/tests/integration/m2-realtime-revocation.test.ts)).
-- **Dual-key auth rate limiting & fail-closed ingress:** Login pairs an IP window cap with a SHA-256 per-account lockout (`10` failures / `15m`) checked in Redis Lua before `scrypt`, reset via `PEXPIRE 0` (no `DEL` for Redis 7 ACLs), failing closed (`503`) if Redis is unavailable ([`rate-limit.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/apps/api/src/rate-limit.ts#L18-L66), [`auth.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/apps/api/src/auth.ts#L126-L158), [`rate-limit.test.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/tests/unit/rate-limit.test.ts)).
-- **Checkout, refunds & cashier shifts:** Integer VND accounting enforces open-shift row locks (`FOR UPDATE`) for cash payments, bill splits, manually verified bank transfers, manager-approved compensating refunds against settled payments (capped to item/payment totals, adding a shift `REFUND` cash movement for cash payments without mutating original payments or restocking ingredients), and discrepancy approval on shift close ([`payments.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/apps/api/src/payments.ts#L28-L92), [`payments.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/apps/api/src/payments.ts#L116-L163), [`cash-shifts.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/apps/api/src/cash-shifts.ts#L65-L97), [`operations.test.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/tests/integration/operations.test.ts)).
+The current suites cover `85` unit tests, `36` PostgreSQL integration tests, `9` Redis tests, and `10` Playwright E2E workflows. GitHub Actions also runs CodeQL and dependency audits.
 
-## Tech Stack
+## How it works
+
+### Stock & locking
+
+Orders can compete for the same ingredients. The API aggregates recipe needs in `Decimal(18,3)`, locks ingredient rows in sorted ID order, and applies conditional stock updates inside `Serializable` transactions ([`operations.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/apps/api/src/operations.ts#L57-L76), [`migration.sql`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/prisma/migrations/202610210002_invariants/migration.sql#L1-L26), [`operations.test.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/tests/integration/operations.test.ts)).
+
+### Outbox & realtime
+
+Mutations write `Outbox`, `Audit`, and `CommandReceipt` rows in the same PostgreSQL transaction; a worker claims batches with `FOR UPDATE SKIP LOCKED` and publishes them to Redis Pub/Sub using at-least-once delivery. API replicas use a process-local FIFO cache of up to `2,048` event IDs to suppress recently seen duplicates; the cache is lost on restart, so clients refetch authoritative state from REST ([`commands.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/apps/api/src/commands.ts#L39-L58), [`outbox.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/apps/api/src/outbox.ts#L150-L240), [`realtime.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/apps/api/src/realtime.ts#L877-L898), [`realtime-replicas.test.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/tests/redis/realtime-replicas.test.ts#L157-L174)).
+
+### Offline KDS & device sync
+
+The KDS PWA caches tickets and queues ordered `START`/`READY` commands in IndexedDB, stopping per-order replay on version conflicts. Heartbeats use atomic conditional `ReadCommitted` updates (`revokedAt IS NULL`) to avoid `P2034` bursts; registration and revocation use `Serializable` transactions, and item commands lock active devices with `FOR SHARE` ([`kitchen-offline.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/apps/web/src/app/kitchen-offline.ts#L14-L105), [`http.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/apps/api/src/http.ts#L40-L59), [`http.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/apps/api/src/http.ts#L162-L221), [`workflow.spec.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/tests/e2e/workflow.spec.ts#L272-L329), [`m2-realtime-revocation.test.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/tests/integration/m2-realtime-revocation.test.ts)).
+
+### Auth rate limiting
+
+Login uses an IP rate limit and a SHA-256 per-account lockout (`10` failures / `15m`); Redis Lua checks the limit before `scrypt`, and login fails with `503` if Redis is unavailable ([`rate-limit.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/apps/api/src/rate-limit.ts#L18-L66), [`auth.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/apps/api/src/auth.ts#L126-L158), [`rate-limit.test.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/tests/unit/rate-limit.test.ts)).
+
+### Checkout & cash shifts
+
+Checkout uses integer VND amounts, and cash payments lock the open-shift row with `FOR UPDATE`. The flow supports bill splits, manually verified bank transfers, and manager-approved compensating refunds capped at item and payment totals; cash refunds add a `REFUND` movement without changing the original payment or restocking ingredients ([`payments.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/apps/api/src/payments.ts#L28-L92), [`payments.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/apps/api/src/payments.ts#L116-L163), [`cash-shifts.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/apps/api/src/cash-shifts.ts#L65-L97), [`operations.test.ts`](https://github.com/ngophong123/OMNIHUB/blob/d72a03d0edfbc2cd45d067b3c6b33819531296e6/tests/integration/operations.test.ts)).
+
+## Stack
 
 - **Frontend:** Next.js `16.4.6` (App Router), React `19.2`, TypeScript `5.9`, `socket.io-client` `4.8`
 - **Backend:** NestJS `12.2` (Express `5.1`), Socket.IO `4.8` + `@socket.io/redis-adapter` `8.3`, Zod `4.6`, Helmet `8.1`, `prom-client` `15.1`
@@ -47,7 +63,7 @@ flowchart LR
 
 ## Quick Start
 
-Requires Node.js `>=22.14.0`, `pnpm 12.4.1`, and Docker Desktop (for PostgreSQL 17 and Redis 7). On Windows PowerShell, use `pnpm.cmd` if execution policy blocks `pnpm.ps1`.
+You need Node.js `>=22.14.0`, `pnpm 12.4.1`, and Docker Desktop for PostgreSQL 17 and Redis 7. In Windows PowerShell, use `pnpm.cmd` if the execution policy blocks `pnpm.ps1`.
 
 ```powershell
 pnpm install --frozen-lockfile
@@ -64,9 +80,11 @@ pnpm dev      # Terminal 1: Web (http://localhost:3000) + API (http://127.0.0.1:
 pnpm worker   # Terminal 2: PostgreSQL Outbox -> Redis Pub/Sub worker
 ```
 
-Verify locally: `http://127.0.0.1:4000/health` (`200`), `http://127.0.0.1:4000/ready` (`200`), and `http://localhost:3000` (`200`). Sample store ID: `22222222-2222-4222-8222-222222222222` (`owner@local.omnihub.test`, `cashier@local.omnihub.test`, `kitchen@local.omnihub.test`, `inventory@local.omnihub.test`).
+After startup, check `http://127.0.0.1:4000/health` (`200`), `http://127.0.0.1:4000/ready` (`200`), and `http://localhost:3000` (`200`). The sample store ID is `22222222-2222-4222-8222-222222222222`. Demo accounts: `owner@local.omnihub.test`, `cashier@local.omnihub.test`, `kitchen@local.omnihub.test`, and `inventory@local.omnihub.test`.
 
-## Engineering Validation
+## Tests
+
+Run these checks locally:
 
 - `pnpm typecheck`, `pnpm lint`, `pnpm build`, `pnpm security:hygiene`, `pnpm audit --prod --audit-level high`
 - `pnpm test`: `85` unit tests across `9` files (domain math, auth/commands, error redaction, rate-limit Lua, structured logging, Prometheus metrics, `P2034` retries)
@@ -76,21 +94,21 @@ Verify locally: `http://127.0.0.1:4000/health` (`200`), `http://127.0.0.1:4000/r
 
 ## Known Limitations
 
-- **Sample data only:** Not piloted in a live restaurant; physical hardware, LAN/printer cutover, and operator UAT have not been executed.
-- **Card payments are sandbox-only:** `CARD` checkout routes to `LabeledCardSandboxAdapter` (`SANDBOX_ONLY`); real acquiring and signed provider webhooks are not implemented.
-- **No off-machine DR or WAL PITR:** Local staging provides logical `pg_dump` + Restic scripts, but off-machine backup storage, independent alerting, and WAL archiving are not provisioned.
-- **Backend modularization pending:** `apps/api/src/http.ts` still wires routes in a single `ApiController` (`M2-T12` feature-module refactor pending); staff sessions bind to one store at login. See [Known Limitations](docs/KNOWN_LIMITATIONS.md).
+- The project uses sample data and has not been piloted in a live restaurant. Physical hardware, LAN/printer cutover, and operator UAT have not been tested.
+- Card checkout is sandbox-only. The `CARD` route uses `LabeledCardSandboxAdapter` (`SANDBOX_ONLY`); real acquiring and signed provider webhooks are not implemented.
+- There is no off-machine disaster recovery or WAL point-in-time recovery. Local staging has logical `pg_dump` and Restic scripts, but off-machine backup storage, independent alerting, and WAL archiving are not configured.
+- Routes are still wired through one `ApiController` in `apps/api/src/http.ts`; the `M2-T12` feature-module refactor is pending. Staff sessions are tied to one store at login. See [Known Limitations](docs/KNOWN_LIMITATIONS.md).
 
 ## Roadmap
 
-- Refactor `apps/api/src/http.ts` into NestJS feature modules with constructor-injected providers (`M2-T12`).
+- Split `apps/api/src/http.ts` into NestJS feature modules with constructor-injected providers (`M2-T12`).
 - Add multi-store runtime switching and multi-warehouse inventory transfers.
-- Provision and verify off-machine encrypted backup recovery and external alerting.
-- Integrate a real payment provider with signed webhook verification and complete pilot UAT.
+- Set up and verify off-machine encrypted backup recovery and external alerting.
+- Integrate a real payment provider with signed webhook verification, then run pilot UAT.
 
 ## Documentation
 
-- [Architecture](docs/ARCHITECTURE.md) — Monorepo structure, concurrency model, outbox realtime, and security boundaries.
-- [Order-to-Cash Flow](docs/ORDER-TO-CASH-FLOW.md) — End-to-end order, inventory, kitchen, payment, and shift lifecycle.
-- [Known Limitations](docs/KNOWN_LIMITATIONS.md) — Current boundaries, pilot NO-GO status, and out-of-scope items.
+- [Architecture](docs/ARCHITECTURE.md) — Monorepo layout, concurrency, outbox delivery, and security boundaries.
+- [Order-to-Cash Flow](docs/ORDER-TO-CASH-FLOW.md) — Order, inventory, kitchen, payment, and shift lifecycle.
+- [Known Limitations](docs/KNOWN_LIMITATIONS.md) — Current limits, pilot NO-GO status, and out-of-scope items.
 - ADRs: [0001 Serializable Inventory Ledger](docs/adr/0001-serializable-inventory-ledger.md) · [0002 Transactional Outbox & Redis Adapter](docs/adr/0002-transactional-outbox-and-redis-adapter.md) · [0003 Kitchen Device Sync & Revocation](docs/adr/0003-kitchen-device-sync-and-revocation.md) · [Contributing](CONTRIBUTING.md)
