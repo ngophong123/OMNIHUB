@@ -7,6 +7,7 @@
   },
   "scripts": {
     "dev": "concurrently -k -n api,web \"pnpm --filter @omnihub/api dev\" \"pnpm --filter @omnihub/web dev\"",
+    "dev:all": "pnpm infra:up && concurrently -k -n api,web,worker \"pnpm --filter @omnihub/api dev\" \"pnpm --filter @omnihub/web dev\" \"pnpm worker\"",
     "build": "pnpm --filter @omnihub/contracts build && pnpm --filter @omnihub/api build && pnpm --filter @omnihub/web build",
     "typecheck": "pnpm -r typecheck && tsc --noEmit",
     "lint": "eslint .",

@@ -78,6 +78,9 @@ pnpm --filter @omnihub/contracts build
 
 pnpm dev      # Terminal 1: Web (http://localhost:3000) + API (http://127.0.0.1:4000)
 pnpm worker   # Terminal 2: PostgreSQL Outbox -> Redis Pub/Sub worker
+
+# Or after first-time setup, start Postgres, Redis, Web, API, and Worker in one command:
+pnpm dev:all
 ```
 
 After startup, check `http://127.0.0.1:4000/health` (`200`), `http://127.0.0.1:4000/ready` (`200`), and `http://localhost:3000` (`200`). The sample store ID is `22222222-2222-4222-8222-222222222222`. Demo accounts: `owner@local.omnihub.test`, `cashier@local.omnihub.test`, `kitchen@local.omnihub.test`, and `inventory@local.omnihub.test`.
