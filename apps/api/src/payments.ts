@@ -1,16 +1,20 @@
 import { BadRequestException, ConflictException, NotFoundException } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
-import type { Context } from './auth';
+import { Prisma, type PrismaClient } from '@prisma/client';
+import { reauthorize, type Context } from './auth';
 import type { Result } from './commands';
-import { CommandBus, scope } from './commands';
+import { CommandBus, requirePermission, scope } from './commands';
 import { businessDate, totalDue } from './domain';
-import { LabeledCardSandboxAdapter } from './card-provider';
+import { LabeledCardSandboxAdapter, type CardProviderAdapter } from './card-provider';
 
 type PaymentInput = { amount: number; method: 'CASH' | 'BANK_TRANSFER' | 'CARD'; tendered?: number; externalReference?: string; splitId?: string };
 type RefundInput = { amount: number; reason: string; itemId?: string };
 
 export class Payments extends CommandBus {
-  private readonly cardProvider = new LabeledCardSandboxAdapter();
+  private readonly cardProvider: CardProviderAdapter;
+  constructor(db: PrismaClient, cardProvider: CardProviderAdapter = new LabeledCardSandboxAdapter()) {
+    super(db);
+    this.cardProvider = cardProvider;
+  }
   async history(ctx: Context, orderId: string) {
     const order = await this.db.order.findFirst({ where: { ...scope(ctx), id: orderId }, select: { id: true, total: true } });
     if (!order) throw new NotFoundException('ORDER_NOT_FOUND');
@@ -26,7 +30,10 @@ export class Payments extends CommandBus {
   }
 
   async record(ctx: Context, key: string, orderId: string, input: PaymentInput): Promise<Result> {
-    if (input.method === 'CARD') await this.cardProvider.authorize(input.amount);
+    requirePermission(ctx, 'cash');
+    const authorized = await reauthorize(this.db, ctx);
+    requirePermission(authorized, 'cash');
+    if (input.method === 'CARD') await this.cardProvider.chargeCard(input.amount);
     if (input.method === 'BANK_TRANSFER' && !input.externalReference) throw new BadRequestException('BANK_REFERENCE_REQUIRED');
     if (input.method === 'CASH' && (input.tendered ?? 0) < input.amount) throw new BadRequestException('INSUFFICIENT_CASH');
     return this.command(ctx, key, input.method === 'BANK_TRANSFER' ? 'payment.recorded' : 'payment.confirmed', { orderId, ...input }, async (tx, current) => {
