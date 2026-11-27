@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { closeSync, mkdirSync, openSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readSync, readdirSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 // Local development drill only. Run after stopping application writers.
@@ -54,15 +54,30 @@ const before = counts(sourceName);
 const sourceSchema = sql(sourceName, schemaQuery);
 tool('pg_dump', '--format=custom', '--no-owner', '--no-acl', '--file', temporaryBackup, '--dbname', sourceName);
 tool('pg_restore', '--list', temporaryBackup);
+function readFdBytes(fd: number): Buffer {
+  const chunks: Buffer[] = [];
+  let position = 0;
+  for (;;) {
+    const chunk = Buffer.allocUnsafe(64 * 1024);
+    const bytesRead = readSync(fd, chunk, 0, chunk.length, position);
+    if (bytesRead === 0) break;
+    chunks.push(chunk.subarray(0, bytesRead));
+    position += bytesRead;
+  }
+  return Buffer.concat(chunks);
+}
 // Docker's archive/cp endpoint cannot read this tmpfs mount. Stream binary bytes
-// directly to a private file descriptor; never send dump contents to the terminal.
-const backupFd = openSync(backup, 'wx', 0o600);
+// directly to a private file descriptor and hash from that same descriptor
+// without reopening the path; never send dump contents to the terminal.
+const backupFd = openSync(backup, 'wx+', 0o600);
+let backupBytes: Buffer;
 try {
   const copied = spawnSync('docker', ['exec', container, 'cat', temporaryBackup], { env, windowsHide: true, stdio: ['ignore', backupFd, 'pipe'], timeout: 180_000 });
   if (copied.error || copied.status !== 0) throw new Error('BACKUP_COPY_FAILED: partial artifact retained');
+  backupBytes = readFdBytes(backupFd);
 } finally { closeSync(backupFd); }
-if (statSync(backup).size === 0) throw new Error('EMPTY_BACKUP');
-const checksum = createHash('sha256').update(readFileSync(backup)).digest('hex');
+if (backupBytes.length === 0) throw new Error('EMPTY_BACKUP');
+const checksum = createHash('sha256').update(backupBytes).digest('hex');
 writeFileSync(`${backup}.sha256`, `${checksum}  ${backup.split(/[\\/]/).at(-1)}\n`, { flag: 'wx', mode: 0o600 });
 const containerChecksum = tool('sha256sum', temporaryBackup).split(/\s+/)[0];
 if (checksum !== containerChecksum) throw new Error('BACKUP_CHECKSUM_MISMATCH');
@@ -81,7 +96,7 @@ run(process.execPath, [resolve('node_modules/prisma/build/index.js'), 'migrate',
 const migrations = JSON.parse(sql(targetName, `SELECT json_agg(migration_name ORDER BY migration_name) FROM "_prisma_migrations" WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL`)) as string[];
 if (JSON.stringify(migrations) !== JSON.stringify(readdirSync(resolve('prisma/migrations'), { withFileTypes: true }).filter(entry => entry.isDirectory()).map(entry => entry.name).sort())) throw new Error('MIGRATIONS_DIFFER');
 const integrity = JSON.parse(sql(targetName, integrityQuery)) as Record<string, number>;
-const report = { checkedAt: new Date().toISOString(), tooling: version, targetDatabase: targetName, backupBytes: statSync(backup).size, sha256: checksum, readable: true, restoreSeconds, verificationSeconds: (Date.now() - start) / 1000, schemaMatches: true, foreignKeysValidatedDuringRestore: true, migrations: migrations.length, counts: restored, integrity, status: Object.values(integrity).every(count => count === 0) ? 'VERIFIED' : 'FAILED' };
+const report = { checkedAt: new Date().toISOString(), tooling: version, targetDatabase: targetName, backupBytes: backupBytes.length, sha256: checksum, readable: true, restoreSeconds, verificationSeconds: (Date.now() - start) / 1000, schemaMatches: true, foreignKeysValidatedDuringRestore: true, migrations: migrations.length, counts: restored, integrity, status: Object.values(integrity).every(count => count === 0) ? 'VERIFIED' : 'FAILED' };
 writeFileSync(`${backup}.verification.json`, JSON.stringify(report, null, 2), { flag: 'wx', mode: 0o600 });
 console.log(JSON.stringify(report, null, 2));
 if (report.status !== 'VERIFIED') process.exitCode = 1;

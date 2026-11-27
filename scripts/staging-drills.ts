@@ -15,9 +15,48 @@ function docker(args: string[], input?: string) {
   return execFileSync('docker', [...compose, ...args], { input, encoding: 'utf8', windowsHide: true, timeout: 120_000, stdio: ['pipe', 'pipe', 'pipe'] }).trim();
 }
 function sql(query: string) { return docker(['exec', '-T', 'postgres', 'psql', '-X', '-Atq', '-v', 'ON_ERROR_STOP=1', '-U', 'staging_admin', '-d', 'omnihub_staging'], query); }
-function db<T>(code: string): T {
-  const output = docker(['exec', '-T', 'api', 'node', '--require', '/app/deploy/load-secrets.cjs', '-'], `const {PrismaClient}=require('@prisma/client');const db=new PrismaClient(); (async()=>{${code}})().then(x=>console.log(JSON.stringify(x))).finally(()=>db.$disconnect());`);
-  return JSON.parse(output) as T;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const CREATE_DRILL_FIXTURE_SCRIPT = [
+  "const {PrismaClient}=require('@prisma/client');",
+  "const {randomUUID,randomBytes}=require('node:crypto');",
+  "const {digest}=require('./apps/api/dist/domain');",
+  'const db=new PrismaClient();',
+  '(async()=>{',
+  '  const tenantId=randomUUID(),storeId=randomUUID(),userId=randomUUID(),token=randomBytes(32).toString(\'hex\');',
+  "  await db.tenant.create({data:{id:tenantId,name:'Staging failure drill'}});",
+  "  await db.store.create({data:{id:storeId,tenantId,name:'Isolated drill store'}});",
+  "  await db.user.create({data:{id:userId,email:userId+'@drill.invalid',passwordHash:'no-password-login'}});",
+  "  await db.membership.create({data:{tenantId,storeId,userId,role:'OWNER'}});",
+  '  await db.session.create({data:{tenantId,storeId,userId,tokenHash:digest(token),expiresAt:new Date(Date.now()+3600000)}});',
+  "  const station=await db.station.create({data:{tenantId,storeId,name:'Drill station'}});",
+  "  const ingredient=await db.ingredient.create({data:{tenantId,storeId,name:'Drill ingredient',unit:'g'}});",
+  '  await db.balance.create({data:{tenantId,storeId,ingredientId:ingredient.id,onHand:100}});',
+  "  await db.movement.create({data:{tenantId,storeId,ingredientId:ingredient.id,commandKey:'drill-fixture',kind:'ADJUST',reason:'Isolated opening stock',onHandDelta:100,reservedDelta:0}});",
+  "  const product=await db.product.create({data:{tenantId,storeId,stationId:station.id,name:'Drill item',price:35000}});",
+  '  await db.recipeItem.create({data:{tenantId,storeId,productId:product.id,ingredientId:ingredient.id,quantity:1}});',
+  '  return {token,tenantId,storeId,userId,productId:product.id,ingredientId:ingredient.id};',
+  '})().then(x=>console.log(JSON.stringify(x))).finally(()=>db.$disconnect());',
+].join('\n');
+const EXPIRE_DRILL_SESSIONS_SCRIPT = [
+  "const {PrismaClient}=require('@prisma/client');",
+  'const UUID_RE=/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;',
+  'const db=new PrismaClient();',
+  '(async()=>{',
+  '  const userId=process.env.DRILL_USER_ID;',
+  "  if(!userId||!UUID_RE.test(userId))throw new Error('INVALID_DRILL_USER_ID');",
+  '  await db.session.updateMany({where:{userId},data:{expiresAt:new Date(0)}});',
+  '  return true;',
+  '})().then(x=>console.log(JSON.stringify(x))).finally(()=>db.$disconnect());',
+].join('\n');
+type DrillFixture = { token: string; tenantId: string; storeId: string; userId: string; productId: string; ingredientId: string };
+function createDrillFixture(): DrillFixture {
+  const output = docker(['exec', '-T', 'api', 'node', '--require', '/app/deploy/load-secrets.cjs', '-'], CREATE_DRILL_FIXTURE_SCRIPT);
+  return JSON.parse(output) as DrillFixture;
+}
+function expireDrillUserSessions(userId: string): boolean {
+  if (!UUID_RE.test(userId)) throw new Error('INVALID_DRILL_USER_ID');
+  const output = docker(['exec', '-T', '-e', `DRILL_USER_ID=${userId}`, 'api', 'node', '--require', '/app/deploy/load-secrets.cjs', '-'], EXPIRE_DRILL_SESSIONS_SCRIPT);
+  return JSON.parse(output) as boolean;
 }
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function until(check: () => boolean | Promise<boolean>, label: string, timeout = 30_000) {
@@ -51,22 +90,7 @@ async function lockRow(table: 'Balance' | 'Outbox', predicate: string, seconds =
 async function main() {
   assert.equal(docker(['config', '--format', 'json']).includes('omnihub-staging'), true);
   await ready();
-  const fixture = db<{ token: string; tenantId: string; storeId: string; userId: string; productId: string; ingredientId: string }>(`
-    const {randomUUID,randomBytes}=require('node:crypto'); const {digest}=require('./apps/api/dist/domain');
-    const tenantId=randomUUID(),storeId=randomUUID(),userId=randomUUID(),token=randomBytes(32).toString('hex');
-    await db.tenant.create({data:{id:tenantId,name:'Staging failure drill'}});
-    await db.store.create({data:{id:storeId,tenantId,name:'Isolated drill store'}});
-    await db.user.create({data:{id:userId,email:userId+'@drill.invalid',passwordHash:'no-password-login'}});
-    await db.membership.create({data:{tenantId,storeId,userId,role:'OWNER'}});
-    await db.session.create({data:{tenantId,storeId,userId,tokenHash:digest(token),expiresAt:new Date(Date.now()+3600000)}});
-    const station=await db.station.create({data:{tenantId,storeId,name:'Drill station'}});
-    const ingredient=await db.ingredient.create({data:{tenantId,storeId,name:'Drill ingredient',unit:'g'}});
-    await db.balance.create({data:{tenantId,storeId,ingredientId:ingredient.id,onHand:100}});
-    await db.movement.create({data:{tenantId,storeId,ingredientId:ingredient.id,commandKey:'drill-fixture',kind:'ADJUST',reason:'Isolated opening stock',onHandDelta:100,reservedDelta:0}});
-    const product=await db.product.create({data:{tenantId,storeId,stationId:station.id,name:'Drill item',price:35000}});
-    await db.recipeItem.create({data:{tenantId,storeId,productId:product.id,ingredientId:ingredient.id,quantity:1}});
-    return {token,tenantId,storeId,userId,productId:product.id,ingredientId:ingredient.id};
-  `);
+  const fixture = createDrillFixture();
   const cookie = `session=${fixture.token}`;
   const orderBody = { lines: [{ productId: fixture.productId, quantity: 1 }] };
   const accept = (key = randomUUID()) => http('/orders', 'POST', orderBody, cookie, { 'Idempotency-Key': key });
@@ -142,7 +166,7 @@ async function main() {
     const duplicates = await Promise.all([accept(duplicateKey), accept(duplicateKey), accept(duplicateKey)]);
     assert.ok(duplicates.every(r => r.status === 201)); assert.equal(new Set(duplicates.map(r => r.body.id)).size, 1);
     record('Concurrent duplicate HTTP order submissions', 'Three simultaneous real HTTPS requests with one idempotency key return one order.');
-    db(`await db.session.updateMany({where:{userId:${JSON.stringify(fixture.userId)}},data:{expiresAt:new Date(0)}});return true;`);
+    expireDrillUserSessions(fixture.userId);
     assert.equal((await http('/orders', 'GET', undefined, cookie)).status, 401);
     await until(() => !socket.connected, 'EXPIRED_SOCKET_REVALIDATION', 40_000);
     record('Session expiration', 'Expired only the generated drill session in PostgreSQL; subsequent HTTP access was rejected and the existing authenticated socket was disconnected by server revalidation.');

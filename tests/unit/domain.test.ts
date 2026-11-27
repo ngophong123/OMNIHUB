@@ -38,7 +38,7 @@ describe('domain policies', () => {
     const adapter = new LabeledCardSandboxAdapter();
     expect(adapter.name).toBe('SANDBOX_ONLY');
     expect(adapter.enabledForProduction).toBe(false);
-    await expect(adapter.authorize(10_000)).rejects.toThrow('CARD_PROVIDER_DISABLED_SANDBOX_NOT_CONFIGURED');
+    await expect(adapter.chargeCard(10_000)).rejects.toThrow('CARD_PROVIDER_DISABLED_SANDBOX_NOT_CONFIGURED');
   });
   it('keeps readiness separate from fulfillment and rejects skipped/repeated transitions', () => {
     expect(transition('PENDING', 'START')).toBe('PREPARING');

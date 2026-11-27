@@ -2,8 +2,10 @@ import { Prisma, type PrismaClient } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { authenticate, login, reauthorize, type Context } from '../../apps/api/src/auth';
+import { LabeledCardSandboxAdapter, type CardProviderAdapter } from '../../apps/api/src/card-provider';
 import { CommandBus, requirePermission } from '../../apps/api/src/commands';
 import { digest, hashPassword } from '../../apps/api/src/domain';
+import { Payments } from '../../apps/api/src/payments';
 
 async function expectHttpError(work: Promise<unknown>, status: number, message?: string) {
   try {
@@ -118,5 +120,63 @@ describe('auth and command bus guardrails', () => {
     } as unknown as PrismaClient);
     await expectHttpError(retryBus.run(ctx, randomUUID(), async () => { throw retryError; }), 409);
     expect(attempts).toBe(4);
+  });
+
+  it('enforces cash permission and fresh session reauthorization before invoking card payment provider', async () => {
+    const baseCtx: Context = { tenantId: 't1', storeId: 's1', userId: 'u1', role: 'CASHIER', tokenHash: 'h', expiresAt: new Date(Date.now() + 60_000), correlationId: 'c1' };
+    const orderId = '00000000-0000-4000-8000-000000000001';
+    const sandbox = new LabeledCardSandboxAdapter();
+
+    let providerCalls = 0;
+    const spyProvider: CardProviderAdapter = {
+      name: sandbox.name,
+      enabledForProduction: sandbox.enabledForProduction,
+      async chargeCard(amountVnd: number): Promise<never> {
+        providerCalls++;
+        return sandbox.chargeCard(amountVnd);
+      },
+    };
+
+    // 1. Unauthorized roles (KITCHEN / INVENTORY) are rejected before DB reauthorization or card provider call.
+    let dbLookups = 0;
+    const unusedDb = {
+      session: { findUnique: async () => { dbLookups++; return null; } },
+      membership: { findUnique: async () => { dbLookups++; return null; } },
+    } as unknown as PrismaClient;
+    const kitchenPayments = new Payments(unusedDb, spyProvider);
+    await expectHttpError(kitchenPayments.record({ ...baseCtx, role: 'KITCHEN' }, randomUUID(), orderId, { amount: 50_000, method: 'CARD' }), 403, 'PERMISSION_DENIED');
+    await expectHttpError(kitchenPayments.record({ ...baseCtx, role: 'INVENTORY' }, randomUUID(), orderId, { amount: 50_000, method: 'CARD' }), 403, 'PERMISSION_DENIED');
+    expect(providerCalls).toBe(0);
+    expect(dbLookups).toBe(0);
+
+    // 2. Revoked session is rejected before card provider is called.
+    const revokedDb = {
+      session: { findUnique: async () => null },
+      membership: { findUnique: async () => ({ tenantId: 't1', role: 'CASHIER' }) },
+    } as unknown as PrismaClient;
+    const revokedPayments = new Payments(revokedDb, spyProvider);
+    await expectHttpError(revokedPayments.record(baseCtx, randomUUID(), orderId, { amount: 50_000, method: 'CARD' }), 401, 'SESSION_REVOKED');
+    expect(providerCalls).toBe(0);
+
+    // 3. Role downgraded in DB from CASHIER to KITCHEN is rejected before card provider is called.
+    const downgradedDb = {
+      session: { findUnique: async () => ({ userId: 'u1', tenantId: 't1', storeId: 's1', expiresAt: new Date(Date.now() + 60_000), user: { active: true } }) },
+      membership: { findUnique: async () => ({ tenantId: 't1', role: 'KITCHEN' }) },
+    } as unknown as PrismaClient;
+    const downgradedPayments = new Payments(downgradedDb, spyProvider);
+    await expectHttpError(downgradedPayments.record(baseCtx, randomUUID(), orderId, { amount: 50_000, method: 'CARD' }), 403, 'PERMISSION_DENIED');
+    expect(providerCalls).toBe(0);
+
+    // 4. Active authorized CASHIER reaches card provider (outside any write transaction) and receives sandbox rejection.
+    let transactionOpened = false;
+    const activeDb = {
+      session: { findUnique: async () => ({ userId: 'u1', tenantId: 't1', storeId: 's1', expiresAt: new Date(Date.now() + 60_000), user: { active: true } }) },
+      membership: { findUnique: async () => ({ tenantId: 't1', role: 'CASHIER' }) },
+      $transaction: async () => { transactionOpened = true; throw new Error('UNEXPECTED_TRANSACTION'); },
+    } as unknown as PrismaClient;
+    const activePayments = new Payments(activeDb, spyProvider);
+    await expectHttpError(activePayments.record(baseCtx, randomUUID(), orderId, { amount: 50_000, method: 'CARD' }), 400, 'CARD_PROVIDER_DISABLED_SANDBOX_NOT_CONFIGURED');
+    expect(providerCalls).toBe(1);
+    expect(transactionOpened).toBe(false);
   });
 });
