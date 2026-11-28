@@ -22,7 +22,7 @@ export const orderCancelSchema = z.object({ expectedVersion: z.number().int().mi
 export const cashSchema = z.object({ expectedVersion: z.number().int().min(0), tendered: z.number().int().min(0).max(1_000_000_000) }).strict();
 export const paymentSchema = z.object({ amount: z.number().int().min(1).max(1_000_000_000), method: z.enum(['CASH','BANK_TRANSFER','CARD']), tendered: z.number().int().min(1).max(1_000_000_000).optional(), externalReference: z.string().trim().min(3).max(120).optional(), splitId: z.string().uuid().optional() }).strict();
 export const refundRequestSchema = z.object({ amount: z.number().int().min(1).max(1_000_000_000), reason: z.string().trim().min(5).max(300), itemId: z.string().uuid().optional() }).strict();
-export const refundDecisionSchema = z.object({ reason: z.string().trim().min(5).max(300), decision: z.enum(['APPROVED','REJECTED']) }).strict();
+export const refundDecisionSchema = z.object({ reason: z.string().trim().min(5).max(300), decision: z.enum(['APPROVED','REJECTED']), shiftId: z.string().uuid().optional() }).strict();
 export const paymentFailureSchema = z.object({ reason: z.string().trim().min(5).max(300) }).strict();
 export const billSplitSchema = z.object({ label: z.string().trim().min(1).max(80), amount: z.number().int().min(1).max(1_000_000_000).optional(), itemIds: z.array(z.string().uuid()).min(1).max(100).optional() }).strict().refine(x => Boolean(x.amount) !== Boolean(x.itemIds?.length), 'Specify amount or items');
 export const cashShiftOpenSchema = z.object({ registerId: z.string().uuid(), cashierId: z.string().uuid().optional(), openingAmount: z.number().int().min(0).max(1_000_000_000) }).strict();
