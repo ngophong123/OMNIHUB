@@ -1,7 +1,7 @@
 'use client';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { io, type Socket } from 'socket.io-client';
-import { enqueueKitchenCommand, getKitchenDeviceId, readKitchenCommands, readKitchenSnapshot, recoverKitchenCommands, reviewKitchenCommand, saveKitchenSnapshot, updateKitchenCommand, type KitchenOrderSnapshot, type KitchenScope, type OfflineAction, type OfflineKitchenCommand } from './kitchen-offline';
+import { enqueueKitchenCommand, getKitchenDeviceId, pruneKitchenCommands, readKitchenCommands, readKitchenSnapshot, recoverKitchenCommands, reviewKitchenCommand, saveKitchenSnapshot, updateKitchenCommand, type KitchenOrderSnapshot, type KitchenScope, type OfflineAction, type OfflineKitchenCommand } from './kitchen-offline';
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000';
 type Identity = { userId: string; tenantId: string; storeId: string; role: string };
@@ -39,6 +39,8 @@ export default function KitchenPanel({ identity, locale, onConnectionChange }: {
   const [online, setOnline] = useState(false); const [synchronizing, setSynchronizing] = useState(false); const [sessionExpired, setSessionExpired] = useState(false); const [storageError, setStorageError] = useState(false);
   const [deviceId, setDeviceId] = useState(''); const [lastSync, setLastSync] = useState(''); const busy = useRef(false); const socket = useRef<Socket | null>(null); const retryAfterBusy = useRef(false);
   const [authorizedDeviceId, setAuthorizedDeviceId] = useState('');
+  const [enqueuingItems, setEnqueuingItems] = useState<string[]>([]);
+  const enqueuingRef = useRef(new Set<string>());
 
   const refreshAuthoritative = useCallback(async (id: string) => {
     const rows = await request<Parameters<typeof kitchenOnly>[0][]>('/orders', undefined, id); const clean = rows.map(kitchenOnly).filter(order => order.status === 'ACCEPTED');
@@ -61,19 +63,25 @@ export default function KitchenPanel({ identity, locale, onConnectionChange }: {
       await refreshAuthoritative(id);
       const pending = (await recoverKitchenCommands(scope)).filter(command => ['PENDING', 'SENDING'].includes(command.status)); setCommands(await readKitchenCommands(scope));
       if (pending.length) {
-        for (const command of pending) await updateKitchenCommand(command.commandId, { status: 'SENDING' });
-        setCommands(await readKitchenCommands(scope));
-        try {
-          const response = await request<{ results: { commandId: string; status: 'CONFIRMED' | 'CONFLICT' | 'REJECTED' | 'BLOCKED'; version?: number; code?: string }[] }>('/kitchen/sync', { commands: pending.map(({ scope: _scope, status: _status, code: _code, ...command }) => command) }, id);
-          for (const result of response.results) await updateKitchenCommand(result.commandId, { status: result.status, code: result.code });
-        } catch (error) {
-          for (const command of pending) await updateKitchenCommand(command.commandId, { status: 'PENDING', code: error instanceof KitchenError ? error.code : 'NETWORK_RETRY' });
-          if (error instanceof KitchenError && error.status === 401) { setSessionExpired(true); return; }
-          throw error;
+        const CHUNK_SIZE = 50;
+        for (let offset = 0; offset < pending.length; offset += CHUNK_SIZE) {
+          const chunk = pending.slice(offset, offset + CHUNK_SIZE);
+          for (const command of chunk) await updateKitchenCommand(command.commandId, { status: 'SENDING' });
+          setCommands(await readKitchenCommands(scope));
+          try {
+            const response = await request<{ results: { commandId: string; status: 'CONFIRMED' | 'CONFLICT' | 'REJECTED' | 'BLOCKED'; version?: number; code?: string }[] }>('/kitchen/sync', { commands: chunk.map(({ scope: _scope, status: _status, code: _code, ...command }) => command) }, id);
+            for (const result of response.results) await updateKitchenCommand(result.commandId, { status: result.status, code: result.code });
+          } catch (error) {
+            for (const command of chunk) await updateKitchenCommand(command.commandId, { status: 'PENDING', code: error instanceof KitchenError ? error.code : 'NETWORK_RETRY' });
+            if (error instanceof KitchenError && error.status === 401) { setSessionExpired(true); return; }
+            throw error;
+          }
+          setCommands(await readKitchenCommands(scope));
         }
-        setCommands(await readKitchenCommands(scope));
         await refreshAuthoritative(id);
       }
+      await pruneKitchenCommands(scope).catch(() => undefined);
+      setOnline(true);
       setCommands(await readKitchenCommands(scope));
     } catch (error) {
       if (error instanceof KitchenError && (error.status === 401 || error.status === 403)) { setSessionExpired(true); setAuthorizedDeviceId(''); }
@@ -114,10 +122,16 @@ export default function KitchenPanel({ identity, locale, onConnectionChange }: {
     return () => { channel.removeAllListeners(); channel.disconnect(); socket.current = null; onConnectionChange?.(false); };
   }, [authorizedDeviceId, synchronize, onConnectionChange]);
 
-  const visibleOrders = useMemo(() => predict(orders, commands), [orders, commands]);
+  const visibleOrders = useMemo(
+    () => predict(orders, commands).filter(order => order.items.some(item => item.status !== 'HANDED_OFF' && item.status !== 'CANCELLED')),
+    [orders, commands],
+  );
   const unresolved = commands.filter(command => ['CONFLICT', 'REJECTED', 'BLOCKED'].includes(command.status));
   const pendingCount = commands.filter(command => ['PENDING', 'SENDING', 'CONFLICT', 'REJECTED', 'BLOCKED'].includes(command.status)).length;
   const queue = async (order: KitchenOrderSnapshot, itemId: string, action: OfflineAction) => {
+    if (enqueuingRef.current.has(itemId)) return;
+    enqueuingRef.current.add(itemId);
+    setEnqueuingItems(prev => [...prev, itemId]);
     try {
       const id = deviceId || await getKitchenDeviceId(scope); setDeviceId(id);
       const command = await enqueueKitchenCommand(scope, id, order.id, itemId, order.version, action);
@@ -125,6 +139,10 @@ export default function KitchenPanel({ identity, locale, onConnectionChange }: {
       if (navigator.onLine) void synchronize();
       else setCommands(rows => rows.some(row => row.commandId === command.commandId) ? rows : [...rows, command]);
     } catch { setStorageError(true); }
+    finally {
+      enqueuingRef.current.delete(itemId);
+      setEnqueuingItems(prev => prev.filter(id => id !== itemId));
+    }
   };
   const acknowledgeOrder = async (orderId: string) => {
     for (const command of unresolved.filter(row => row.orderId === orderId)) await reviewKitchenCommand(command.commandId);
@@ -139,7 +157,7 @@ export default function KitchenPanel({ identity, locale, onConnectionChange }: {
     <div className="kitchenTickets">{visibleOrders.map(order => <article className="kitchenTicket" key={order.id}><header><strong>#{order.id.slice(0, 8)}</strong><time>{new Date(order.createdAt).toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit' })}</time></header>{order.items.filter(item => item.status !== 'HANDED_OFF' && item.status !== 'CANCELLED').map(item => {
       const station = order.tickets.find(ticket => ticket.id === item.ticketId)?.station.name ?? '';
       const pendingCommand = commands.find(command => command.itemId === item.id && ['PENDING', 'SENDING'].includes(command.status));
-      return <div className="kitchenTicketItem" key={item.id}><div><h3>{item.name}</h3><p>{station} · {itemLabel(item.status, locale === 'vi')}</p>{item.preparationNote && <p className="kitchenNote">{item.preparationNote}</p>}{pendingCommand && <small>{t.queued}</small>}</div><div className="kitchenTicketActions">{item.status === 'PENDING' && <button onClick={() => void queue(order, item.id, 'START')}>{t.start}</button>}{item.status === 'PREPARING' && <button onClick={() => void queue(order, item.id, 'READY')}>{t.ready}</button>}</div></div>;
+      return <div className="kitchenTicketItem" key={item.id}><div><h3>{item.name}</h3><p>{station} · {itemLabel(item.status, locale === 'vi')}</p>{item.preparationNote && <p className="kitchenNote">{item.preparationNote}</p>}{pendingCommand && <small>{t.queued}</small>}</div><div className="kitchenTicketActions">{item.status === 'PENDING' && <button disabled={enqueuingItems.includes(item.id)} onClick={() => void queue(order, item.id, 'START')}>{t.start}</button>}{item.status === 'PREPARING' && <button disabled={enqueuingItems.includes(item.id)} onClick={() => void queue(order, item.id, 'READY')}>{t.ready}</button>}</div></div>;
     })}</article>)}{!visibleOrders.length && <p className="empty">{t.empty}</p>}</div>
   </section>;
 }
