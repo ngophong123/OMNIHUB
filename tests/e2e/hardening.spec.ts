@@ -203,6 +203,17 @@ test('hardening UI: partial-payment refund approval with cashier shift selector 
   expect((await rejectRes).status()).toBe(201);
   await expect(refundRow2).toContainText('Từ chối');
 
+  // Clean up cashierShift (opening 20,000 + payment 15,000 - refund 2,000 = 33,000) so later specs start cleanly
+  const shiftsAfter = await (await ownerPage.request.get(api('/cash/shifts'))).json() as { id: string; version: number; status: string }[];
+  const latestCashierShift = shiftsAfter.find(s => s.id === cashierShift.id);
+  if (latestCashierShift && latestCashierShift.status === 'OPEN') {
+    const closed = await cashierPage.request.post(api(`/cash/shifts/${cashierShift.id}/close`), {
+      headers: { Origin: WEB_ORIGIN, 'Idempotency-Key': crypto.randomUUID() },
+      data: { expectedVersion: latestCashierShift.version, countedAmount: 33_000 },
+    });
+    expect(closed.status()).toBe(201);
+  }
+
   await cashierContext.close();
   await ownerContext.close();
 });
