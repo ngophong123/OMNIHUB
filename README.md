@@ -111,6 +111,8 @@ Run these checks locally:
 
 ## Documentation
 
+- [API Reference (OpenAPI)](docs/openapi.yaml) — OpenAPI 3.0 specification covering all HTTP endpoints, authentication, RBAC, and error contracts.
+- [Database ERD](docs/database-erd.md) — Mermaid entity relationship diagrams derived from `prisma/schema.prisma`.
 - [Architecture](docs/ARCHITECTURE.md) — Monorepo layout, concurrency, outbox delivery, and security boundaries.
 - [Order-to-Cash Flow](docs/ORDER-TO-CASH-FLOW.md) — Order, inventory, kitchen, payment, and shift lifecycle.
 - [Known Limitations](docs/KNOWN_LIMITATIONS.md) — Current limits, pilot NO-GO status, and out-of-scope items.
