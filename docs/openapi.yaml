@@ -1,0 +1,3767 @@
+openapi: 3.0.3
+info:
+  title: OMNIHUB Restaurant Operations API
+  version: 0.1.0
+  description: |
+    HTTP REST API for OMNIHUB (POS ordering, QR table ordering, offline-capable Kitchen Display System,
+    recipe-based inventory ledger, multi-method payments, compensating refunds, cash shift reconciliation,
+    and transactional Outbox dead-letter administration).
+
+    ### Authentication vs Authorization
+    - **Staff authentication (`sessionCookie`)**: HttpOnly, `SameSite=Strict` cookie named `session` issued by `POST /auth/login`.
+      Sessions are scoped to one `(tenantId, storeId, userId)` and re-validated inside database transactions.
+    - **Origin CSRF protection**: State-changing requests (`POST`, `PUT`, `DELETE`, `PATCH`) must send an exact `Origin` matching `WEB_ORIGIN`.
+    - **Role-Based Access Control (RBAC)**: Every staff endpoint enforces explicit store-scoped permissions (`OWNER`, `MANAGER`, `CASHIER`, `KITCHEN`, `INVENTORY`).
+      Vendor extensions `x-required-permission` and `x-allowed-roles` document the exact server-side authorization policy.
+    - **Customer QR table authentication (`tableSessionBearer`)**: Opaque 64-hex bearer token returned once by `POST /public/qr/{token}/session` (4-hour TTL, bound to the table's active QR credential hash).
+    - **Idempotency & concurrency**: Business mutations through `CommandBus` require a UUID v4 `Idempotency-Key` header.
+      Replaying the same key with an identical payload returns the original `{ id, version }` response; reusing the key with a different payload returns `409 IDEMPOTENCY_KEY_REUSED`.
+      Database mutations execute in `Serializable` PostgreSQL transactions with bounded retries on `P2034` / `40001` / `40P01`.
+    - **Sanitized error envelope**: All JSON errors follow `{ code, correlationId }` without leaking internal SQL or stack traces.
+servers:
+  - url: http://127.0.0.1:4000
+    description: Local development API server
+tags:
+  - name: Health & Observability
+    description: Liveness, readiness, and Prometheus telemetry endpoints.
+  - name: Authentication
+    description: Staff cookie session lifecycle.
+  - name: Orders
+    description: Order intake, cancellation, and kitchen item state transitions.
+  - name: Payments & Refunds
+    description: Multi-method payments, bill splits, compensating refunds, and daily net financial reports.
+  - name: Cash Shifts
+    description: Cash registers, cashier shift lifecycle, discrepancy approval, and cash drawer movements.
+  - name: Kitchen
+    description: Kitchen display device registration, offline command sync, and device administration.
+  - name: QR Ordering
+    description: Public guest QR menu, table sessions, order tracking, and store table administration.
+  - name: Catalog
+    description: Staff catalog projection and versioned CRUD for categories, stations, ingredients, products, variants, and modifiers.
+  - name: Inventory
+    description: Ingredient stock balances, stock receipts, manual adjustments, and immutable ledger queries.
+  - name: Outbox
+    description: Tenant-scoped Outbox Dead Letter Queue inspection and safe replay.
+  - name: Administration
+    description: Store pilot readiness and single-use staff invitations.
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: session
+      description: HttpOnly SameSite=Strict staff session cookie issued by POST /auth/login.
+    tableSessionBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: 64-char hex token
+      description: Customer table session bearer token issued by POST /public/qr/{token}/session.
+    metricsBearer:
+      type: http
+      scheme: bearer
+      description: Optional bearer token matching METRICS_AUTH_TOKEN; loopback-only when unset.
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-generated UUID v4 idempotency key persisted in CommandReceipt.
+      schema:
+        type: string
+        format: uuid
+    KitchenDeviceHeader:
+      name: X-Kitchen-Device
+      in: header
+      required: false
+      description: Registered non-secret KitchenDevice UUID. Required for KITCHEN role on order reads, item commands, and /kitchen/sync.
+      schema:
+        type: string
+        format: uuid
+    KitchenDeviceHeaderRequired:
+      name: X-Kitchen-Device
+      in: header
+      required: true
+      description: Registered KitchenDevice UUID matching every command's deviceId in the sync batch.
+      schema:
+        type: string
+        format: uuid
+    QrTokenHeader:
+      name: X-QR-Token
+      in: header
+      required: false
+      description: Raw 64-character hex table QR token (preferred over legacy query parameter ?token=).
+      schema:
+        type: string
+        pattern: '^[a-f0-9]{64}$'
+    EntityIdPath:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ProductIdPath:
+      name: productId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    GroupIdPath:
+      name: groupId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    Hex64TokenPath:
+      name: token
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^[a-f0-9]{64}$'
+
+  schemas:
+    Role:
+      type: string
+      enum: [OWNER, MANAGER, CASHIER, KITCHEN, INVENTORY]
+    ErrorResponse:
+      type: object
+      required: [code]
+      properties:
+        code:
+          type: string
+          description: Sanitized machine-readable error code.
+          example: INVALID_INPUT
+        correlationId:
+          type: string
+          description: Request correlation identifier echoed from X-Correlation-ID or server-generated.
+    CommandResult:
+      type: object
+      required: [id, version]
+      properties:
+        id:
+          type: string
+          format: uuid
+        version:
+          type: integer
+    VersionBody:
+      type: object
+      additionalProperties: false
+      required: [expectedVersion]
+      properties:
+        expectedVersion:
+          type: integer
+          minimum: 1
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password, storeId]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        password:
+          type: string
+          minLength: 1
+          maxLength: 128
+        storeId:
+          type: string
+          format: uuid
+    OrderLineInput:
+      type: object
+      additionalProperties: false
+      required: [productId, quantity]
+      properties:
+        productId:
+          type: string
+          format: uuid
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 100
+        variantId:
+          type: string
+          format: uuid
+        modifierIds:
+          type: array
+          maxItems: 20
+          items:
+            type: string
+            format: uuid
+        note:
+          type: string
+          maxLength: 250
+    CreateOrderRequest:
+      type: object
+      additionalProperties: false
+      required: [lines]
+      properties:
+        lines:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/OrderLineInput'
+    OrderCancelRequest:
+      type: object
+      additionalProperties: false
+      required: [expectedVersion, reason]
+      properties:
+        expectedVersion:
+          type: integer
+          minimum: 1
+        reason:
+          type: string
+          minLength: 5
+          maxLength: 300
+    ItemCommandRequest:
+      type: object
+      additionalProperties: false
+      required: [expectedVersion, action]
+      properties:
+        expectedVersion:
+          type: integer
+          minimum: 0
+        action:
+          type: string
+          enum: [START, READY, HANDOFF, CANCEL]
+    LegacyCashPaymentRequest:
+      type: object
+      additionalProperties: false
+      required: [expectedVersion, tendered]
+      properties:
+        expectedVersion:
+          type: integer
+          minimum: 0
+        tendered:
+          type: integer
+          minimum: 0
+          maximum: 1000000000
+    RecordPaymentRequest:
+      type: object
+      additionalProperties: false
+      required: [amount, method]
+      properties:
+        amount:
+          type: integer
+          minimum: 1
+          maximum: 1000000000
+        method:
+          type: string
+          enum: [CASH, BANK_TRANSFER, CARD]
+        tendered:
+          type: integer
+          minimum: 1
+          maximum: 1000000000
+          description: Required for CASH payments and must be >= amount.
+        externalReference:
+          type: string
+          minLength: 3
+          maxLength: 120
+          description: Required for BANK_TRANSFER payments; unique per (tenantId, storeId, method).
+        splitId:
+          type: string
+          format: uuid
+    BillSplitRequest:
+      type: object
+      additionalProperties: false
+      required: [label]
+      description: Must provide exactly one of amount or itemIds (XOR).
+      properties:
+        label:
+          type: string
+          minLength: 1
+          maxLength: 80
+        amount:
+          type: integer
+          minimum: 1
+          maximum: 1000000000
+        itemIds:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            type: string
+            format: uuid
+    PaymentFailureRequest:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          minLength: 5
+          maxLength: 300
+    RefundRequest:
+      type: object
+      additionalProperties: false
+      required: [amount, reason]
+      properties:
+        amount:
+          type: integer
+          minimum: 1
+          maximum: 1000000000
+        reason:
+          type: string
+          minLength: 5
+          maxLength: 300
+        itemId:
+          type: string
+          format: uuid
+          description: Optional order item scope; refund cannot exceed item unitPrice.
+    RefundDecisionRequest:
+      type: object
+      additionalProperties: false
+      required: [decision, reason]
+      properties:
+        decision:
+          type: string
+          enum: [APPROVED, REJECTED]
+        reason:
+          type: string
+          minLength: 5
+          maxLength: 300
+        shiftId:
+          type: string
+          format: uuid
+          description: |
+            Optional OPEN CashShift UUID for APPROVED CASH refunds. When omitted, only the approving manager's
+            own OPEN shift is used; another cashier's shift is never silently selected.
+    CashRegisterRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 80
+    CashShiftOpenRequest:
+      type: object
+      additionalProperties: false
+      required: [registerId, openingAmount]
+      properties:
+        registerId:
+          type: string
+          format: uuid
+        cashierId:
+          type: string
+          format: uuid
+          description: Optional cashier assignment; specifying another user requires OWNER or MANAGER role.
+        openingAmount:
+          type: integer
+          minimum: 0
+          maximum: 1000000000
+    CashShiftCloseRequest:
+      type: object
+      additionalProperties: false
+      required: [expectedVersion, countedAmount]
+      properties:
+        expectedVersion:
+          type: integer
+          minimum: 1
+        countedAmount:
+          type: integer
+          minimum: 0
+          maximum: 1000000000
+        reason:
+          type: string
+          maxLength: 300
+          description: Required (min 5 trimmed chars) whenever countedAmount differs from expectedAmount.
+    CashShiftApproveRequest:
+      type: object
+      additionalProperties: false
+      required: [expectedVersion, reason]
+      properties:
+        expectedVersion:
+          type: integer
+          minimum: 1
+        reason:
+          type: string
+          minLength: 5
+          maxLength: 300
+    CashMovementRequest:
+      type: object
+      additionalProperties: false
+      required: [shiftId, kind, amount, reason]
+      properties:
+        shiftId:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          enum: [CASH_IN, CASH_OUT, REFUND, CORRECTION_IN, CORRECTION_OUT]
+        amount:
+          type: integer
+          minimum: 1
+          maximum: 1000000000
+        reason:
+          type: string
+          minLength: 5
+          maxLength: 300
+        paymentId:
+          type: string
+          format: uuid
+          description: Required iff kind is REFUND. Recording kind=REFUND requires cashApprove (OWNER/MANAGER).
+    KitchenDeviceRegisterRequest:
+      type: object
+      additionalProperties: false
+      required: [deviceId]
+      properties:
+        deviceId:
+          type: string
+          format: uuid
+    KitchenDeviceAssignmentRequest:
+      type: object
+      additionalProperties: false
+      required: [stationId]
+      properties:
+        stationId:
+          type: string
+          format: uuid
+          nullable: true
+    KitchenReplayCommand:
+      type: object
+      additionalProperties: false
+      required: [commandId, tenantId, storeId, userId, deviceId, sequence, orderId, itemId, expectedVersion, action, createdAt]
+      properties:
+        commandId:
+          type: string
+          format: uuid
+        tenantId:
+          type: string
+          format: uuid
+        storeId:
+          type: string
+          format: uuid
+        userId:
+          type: string
+          format: uuid
+        deviceId:
+          type: string
+          format: uuid
+        sequence:
+          type: integer
+          minimum: 1
+        orderId:
+          type: string
+          format: uuid
+        itemId:
+          type: string
+          format: uuid
+        expectedVersion:
+          type: integer
+          minimum: 1
+        action:
+          type: string
+          enum: [START, READY]
+        createdAt:
+          type: string
+          format: date-time
+    KitchenSyncRequest:
+      type: object
+      additionalProperties: false
+      required: [commands]
+      properties:
+        commands:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/KitchenReplayCommand'
+    StockAdjustmentRequest:
+      type: object
+      additionalProperties: false
+      required: [ingredientId, delta, reason]
+      properties:
+        ingredientId:
+          type: string
+          format: uuid
+        delta:
+          type: string
+          pattern: '^-?\d+(\.\d{1,3})?$'
+        reason:
+          type: string
+          minLength: 5
+          maxLength: 300
+    RecipeLineInput:
+      type: object
+      additionalProperties: false
+      required: [ingredientId, quantity, unit]
+      properties:
+        ingredientId:
+          type: string
+          format: uuid
+        quantity:
+          type: string
+          pattern: '^\d+(\.\d{1,3})?$'
+        unit:
+          type: string
+          enum: [g, kg, ml, l, piece]
+    StockReceiptRequest:
+      type: object
+      additionalProperties: false
+      required: [reference, supplier, lines]
+      properties:
+        reference:
+          type: string
+          minLength: 3
+          maxLength: 80
+        supplier:
+          type: string
+          minLength: 1
+          maxLength: 120
+        lines:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/RecipeLineInput'
+    CategoryCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+    CategoryUpdateRequest:
+      type: object
+      additionalProperties: false
+      required: [name, active, expectedVersion]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        active:
+          type: boolean
+        expectedVersion:
+          type: integer
+          minimum: 1
+    StationCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [name, active]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        active:
+          type: boolean
+    StationUpdateRequest:
+      type: object
+      additionalProperties: false
+      required: [name, active, expectedVersion]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        active:
+          type: boolean
+        expectedVersion:
+          type: integer
+          minimum: 1
+    IngredientCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [name, active, unit, lowStockThreshold]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        active:
+          type: boolean
+        unit:
+          type: string
+          enum: [g, ml, piece]
+        lowStockThreshold:
+          type: string
+          pattern: '^\d+(\.\d{1,3})?$'
+    IngredientUpdateRequest:
+      allOf:
+        - $ref: '#/components/schemas/IngredientCreateRequest'
+        - $ref: '#/components/schemas/VersionBody'
+    ProductCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [name, active, description, price, stationId, categoryId, manualAvailable, recipe]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        active:
+          type: boolean
+        description:
+          type: string
+          maxLength: 1000
+        imageUrl:
+          type: string
+          format: uri
+          maxLength: 1000
+          nullable: true
+          description: Must use https:// protocol when provided.
+        price:
+          type: integer
+          minimum: 0
+          maximum: 1000000000
+        stationId:
+          type: string
+          format: uuid
+        categoryId:
+          type: string
+          format: uuid
+          nullable: true
+        manualAvailable:
+          type: boolean
+        recipe:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/RecipeLineInput'
+    ProductUpdateRequest:
+      allOf:
+        - $ref: '#/components/schemas/ProductCreateRequest'
+        - $ref: '#/components/schemas/VersionBody'
+    ProductAvailabilityRequest:
+      type: object
+      additionalProperties: false
+      required: [expectedVersion, available]
+      properties:
+        expectedVersion:
+          type: integer
+          minimum: 1
+        available:
+          type: boolean
+    VariantCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [name, active, price, recipeMultiplier]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        active:
+          type: boolean
+        price:
+          type: integer
+          minimum: 0
+          maximum: 1000000000
+        recipeMultiplier:
+          type: string
+          pattern: '^\d+(\.\d{1,3})?$'
+          description: Numeric multiplier > 0 and <= 1000.
+    VariantUpdateRequest:
+      allOf:
+        - $ref: '#/components/schemas/VariantCreateRequest'
+        - $ref: '#/components/schemas/VersionBody'
+    ModifierGroupCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [name, active, minSelections, maxSelections]
+      description: Enforces minSelections <= maxSelections.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        active:
+          type: boolean
+        minSelections:
+          type: integer
+          minimum: 0
+          maximum: 20
+        maxSelections:
+          type: integer
+          minimum: 1
+          maximum: 20
+    ModifierGroupUpdateRequest:
+      allOf:
+        - $ref: '#/components/schemas/ModifierGroupCreateRequest'
+        - $ref: '#/components/schemas/VersionBody'
+    ModifierCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [name, active, priceDelta, recipe]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        active:
+          type: boolean
+        priceDelta:
+          type: integer
+          minimum: 0
+          maximum: 1000000000
+        recipe:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/RecipeLineInput'
+    ModifierUpdateRequest:
+      allOf:
+        - $ref: '#/components/schemas/ModifierCreateRequest'
+        - $ref: '#/components/schemas/VersionBody'
+    TableConfigRequest:
+      type: object
+      additionalProperties: false
+      required: [enabled]
+      properties:
+        enabled:
+          type: boolean
+    TableCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 80
+    TableUpdateRequest:
+      type: object
+      additionalProperties: false
+      required: [name, active, qrEnabled, expectedVersion]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 80
+        active:
+          type: boolean
+        qrEnabled:
+          type: boolean
+        expectedVersion:
+          type: integer
+          minimum: 1
+    InvitationCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [email, role]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        role:
+          type: string
+          enum: [MANAGER, CASHIER, KITCHEN, INVENTORY]
+    InvitationAcceptRequest:
+      type: object
+      additionalProperties: false
+      required: [password]
+      properties:
+        password:
+          type: string
+          minLength: 12
+          maxLength: 128
+    OutboxReplayRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        ids:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            type: string
+            format: uuid
+    OutboxDeadLetterRow:
+      type: object
+      required: [id, tenantId, storeId, type, aggregateId, version, attempts, maxAttempts, createdAt, deadLetteredAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        tenantId:
+          type: string
+          format: uuid
+        storeId:
+          type: string
+          format: uuid
+        type:
+          type: string
+        aggregateId:
+          type: string
+          format: uuid
+        version:
+          type: integer
+        attempts:
+          type: integer
+        maxAttempts:
+          type: integer
+        lastError:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        deadLetteredAt:
+          type: string
+          format: date-time
+
+  responses:
+    BadRequest:
+      description: Validation error, invalid UUID/JSON body, or invalid input reference.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Unauthorized:
+      description: Missing, expired, or invalid staff session cookie or credentials.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Forbidden:
+      description: Authenticated user lacks required role/permission, Origin header mismatch, or unauthorized kitchen device/table session.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound:
+      description: Resource does not exist within the authenticated tenant and store scope.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Conflict:
+      description: Business rule conflict, stale optimistic version, idempotency key reuse, insufficient stock, or concurrency conflict.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    TooManyRequests:
+      description: Shared Redis rate limit exceeded or per-account lockout active.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    InternalServerError:
+      description: Unexpected internal server failure (details redacted).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    ServiceUnavailable:
+      description: PostgreSQL or Redis dependency unavailable (fail-closed).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+paths:
+  /health:
+    get:
+      tags: [Health & Observability]
+      operationId: getHealth
+      summary: Liveness probe
+      description: Public process liveness endpoint.
+      security: []
+      responses:
+        '200':
+          description: API process is running.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+  /ready:
+    get:
+      tags: [Health & Observability]
+      operationId: getReadiness
+      summary: Readiness probe
+      description: Verifies PostgreSQL connectivity, protected rate-limit Redis PING, and realtime Redis adapter/subscriber readiness.
+      security: []
+      responses:
+        '200':
+          description: All dependencies are ready.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [database, redis, realtime]
+                properties:
+                  database:
+                    type: string
+                    example: ok
+                  redis:
+                    type: string
+                    example: ok
+                  realtime:
+                    type: string
+                    example: ok
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /metrics:
+    get:
+      tags: [Health & Observability]
+      operationId: getMetrics
+      summary: Prometheus metrics scrape endpoint
+      description: Exposes Prometheus telemetry. Requires METRICS_AUTH_TOKEN bearer authentication when configured, or loopback client access otherwise, with bounded LRU rate limiting.
+      security:
+        - metricsBearer: []
+      responses:
+        '200':
+          description: Prometheus text exposition metrics.
+          content:
+            text/plain:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /auth/login:
+    post:
+      tags: [Authentication]
+      operationId: loginStaff
+      summary: Authenticate staff member and issue session cookie
+      description: Validates credentials with async scrypt and issues an HttpOnly SameSite=Strict session cookie. Protected by IP and per-account Redis Lua rate limits (fail-closed 503 if Redis is unavailable).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '201':
+          description: Session created and set via Set-Cookie header.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [expiresAt]
+                properties:
+                  expiresAt:
+                    type: string
+                    format: date-time
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /auth/me:
+    get:
+      tags: [Authentication]
+      operationId: getCurrentSession
+      summary: Inspect current authenticated staff session
+      security:
+        - sessionCookie: []
+      x-required-permission: read
+      x-allowed-roles: [OWNER, MANAGER, CASHIER, KITCHEN, INVENTORY]
+      responses:
+        '200':
+          description: Active user, tenant, store, and role details.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [userId, tenantId, storeId, role, storeName]
+                properties:
+                  userId:
+                    type: string
+                    format: uuid
+                  tenantId:
+                    type: string
+                    format: uuid
+                  storeId:
+                    type: string
+                    format: uuid
+                  role:
+                    $ref: '#/components/schemas/Role'
+                  storeName:
+                    type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /auth/logout:
+    post:
+      tags: [Authentication]
+      operationId: logoutStaff
+      summary: Revoke current staff session and clear session cookie
+      description: Deletes the Session row and persists a session.revoked Outbox event in the same transaction for immediate multi-replica Socket.IO disconnection.
+      security:
+        - sessionCookie: []
+      x-required-permission: read
+      x-allowed-roles: [OWNER, MANAGER, CASHIER, KITCHEN, INVENTORY]
+      responses:
+        '201':
+          description: Session revoked and cookie cleared.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok:
+                    type: boolean
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /orders:
+    get:
+      tags: [Orders]
+      operationId: listOrders
+      summary: List latest 100 store orders
+      description: |
+        Requires pos or kitchen permission (INVENTORY is denied with 403).
+        KITCHEN role requires a valid X-Kitchen-Device header, receives station-scoped items/tickets if assigned,
+        and receives empty arrays for payments, refunds, and billSplits.
+      security:
+        - sessionCookie: []
+      x-required-permission: pos | kitchen
+      x-allowed-roles: [OWNER, MANAGER, CASHIER, KITCHEN]
+      parameters:
+        - $ref: '#/components/parameters/KitchenDeviceHeader'
+      responses:
+        '200':
+          description: Latest 100 scoped orders.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [Orders]
+      operationId: createOrder
+      summary: Accept a POS order and reserve stock atomically
+      description: Server-calculates prices and composed recipes, locks ingredient balances in ascending ingredientId order inside a Serializable transaction, creates KitchenTickets, OrderItems, Reservations, Movements, Audit, Outbox, and CommandReceipt.
+      security:
+        - sessionCookie: []
+      x-required-permission: pos
+      x-allowed-roles: [OWNER, MANAGER, CASHIER]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+      responses:
+        '201':
+          description: Order accepted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /orders/{id}/cancel:
+    post:
+      tags: [Orders]
+      operationId: cancelOrder
+      summary: Cancel an unpaid order atomically
+      description: Rejects if active payments or BillSplits exist (409 ORDER_PAYMENT_IN_PROGRESS / ORDER_HAS_BILL_SPLITS). Cancelling an order with started items requires OWNER or MANAGER.
+      security:
+        - sessionCookie: []
+      x-required-permission: cancelPending (cancelStarted if started items exist)
+      x-allowed-roles: [OWNER, MANAGER, CASHIER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderCancelRequest'
+      responses:
+        '201':
+          description: Order cancelled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /items/{id}/commands:
+    post:
+      tags: [Orders]
+      operationId: executeOrderItemCommand
+      summary: Transition a single order item state (START, READY, HANDOFF, CANCEL)
+      description: |
+        Enforces permission per action (START/READY: kitchen; HANDOFF: handoff; CANCEL pending: cancelPending; CANCEL started: cancelStarted).
+        KITCHEN role requires a valid X-Kitchen-Device header (re-checked after in-transaction reauthorize) and station scope.
+        CANCEL is blocked if active payments or BillSplits exist.
+      security:
+        - sessionCookie: []
+      x-required-permission: kitchen | handoff | cancelPending | cancelStarted
+      x-allowed-roles: [OWNER, MANAGER, CASHIER, KITCHEN]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/KitchenDeviceHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ItemCommandRequest'
+      responses:
+        '201':
+          description: Item transitioned; returns parent order id and new version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /orders/{id}/cash:
+    post:
+      tags: [Payments & Refunds]
+      operationId: settleLegacyCashPayment
+      summary: Legacy full-balance cash checkout
+      description: Retained compatibility endpoint; settles remaining unpaid balance in CASH against the caller's OPEN cash shift.
+      deprecated: true
+      security:
+        - sessionCookie: []
+      x-required-permission: cash
+      x-allowed-roles: [OWNER, MANAGER, CASHIER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LegacyCashPaymentRequest'
+      responses:
+        '201':
+          description: Cash payment settled and order completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /orders/{id}/payments:
+    get:
+      tags: [Payments & Refunds]
+      operationId: getOrderPaymentHistory
+      summary: Retrieve payment, refund, and bill split history for an order
+      security:
+        - sessionCookie: []
+      x-required-permission: cash | report
+      x-allowed-roles: [OWNER, MANAGER, CASHIER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+      responses:
+        '200':
+          description: Scoped payment summary and financial records.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [payments, refunds, splits, total, paid, pending, refunded, outstanding, availableToCollect]
+                properties:
+                  payments:
+                    type: array
+                    items:
+                      type: object
+                  refunds:
+                    type: array
+                    items:
+                      type: object
+                  splits:
+                    type: array
+                    items:
+                      type: object
+                  total:
+                    type: integer
+                  paid:
+                    type: integer
+                  pending:
+                    type: integer
+                  refunded:
+                    type: integer
+                  outstanding:
+                    type: integer
+                  availableToCollect:
+                    type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Payments & Refunds]
+      operationId: recordOrderPayment
+      summary: Record a full or partial payment against a handed-off order
+      description: |
+        Locks Order FOR UPDATE and prevents overpayment across settled + pending payments minus approved refunds.
+        CASH requires an OPEN CashShift owned by the caller and settles immediately.
+        BANK_TRANSFER creates a PENDING payment requiring manager verification.
+        CARD uses the sandbox-only adapter (currently rejects with 400).
+      security:
+        - sessionCookie: []
+      x-required-permission: cash
+      x-allowed-roles: [OWNER, MANAGER, CASHIER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecordPaymentRequest'
+      responses:
+        '201':
+          description: Payment recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /orders/{id}/splits:
+    post:
+      tags: [Payments & Refunds]
+      operationId: createBillSplit
+      summary: Create an append-only bill split for an ACCEPTED order
+      description: Locks Order FOR UPDATE, subtracts existing splits and unallocated active payments from splittable total, and enforces amount XOR itemIds.
+      security:
+        - sessionCookie: []
+      x-required-permission: cash
+      x-allowed-roles: [OWNER, MANAGER, CASHIER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BillSplitRequest'
+      responses:
+        '201':
+          description: Bill split created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /payments/{id}/verify:
+    post:
+      tags: [Payments & Refunds]
+      operationId: verifyBankTransferPayment
+      summary: Verify and settle a PENDING bank transfer payment
+      description: Locks Order -> Payment FOR UPDATE, verifies remaining order balance, marks payment SETTLED, and recalculates Order paymentStatus/status.
+      security:
+        - sessionCookie: []
+      x-required-permission: cashApprove
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '201':
+          description: Payment settled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /payments/{id}/fail:
+    post:
+      tags: [Payments & Refunds]
+      operationId: failPendingPayment
+      summary: Mark a PENDING bank transfer payment as FAILED
+      security:
+        - sessionCookie: []
+      x-required-permission: cashApprove
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentFailureRequest'
+      responses:
+        '201':
+          description: Payment marked FAILED.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /payments/{id}/refunds:
+    post:
+      tags: [Payments & Refunds]
+      operationId: requestPaymentRefund
+      summary: Request a compensating refund against a SETTLED payment
+      description: |
+        Supports refunds on both COMPLETED and partially paid (ACCEPTED / PARTIALLY_PAID) orders.
+        Locks Order -> Payment FOR UPDATE in deterministic order and rejects any request exceeding
+        payment.amount minus existing REQUESTED/APPROVED Refunds and legacy unlinked CashMovement(REFUND) rows.
+      security:
+        - sessionCookie: []
+      x-required-permission: cash
+      x-allowed-roles: [OWNER, MANAGER, CASHIER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefundRequest'
+      responses:
+        '201':
+          description: Refund request created in REQUESTED state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /refunds/{id}/decision:
+    post:
+      tags: [Payments & Refunds]
+      operationId: decideRefund
+      summary: Approve or reject a pending refund request
+      description: |
+        Locks Order -> Payment -> Refund -> CashShift in deterministic order.
+        For APPROVED CASH refunds, requires an OPEN shift via explicit shiftId (validating tenant/store scope,
+        active shift cashier membership, and non-negative resulting drawer balance cashExpected >= 0) or the
+        approving manager's own OPEN shift; never silently selects another cashier's shift.
+        Records approving manager identity separately from shift cashier and refreshes Order paymentStatus.
+      security:
+        - sessionCookie: []
+      x-required-permission: cashApprove
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefundDecisionRequest'
+      responses:
+        '201':
+          description: Refund decision recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /reports/daily:
+    get:
+      tags: [Payments & Refunds]
+      operationId: getDailyFinancialReport
+      summary: Daily net sales summary for the latest 31 business days
+      description: Aggregates SETTLED payments minus APPROVED refunds grouped by businessDate.
+      security:
+        - sessionCookie: []
+      x-required-permission: report
+      x-allowed-roles: [OWNER, MANAGER]
+      responses:
+        '200':
+          description: Daily net revenue rows ordered descending by businessDate.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  required: [businessDate, _sum, _count, refunds, net]
+                  properties:
+                    businessDate:
+                      type: string
+                    _sum:
+                      type: object
+                      properties:
+                        amount:
+                          type: integer
+                          nullable: true
+                    _count:
+                      type: object
+                      properties:
+                        id:
+                          type: integer
+                    refunds:
+                      type: integer
+                    net:
+                      type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /cash/registers:
+    get:
+      tags: [Cash Shifts]
+      operationId: listCashRegisters
+      summary: List active cash registers in the store
+      security:
+        - sessionCookie: []
+      x-required-permission: cashShift
+      x-allowed-roles: [OWNER, MANAGER, CASHIER]
+      responses:
+        '200':
+          description: Active store cash registers.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [Cash Shifts]
+      operationId: createCashRegister
+      summary: Create a cash register in the store
+      security:
+        - sessionCookie: []
+      x-required-permission: cashApprove
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CashRegisterRequest'
+      responses:
+        '201':
+          description: Cash register created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /cash/assignments:
+    get:
+      tags: [Cash Shifts]
+      operationId: listCashShiftAssignments
+      summary: List assignable cashier memberships for cash shifts
+      description: OWNER/MANAGER receives all active OWNER, MANAGER, and CASHIER store memberships; CASHIER receives only their own record.
+      security:
+        - sessionCookie: []
+      x-required-permission: cashShift
+      x-allowed-roles: [OWNER, MANAGER, CASHIER]
+      responses:
+        '200':
+          description: Scoped list of assignable cash shift members.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /cash/shifts:
+    get:
+      tags: [Cash Shifts]
+      operationId: listCashShifts
+      summary: List latest 100 store cash shifts with payments and movements
+      security:
+        - sessionCookie: []
+      x-required-permission: cashShift
+      x-allowed-roles: [OWNER, MANAGER, CASHIER]
+      responses:
+        '200':
+          description: Latest 100 cash shifts ordered by openedAt descending.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [Cash Shifts]
+      operationId: openCashShift
+      summary: Open a cash shift on an active register
+      description: Cashiers can open a shift for themselves; assigning another store cashier requires OWNER or MANAGER. Database constraints enforce at most one active shift per cashier and per register.
+      security:
+        - sessionCookie: []
+      x-required-permission: cashShift (admin if cashierId != caller)
+      x-allowed-roles: [OWNER, MANAGER, CASHIER]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CashShiftOpenRequest'
+      responses:
+        '201':
+          description: Cash shift opened.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /cash/shifts/{id}/close:
+    post:
+      tags: [Cash Shifts]
+      operationId: closeCashShift
+      summary: Close an OPEN cash shift with counted drawer amount
+      description: Zero discrepancy transitions directly to CLOSED (approvalStatus=NOT_REQUIRED). Non-zero discrepancy requires a reason (min 5 chars) and moves to CLOSING (approvalStatus=PENDING) pending manager approval.
+      security:
+        - sessionCookie: []
+      x-required-permission: cashShift (shift cashier or admin)
+      x-allowed-roles: [OWNER, MANAGER, CASHIER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CashShiftCloseRequest'
+      responses:
+        '201':
+          description: Cash shift closed or transitioned to CLOSING pending approval.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /cash/shifts/{id}/approve:
+    post:
+      tags: [Cash Shifts]
+      operationId: approveCashShiftDiscrepancy
+      summary: Approve a CLOSING cash shift discrepancy and finalize CLOSED state
+      security:
+        - sessionCookie: []
+      x-required-permission: cashApprove
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CashShiftApproveRequest'
+      responses:
+        '201':
+          description: Cash shift discrepancy approved and closed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /cash/movements:
+    post:
+      tags: [Cash Shifts]
+      operationId: recordCashMovement
+      summary: Record an append-only cash drawer movement on an OPEN shift
+      description: |
+        Validates non-negative expected drawer balance (cashExpected >= 0).
+        Recording kind=REFUND requires cashApprove (OWNER/MANAGER) and a valid SETTLED CASH paymentId from that shift,
+        locks Order -> Payment -> CashShift, enforces refund caps across Refund and legacy CashMovement rows,
+        creates linked Refund + RefundDecision rows, and updates Order.paymentStatus.
+      security:
+        - sessionCookie: []
+      x-required-permission: cash (cashApprove required when kind=REFUND)
+      x-allowed-roles: [OWNER, MANAGER, CASHIER]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CashMovementRequest'
+      responses:
+        '201':
+          description: Cash movement recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /kitchen/devices/register:
+    post:
+      tags: [Kitchen]
+      operationId: registerKitchenDevice
+      summary: Register or heartbeat a kitchen display device
+      description: Heartbeats execute an atomic conditional ReadCommitted update (revokedAt IS NULL); new device registration uses Serializable transaction with retry and audit logging.
+      security:
+        - sessionCookie: []
+      x-required-permission: kitchen
+      x-allowed-roles: [OWNER, MANAGER, KITCHEN]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/KitchenDeviceRegisterRequest'
+      responses:
+        '201':
+          description: Device registered or heartbeat updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deviceId, authorized]
+                properties:
+                  deviceId:
+                    type: string
+                    format: uuid
+                  authorized:
+                    type: boolean
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /kitchen/sync:
+    post:
+      tags: [Kitchen]
+      operationId: syncKitchenOfflineCommands
+      summary: Replay up to 50 ordered offline KDS START/READY commands
+      description: Uses each command's UUID v4 commandId as its idempotency key, requires X-Kitchen-Device header matching the batch deviceId, stops per-order replay on conflict (marking subsequent commands for that order BLOCKED), and audits sync counts.
+      security:
+        - sessionCookie: []
+      x-required-permission: kitchen
+      x-allowed-roles: [OWNER, MANAGER, KITCHEN]
+      parameters:
+        - $ref: '#/components/parameters/KitchenDeviceHeaderRequired'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/KitchenSyncRequest'
+      responses:
+        '201':
+          description: Per-command replay outcomes.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [results]
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      required: [commandId, status]
+                      properties:
+                        commandId:
+                          type: string
+                          format: uuid
+                        status:
+                          type: string
+                          enum: [CONFIRMED, CONFLICT, REJECTED, BLOCKED]
+                        version:
+                          type: integer
+                        code:
+                          type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/kitchen/devices:
+    get:
+      tags: [Kitchen]
+      operationId: listKitchenDevices
+      summary: List store kitchen devices, stations, session expiry, and recent activity
+      security:
+        - sessionCookie: []
+      x-required-permission: admin
+      x-allowed-roles: [OWNER, MANAGER]
+      responses:
+        '200':
+          description: Store stations and up to 200 kitchen devices.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [stations, devices]
+                properties:
+                  stations:
+                    type: array
+                    items:
+                      type: object
+                  devices:
+                    type: array
+                    items:
+                      type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/kitchen/devices/{id}/assignment:
+    put:
+      tags: [Kitchen]
+      operationId: assignKitchenDeviceStation
+      summary: Assign or clear a kitchen device station filter
+      description: Updates stationId transactionally and emits kitchen.device.changed via Outbox + Redis to immediately disconnect drifted sockets.
+      security:
+        - sessionCookie: []
+      x-required-permission: admin
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/KitchenDeviceAssignmentRequest'
+      responses:
+        '200':
+          description: Station assignment updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, stationId]
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  stationId:
+                    type: string
+                    format: uuid
+                    nullable: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/kitchen/devices/{id}/activity:
+    get:
+      tags: [Kitchen]
+      operationId: getKitchenDeviceActivity
+      summary: Retrieve latest 100 audit events for a store kitchen device
+      security:
+        - sessionCookie: []
+      x-required-permission: admin
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+      responses:
+        '200':
+          description: Audit activity records for the device.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/kitchen/devices/{id}/revoke:
+    post:
+      tags: [Kitchen]
+      operationId: revokeKitchenDevice
+      summary: Revoke a kitchen device immediately
+      description: Sets revokedAt in a Serializable transaction and emits kitchen.device.changed via Outbox + Redis to disconnect active sockets across replicas.
+      security:
+        - sessionCookie: []
+      x-required-permission: admin
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+      responses:
+        '201':
+          description: Kitchen device revoked.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, revoked]
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  revoked:
+                    type: boolean
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /public/qr/{token}/menu:
+    get:
+      tags: [QR Ordering]
+      operationId: getPublicQrMenu
+      summary: Fetch public restaurant menu for an active QR table token
+      description: Public rate-limited endpoint returning safe restaurant/table names, categories, active products, server-derived stock availability, variants, and modifier groups.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/Hex64TokenPath'
+      responses:
+        '200':
+          description: Public menu projection.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [restaurant, table, categories, products]
+                properties:
+                  restaurant:
+                    type: object
+                  table:
+                    type: object
+                  categories:
+                    type: array
+                    items:
+                      type: object
+                  products:
+                    type: array
+                    items:
+                      type: object
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /public/qr/{token}/session:
+    post:
+      tags: [QR Ordering]
+      operationId: openPublicTableSession
+      summary: Open a 4-hour customer table session from a QR token
+      description: Public rate-limited endpoint. Returns a one-time 64-hex bearer token bound to the table's current qrTokenHash.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/Hex64TokenPath'
+      responses:
+        '201':
+          description: Table session opened.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, token, expiresAt]
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  token:
+                    type: string
+                  expiresAt:
+                    type: string
+                    format: date-time
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /public/table-sessions/me:
+    get:
+      tags: [QR Ordering]
+      operationId: getCurrentTableSession
+      summary: Validate active customer table session bearer token
+      security:
+        - tableSessionBearer: []
+      responses:
+        '200':
+          description: Active table session summary.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, expiresAt, restaurant, table]
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  expiresAt:
+                    type: string
+                    format: date-time
+                  restaurant:
+                    type: string
+                  table:
+                    type: string
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /public/table-sessions/orders:
+    post:
+      tags: [QR Ordering]
+      operationId: createPublicTableOrder
+      summary: Submit a QR guest order under an active table session
+      description: Server-priced idempotent order creation with dedicated QR order rate limiting. Returns order id, version, and an HMAC-derived per-order trackingToken.
+      security:
+        - tableSessionBearer: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+      responses:
+        '201':
+          description: QR order accepted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, version, trackingToken]
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  version:
+                    type: integer
+                  trackingToken:
+                    type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /public/order-status/{token}:
+    get:
+      tags: [QR Ordering]
+      operationId: getPublicOrderStatus
+      summary: Track guest order progress using its per-order tracking token
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/Hex64TokenPath'
+      responses:
+        '200':
+          description: Safe order status projection.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, status, restaurant, table, createdAt, items]
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                    enum: [ACCEPTED, PREPARING, READY, SERVED, CANCELLED]
+                  restaurant:
+                    type: string
+                  table:
+                    type: string
+                    nullable: true
+                  createdAt:
+                    type: string
+                    format: date-time
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name:
+                          type: string
+                        status:
+                          type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /admin/tables/config:
+    get:
+      tags: [QR Ordering]
+      operationId: getStoreQrConfig
+      summary: Read store QR ordering enabled flag
+      security:
+        - sessionCookie: []
+      x-required-permission: catalog
+      x-allowed-roles: [OWNER, MANAGER]
+      responses:
+        '200':
+          description: Store QR configuration.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [name, qrOrderingEnabled]
+                properties:
+                  name:
+                    type: string
+                  qrOrderingEnabled:
+                    type: boolean
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    put:
+      tags: [QR Ordering]
+      operationId: updateStoreQrConfig
+      summary: Enable or disable QR ordering for the store
+      security:
+        - sessionCookie: []
+      x-required-permission: catalog
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TableConfigRequest'
+      responses:
+        '200':
+          description: Store QR flag updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/tables:
+    get:
+      tags: [QR Ordering]
+      operationId: listStoreTables
+      summary: List store restaurant tables and active customer sessions
+      security:
+        - sessionCookie: []
+      x-required-permission: catalog
+      x-allowed-roles: [OWNER, MANAGER]
+      responses:
+        '200':
+          description: Store tables with open session summaries.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [QR Ordering]
+      operationId: createStoreTable
+      summary: Create a restaurant table and return its one-time QR token
+      security:
+        - sessionCookie: []
+      x-required-permission: catalog
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TableCreateRequest'
+      responses:
+        '201':
+          description: Table created with one-time raw QR token.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, version, token]
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  version:
+                    type: integer
+                  token:
+                    type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/tables/qr-code:
+    get:
+      tags: [QR Ordering]
+      operationId: getTableQrCodeSvg
+      summary: Render printable SVG QR code for a store-owned table token
+      description: Accepts raw 64-hex token via X-QR-Token header (preferred) or legacy ?token= query parameter. Returns Cache-Control no-store and Referrer-Policy no-referrer headers.
+      security:
+        - sessionCookie: []
+      x-required-permission: catalog
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/QrTokenHeader'
+        - name: token
+          in: query
+          required: false
+          deprecated: true
+          description: Legacy fallback query parameter; prefer X-QR-Token header.
+          schema:
+            type: string
+            pattern: '^[a-f0-9]{64}$'
+      responses:
+        '200':
+          description: SVG QR code markup.
+          content:
+            image/svg+xml:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/tables/{id}:
+    put:
+      tags: [QR Ordering]
+      operationId: updateStoreTable
+      summary: Update table name, active status, and QR enabled flag
+      security:
+        - sessionCookie: []
+      x-required-permission: catalog
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TableUpdateRequest'
+      responses:
+        '200':
+          description: Table updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/tables/{id}/regenerate-qr:
+    post:
+      tags: [QR Ordering]
+      operationId: regenerateTableQrToken
+      summary: Rotate table QR token and invalidate prior customer sessions
+      security:
+        - sessionCookie: []
+      x-required-permission: catalog
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VersionBody'
+      responses:
+        '201':
+          description: QR token rotated; returns new one-time token.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, version, token]
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  version:
+                    type: integer
+                  token:
+                    type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/tables/sessions/{id}/close:
+    post:
+      tags: [QR Ordering]
+      operationId: closeTableSession
+      summary: Close an active customer table session
+      security:
+        - sessionCookie: []
+      x-required-permission: catalog
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '201':
+          description: Table session closed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /catalog:
+    get:
+      tags: [Catalog]
+      operationId: getStaffCatalog
+      summary: List active sellable store products with computed stock availability
+      security:
+        - sessionCookie: []
+      x-required-permission: read
+      x-allowed-roles: [OWNER, MANAGER, CASHIER, KITCHEN, INVENTORY]
+      responses:
+        '200':
+          description: Active products with variants, modifier groups, and stock availability flags.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /admin/categories:
+    get:
+      tags: [Catalog]
+      operationId: listAdminCategories
+      summary: Paginated category listing
+      security:
+        - sessionCookie: []
+      x-required-permission: catalog
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+            maxLength: 120
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100000
+            default: 1
+        - name: pageSize
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [all, active, inactive]
+            default: all
+      responses:
+        '200':
+          description: Paginated categories.
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [Catalog]
+      operationId: createCategory
+      summary: Create a menu category
+      security:
+        - sessionCookie: []
+      x-required-permission: catalog
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CategoryCreateRequest'
+      responses:
+        '201':
+          description: Category created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/categories/{id}:
+    put:
+      tags: [Catalog]
+      operationId: updateCategory
+      summary: Update a category with optimistic version check
+      security:
+        - sessionCookie: []
+      x-required-permission: catalog
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CategoryUpdateRequest'
+      responses:
+        '200':
+          description: Category updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    delete:
+      tags: [Catalog]
+      operationId: archiveCategory
+      summary: Soft-archive a category with optimistic version check
+      security:
+        - sessionCookie: []
+      x-required-permission: catalog
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VersionBody'
+      responses:
+        '200':
+          description: Category archived.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/stations:
+    get:
+      tags: [Catalog]
+      operationId: listStations
+      summary: List non-archived kitchen stations
+      security:
+        - sessionCookie: []
+      x-required-permission: catalog
+      x-allowed-roles: [OWNER, MANAGER]
+      responses:
+        '200':
+          description: Store stations.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [Catalog]
+      operationId: createStation
+      summary: Create a kitchen station
+      security:
+        - sessionCookie: []
+      x-required-permission: catalog
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StationCreateRequest'
+      responses:
+        '201':
+          description: Station created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/stations/{id}:
+    put:
+      tags: [Catalog]
+      operationId: updateStation
+      summary: Update a kitchen station
+      security:
+        - sessionCookie: []
+      x-required-permission: catalog
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StationUpdateRequest'
+      responses:
+        '200':
+          description: Station updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    delete:
+      tags: [Catalog]
+      operationId: archiveStation
+      summary: Soft-archive a kitchen station
+      security:
+        - sessionCookie: []
+      x-required-permission: catalog
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VersionBody'
+      responses:
+        '200':
+          description: Station archived.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/ingredients:
+    get:
+      tags: [Catalog]
+      operationId: listIngredients
+      summary: List non-archived store ingredients with stock balances
+      security:
+        - sessionCookie: []
+      x-required-permission: inventory | catalog
+      x-allowed-roles: [OWNER, MANAGER, INVENTORY]
+      responses:
+        '200':
+          description: Store ingredients with balances.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [Catalog]
+      operationId: createIngredient
+      summary: Create an ingredient and initialize its zero Balance row
+      security:
+        - sessionCookie: []
+      x-required-permission: inventory
+      x-allowed-roles: [OWNER, MANAGER, INVENTORY]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IngredientCreateRequest'
+      responses:
+        '201':
+          description: Ingredient created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/ingredients/{id}:
+    put:
+      tags: [Catalog]
+      operationId: updateIngredient
+      summary: Update an ingredient
+      security:
+        - sessionCookie: []
+      x-required-permission: inventory
+      x-allowed-roles: [OWNER, MANAGER, INVENTORY]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IngredientUpdateRequest'
+      responses:
+        '200':
+          description: Ingredient updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    delete:
+      tags: [Catalog]
+      operationId: archiveIngredient
+      summary: Soft-archive an unused, zero-balance ingredient
+      security:
+        - sessionCookie: []
+      x-required-permission: inventory
+      x-allowed-roles: [OWNER, MANAGER, INVENTORY]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VersionBody'
+      responses:
+        '200':
+          description: Ingredient archived.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/products:
+    get:
+      tags: [Catalog]
+      operationId: listAdminProducts
+      summary: Search, filter, and paginate store products
+      security:
+        - sessionCookie: []
+      x-required-permission: catalog
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+            maxLength: 120
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100000
+            default: 1
+        - name: pageSize
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [all, active, inactive, archived]
+            default: all
+        - name: categoryId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: stationId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: manualAvailable
+          in: query
+          schema:
+            type: string
+            enum: ['true', 'false']
+      responses:
+        '200':
+          description: Paginated product rows with stockAvailable flag.
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [Catalog]
+      operationId: createProduct
+      summary: Create a product with normalized recipe lines and revision 1
+      security:
+        - sessionCookie: []
+      x-required-permission: catalog
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductCreateRequest'
+      responses:
+        '201':
+          description: Product created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/products/{id}:
+    put:
+      tags: [Catalog]
+      operationId: updateProduct
+      summary: Update a product and validate recipe compatibility with active variants and modifiers
+      description: Validates composeRecipe against all active variant multipliers and modifier recipes before persisting a new RecipeRevision.
+      security:
+        - sessionCookie: []
+      x-required-permission: catalog
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductUpdateRequest'
+      responses:
+        '200':
+          description: Product updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    delete:
+      tags: [Catalog]
+      operationId: archiveProduct
+      summary: Soft-archive a product
+      security:
+        - sessionCookie: []
+      x-required-permission: catalog
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VersionBody'
+      responses:
+        '200':
+          description: Product archived.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/products/{id}/availability:
+    post:
+      tags: [Catalog]
+      operationId: setProductAvailability
+      summary: Toggle manual sale availability for a product
+      security:
+        - sessionCookie: []
+      x-required-permission: catalog
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductAvailabilityRequest'
+      responses:
+        '201':
+          description: Availability updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/products/{id}/variants:
+    get:
+      tags: [Catalog]
+      operationId: listProductVariants
+      summary: List non-archived variants for a product
+      security:
+        - sessionCookie: []
+      x-required-permission: catalog
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+      responses:
+        '200':
+          description: Product variants.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Catalog]
+      operationId: createProductVariant
+      summary: Create a product variant with validated recipe multiplier
+      security:
+        - sessionCookie: []
+      x-required-permission: catalog
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VariantCreateRequest'
+      responses:
+        '201':
+          description: Variant created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/products/{productId}/variants/{id}:
+    put:
+      tags: [Catalog]
+      operationId: updateProductVariant
+      summary: Update a product variant
+      security:
+        - sessionCookie: []
+      x-required-permission: catalog
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/ProductIdPath'
+        - $ref: '#/components/parameters/EntityIdPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VariantUpdateRequest'
+      responses:
+        '200':
+          description: Variant updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/products/{id}/modifier-groups:
+    get:
+      tags: [Catalog]
+      operationId: listProductModifierGroups
+      summary: List non-archived modifier groups and options for a product
+      security:
+        - sessionCookie: []
+      x-required-permission: catalog
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+      responses:
+        '200':
+          description: Modifier groups with nested options.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Catalog]
+      operationId: createModifierGroup
+      summary: Create a modifier group for a product
+      security:
+        - sessionCookie: []
+      x-required-permission: catalog
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModifierGroupCreateRequest'
+      responses:
+        '201':
+          description: Modifier group created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/products/{productId}/modifier-groups/{id}:
+    put:
+      tags: [Catalog]
+      operationId: updateModifierGroup
+      summary: Update a modifier group
+      security:
+        - sessionCookie: []
+      x-required-permission: catalog
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/ProductIdPath'
+        - $ref: '#/components/parameters/EntityIdPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModifierGroupUpdateRequest'
+      responses:
+        '200':
+          description: Modifier group updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/modifier-groups/{id}/options:
+    post:
+      tags: [Catalog]
+      operationId: createModifierOption
+      summary: Create a modifier option inside a modifier group
+      security:
+        - sessionCookie: []
+      x-required-permission: catalog
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModifierCreateRequest'
+      responses:
+        '201':
+          description: Modifier option created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/modifier-groups/{groupId}/options/{id}:
+    put:
+      tags: [Catalog]
+      operationId: updateModifierOption
+      summary: Update a modifier option
+      security:
+        - sessionCookie: []
+      x-required-permission: catalog
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/GroupIdPath'
+        - $ref: '#/components/parameters/EntityIdPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModifierUpdateRequest'
+      responses:
+        '200':
+          description: Modifier option updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /inventory:
+    get:
+      tags: [Inventory]
+      operationId: getInventoryBalances
+      summary: List store ingredient stock balances (onHand, reserved, available)
+      security:
+        - sessionCookie: []
+      x-required-permission: inventory
+      x-allowed-roles: [OWNER, MANAGER, INVENTORY]
+      responses:
+        '200':
+          description: Ingredient balances with computed available quantity string.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /inventory/movements:
+    get:
+      tags: [Inventory]
+      operationId: listRecentInventoryMovements
+      summary: List latest 200 inventory ledger movements
+      security:
+        - sessionCookie: []
+      x-required-permission: inventory
+      x-allowed-roles: [OWNER, MANAGER, INVENTORY]
+      responses:
+        '200':
+          description: Latest 200 immutable Movement rows.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /inventory/adjustments:
+    post:
+      tags: [Inventory]
+      operationId: adjustInventoryBalance
+      summary: Post a reasoned manual stock adjustment
+      description: Rejects adjustments that would reduce onHand below reserved (409 STOCK_BELOW_RESERVED_OR_NOT_FOUND).
+      security:
+        - sessionCookie: []
+      x-required-permission: inventory
+      x-allowed-roles: [OWNER, MANAGER, INVENTORY]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StockAdjustmentRequest'
+      responses:
+        '201':
+          description: Stock adjusted and ADJUST movement posted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/inventory/receipts:
+    post:
+      tags: [Inventory]
+      operationId: createStockReceipt
+      summary: Record a supplier stock receipt and increment ingredient balances atomically
+      security:
+        - sessionCookie: []
+      x-required-permission: inventory
+      x-allowed-roles: [OWNER, MANAGER, INVENTORY]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StockReceiptRequest'
+      responses:
+        '201':
+          description: Stock receipt created and RECEIPT movements recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/inventory/movements:
+    get:
+      tags: [Inventory]
+      operationId: queryInventoryMovements
+      summary: Paginated and filtered inventory ledger query
+      security:
+        - sessionCookie: []
+      x-required-permission: inventory
+      x-allowed-roles: [OWNER, MANAGER, INVENTORY]
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100000
+            default: 1
+        - name: pageSize
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: ingredientId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: kind
+          in: query
+          schema:
+            type: string
+            enum: [RESERVE, CONSUME, RELEASE, WASTE, ADJUST, RECEIPT]
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: Paginated movement ledger rows.
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/outbox/dead-letters:
+    get:
+      tags: [Outbox]
+      operationId: listDeadLetterOutboxEvents
+      summary: List store-scoped dead-lettered Outbox events
+      security:
+        - sessionCookie: []
+      x-required-permission: admin
+      x-allowed-roles: [OWNER, MANAGER]
+      responses:
+        '200':
+          description: Dead-lettered Outbox rows ordered by deadLetteredAt descending.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/OutboxDeadLetterRow'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/outbox/dead-letters/replay:
+    post:
+      tags: [Outbox]
+      operationId: replayDeadLetterOutboxEvents
+      summary: Safely replay store-scoped dead-lettered Outbox events back to pending queue
+      description: Resets deadLetteredAt, attempts, nextAttemptAt, and lastError strictly for undelivered dead-lettered rows within the caller's tenant and store. Never replays already-delivered rows.
+      security:
+        - sessionCookie: []
+      x-required-permission: admin
+      x-allowed-roles: [OWNER, MANAGER]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OutboxReplayRequest'
+      responses:
+        '201':
+          description: Replay summary.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [replayed, ids]
+                properties:
+                  replayed:
+                    type: integer
+                  ids:
+                    type: array
+                    items:
+                      type: string
+                      format: uuid
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/pilot-readiness:
+    get:
+      tags: [Administration]
+      operationId: getPilotReadiness
+      summary: Store configuration and readiness checklist counts
+      security:
+        - sessionCookie: []
+      x-required-permission: admin
+      x-allowed-roles: [OWNER, MANAGER]
+      responses:
+        '200':
+          description: Store metadata and readiness metrics.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [store, checks]
+                properties:
+                  store:
+                    type: object
+                  checks:
+                    type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/invitations:
+    get:
+      tags: [Administration]
+      operationId: listStoreInvitations
+      summary: List latest 100 store staff invitations
+      security:
+        - sessionCookie: []
+      x-required-permission: admin
+      x-allowed-roles: [OWNER, MANAGER]
+      responses:
+        '200':
+          description: Store invitations with computed status (PENDING, ACCEPTED, REVOKED, EXPIRED).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [Administration]
+      operationId: createStoreInvitation
+      summary: Issue a single-use 24-hour staff invitation
+      description: MANAGER cannot invite another MANAGER (403 INVITATION_ROLE_NOT_ALLOWED). Raw invitation token is returned once.
+      security:
+        - sessionCookie: []
+      x-required-permission: admin
+      x-allowed-roles: [OWNER, MANAGER]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InvitationCreateRequest'
+      responses:
+        '201':
+          description: Invitation created with one-time token.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, email, role, expiresAt, token]
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  email:
+                    type: string
+                    format: email
+                  role:
+                    $ref: '#/components/schemas/Role'
+                  expiresAt:
+                    type: string
+                    format: date-time
+                  token:
+                    type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/invitations/{id}/revoke:
+    post:
+      tags: [Administration]
+      operationId: revokeStoreInvitation
+      summary: Revoke a pending store invitation
+      description: MANAGER cannot revoke a MANAGER invitation (403 INVITATION_ROLE_NOT_ALLOWED).
+      security:
+        - sessionCookie: []
+      x-required-permission: admin
+      x-allowed-roles: [OWNER, MANAGER]
+      parameters:
+        - $ref: '#/components/parameters/EntityIdPath'
+      responses:
+        '201':
+          description: Invitation revoked.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, revoked]
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  revoked:
+                    type: boolean
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /public/invitations/{token}/accept:
+    post:
+      tags: [Administration]
+      operationId: acceptStoreInvitation
+      summary: Accept a single-use staff invitation
+      description: Public endpoint protected by dedicated 10 req/min Redis rate limiting. Existing accounts must be active and verify their password; invalid/expired tokens, inactive accounts, and password mismatches all return unified 401 INVITATION_INVALID_OR_EXPIRED to prevent cross-tenant email enumeration.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/Hex64TokenPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InvitationAcceptRequest'
+      responses:
+        '201':
+          description: Invitation accepted and store membership created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [accepted, email, storeId]
+                properties:
+                  accepted:
+                    type: boolean
+                  email:
+                    type: string
+                    format: email
+                  storeId:
+                    type: string
+                    format: uuid
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
