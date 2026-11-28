@@ -93,7 +93,12 @@ export function setRateLimitRedisHealthProbe(probe: () => Promise<string>): void
 }
 
 export async function rateLimitRedisReady(): Promise<boolean> {
-  return !!redisHealthProbe && (await redisHealthProbe()) === 'PONG';
+  if (!redisHealthProbe) return false;
+  try {
+    return (await redisHealthProbe()) === 'PONG';
+  } catch {
+    return false;
+  }
 }
 
 export function configuredRateLimit(

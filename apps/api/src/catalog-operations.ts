@@ -156,13 +156,37 @@ export class CatalogOperations extends CommandBus {
   }
   async updateProduct(ctx: Context, key: string, id: string, version: number, input: ProductInput) {
     return this.command(ctx, key, 'recipe.changed', { action: 'product.update', id, version, ...input }, async tx => {
-      const current = await tx.product.findFirst({ where: { ...scope(ctx), id, deletedAt: null }, include: { recipe: true } });
+      const current = await tx.product.findFirst({
+        where: { ...scope(ctx), id, deletedAt: null },
+        include: {
+          recipe: true,
+          variants: { where: { active: true, deletedAt: null } },
+          modifierGroups: {
+            where: { active: true, deletedAt: null },
+            include: { options: { where: { active: true, deletedAt: null }, include: { recipe: true } } },
+          },
+        },
+      });
       if (!current) throw new NotFoundException('PRODUCT_NOT_FOUND');
       if (current.version !== version) throw new ConflictException('STALE_VERSION');
       const peers = await tx.product.findMany({ where: { ...scope(ctx), id: { not: id }, deletedAt: null }, select: { name: true } });
       if (!uniqueName(input.name, peers.map(p => p.name))) throw new ConflictException('DUPLICATE_NAME');
       const recipe = await this.validateProductRelations(tx, ctx, input);
       if (!recipe.length) throw new BadRequestException('RECIPE_REQUIRED');
+      const multipliers = ['1', ...current.variants.map(v => v.recipeMultiplier.toFixed(3))];
+      const modifierRecipes = current.modifierGroups.flatMap(g =>
+        g.options.map(o => o.recipe.map(r => ({ ingredientId: r.ingredientId, quantity: r.quantity.toFixed(3) }))),
+      );
+      try {
+        for (const multiplier of multipliers) {
+          composeRecipe(recipe, multiplier, []);
+          for (const modRecipe of modifierRecipes) {
+            composeRecipe(recipe, multiplier, modRecipe);
+          }
+        }
+      } catch (error) {
+        throw new BadRequestException(error instanceof Error ? error.message : 'INVALID_PRODUCT_RECIPE');
+      }
       const nextRecipeVersion = current.recipeVersion + (current.recipe.length !== recipe.length || current.recipe.some(old => !recipe.some(next => next.ingredientId === old.ingredientId && new Prisma.Decimal(next.quantity).equals(old.quantity))) ? 1 : 0);
       const row = await tx.product.update({ where: { id }, data: { name: input.name, description: input.description, imageUrl: input.imageUrl ?? null, price: input.price, active: input.active, stationId: input.stationId, categoryId: input.categoryId, manualAvailable: input.manualAvailable, recipeVersion: nextRecipeVersion, version: { increment: 1 } } });
       if (nextRecipeVersion !== current.recipeVersion) {
