@@ -61,6 +61,43 @@ export async function clearKitchenSnapshot(scope: KitchenScope): Promise<void> {
   const db = await openDb(); const tx = db.transaction('snapshots', 'readwrite'); tx.objectStore('snapshots').delete(scopeKey(scope));
   await new Promise<void>((resolve, reject) => { tx.oncomplete = () => { db.close(); resolve(); }; tx.onerror = tx.onabort = () => { db.close(); reject(tx.error ?? new Error('OFFLINE_STORAGE_FAILED')); }; });
 }
+export async function clearKitchenScopeData(scope: KitchenScope): Promise<void> {
+  const db = await openDb();
+  const keyPrefix = scopeKey(scope);
+  const tx = db.transaction(['snapshots', 'commands', 'meta'], 'readwrite');
+  tx.objectStore('snapshots').delete(keyPrefix);
+  tx.objectStore('meta').delete(`${keyPrefix}:device`);
+  tx.objectStore('meta').delete(`${keyPrefix}:sequence`);
+  const commandsStore = tx.objectStore('commands');
+  const all = await new Promise<OfflineKitchenCommand[]>((resolve, reject) => {
+    const req = commandsStore.getAll();
+    req.onsuccess = () => resolve(req.result as OfflineKitchenCommand[]);
+    req.onerror = () => reject(req.error);
+  });
+  for (const row of all) {
+    if (row.scope === keyPrefix) commandsStore.delete(row.commandId);
+  }
+  await new Promise<void>((resolve, reject) => { tx.oncomplete = () => { db.close(); resolve(); }; tx.onerror = tx.onabort = () => { db.close(); reject(tx.error ?? new Error('OFFLINE_STORAGE_FAILED')); }; });
+}
+export async function pruneKitchenCommands(scope: KitchenScope, keepTerminal = 100): Promise<void> {
+  const db = await openDb();
+  const keyPrefix = scopeKey(scope);
+  const tx = db.transaction('commands', 'readwrite');
+  const store = tx.objectStore('commands');
+  const rows = await new Promise<OfflineKitchenCommand[]>((resolve, reject) => {
+    const req = store.getAll();
+    req.onsuccess = () => resolve(req.result as OfflineKitchenCommand[]);
+    req.onerror = () => reject(req.error);
+  });
+  const terminal = rows
+    .filter(row => row.scope === keyPrefix && (row.status === 'CONFIRMED' || row.status === 'REVIEWED'))
+    .sort((a, b) => a.sequence - b.sequence);
+  const excess = terminal.length - Math.max(0, keepTerminal);
+  for (let i = 0; i < excess; i++) {
+    store.delete(terminal[i]!.commandId);
+  }
+  await new Promise<void>((resolve, reject) => { tx.oncomplete = () => { db.close(); resolve(); }; tx.onerror = tx.onabort = () => { db.close(); reject(tx.error ?? new Error('OFFLINE_STORAGE_FAILED')); }; });
+}
 export async function rememberKitchenIdentity(identity: OfflineIdentity): Promise<void> {
   const db = await openDb(); const tx = db.transaction('meta', 'readwrite'); tx.objectStore('meta').put({ key: 'last-kitchen-identity', value: identity });
   await new Promise<void>((resolve, reject) => { tx.oncomplete = () => { db.close(); resolve(); }; tx.onerror = tx.onabort = () => { db.close(); reject(tx.error ?? new Error('OFFLINE_STORAGE_FAILED')); }; });

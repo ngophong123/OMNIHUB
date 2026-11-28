@@ -20,6 +20,7 @@ import { Prisma } from '@prisma/client';
 import { rateLimitRedisReady } from './rate-limit';
 import { publishRealtimeOperationalEvent, realtimeRedisReady } from './realtime';
 import { getLogContext } from './observability/request-context';
+import { listDeadLetterOutbox, replayDeadLetterOutbox } from './outbox';
 
 const ops = new Operations(db);
 const catalog = new CatalogOperations(db);
@@ -143,14 +144,44 @@ class ApiController {
     const c = await context(req);
     const rows = await db.product.findMany({ where: { tenantId: c.tenantId, storeId: c.storeId, active: true, deletedAt: null, station: { active: true, deletedAt: null }, OR: [{ categoryId: null }, { category: { active: true, deletedAt: null } }] }, include: { recipe: true, variants: { where: { active: true, deletedAt: null } }, modifierGroups: { where: { active: true, deletedAt: null }, include: { options: { where: { active: true, deletedAt: null }, include: { recipe: true } } } } }, orderBy: { name: 'asc' } });
     const availability = await catalog.availability(c, rows.map(p => ({ id: p.id, recipe: p.recipe })));
-    const variantAvailability = await catalog.availability(c, rows.flatMap(p => p.variants.map(v => ({ id: v.id, recipe: composeRecipe(p.recipe.map(r => ({ ingredientId: r.ingredientId, quantity: r.quantity.toFixed(3) })), v.recipeMultiplier.toFixed(3), []) }))));
+    const composableVariants: { id: string; recipe: { ingredientId: string; quantity: string }[] }[] = [];
+    for (const p of rows) {
+      const base = p.recipe.map(r => ({ ingredientId: r.ingredientId, quantity: r.quantity.toFixed(3) }));
+      for (const v of p.variants) {
+        try {
+          composableVariants.push({ id: v.id, recipe: composeRecipe(base, v.recipeMultiplier.toFixed(3), []) });
+        } catch {
+          // Guard read path against any legacy invalid multiplier; write path rejects invalid combinations.
+        }
+      }
+    }
+    const variantAvailability = await catalog.availability(c, composableVariants);
     return rows.map(p => ({ ...p, variants: p.variants.map(v => ({ ...v, available: variantAvailability.get(v.id) ?? false })), stockAvailable: availability.get(p.id) ?? false, available: p.manualAvailable && (availability.get(p.id) ?? false) && p.recipe.length > 0 }));
   }
   @Get('orders') async orders(@Req() req: Request) {
     const c = await context(req);
+    if (!allowed(c.role, 'pos') && !allowed(c.role, 'kitchen')) throw new ForbiddenException('PERMISSION_DENIED');
     const device = await kitchenDevice(req, c, c.role === 'KITCHEN');
     const itemScope = device?.stationId ? { ticket: { stationId: device.stationId } } : undefined;
-    return db.order.findMany({ where: { tenantId: c.tenantId, storeId: c.storeId, ...(itemScope ? { items: { some: itemScope } } : {}) }, include: { items: { ...(itemScope ? { where: itemScope } : {}), orderBy: { id: 'asc' } }, tickets: { ...(device?.stationId ? { where: { stationId: device.stationId } } : {}), include: { station: { select: { name: true } } } }, payments: { select: { id: true, amount: true, tendered: true, change: true, method: true, status: true, externalReference: true, splitId: true, businessDate: true, createdAt: true } }, refunds: { orderBy: { createdAt: 'asc' } }, billSplits: true }, orderBy: { createdAt: 'desc' }, take: 100 });
+    const includeFinancials = allowed(c.role, 'cash') || allowed(c.role, 'report');
+    const rows = await db.order.findMany({
+      where: { tenantId: c.tenantId, storeId: c.storeId, ...(itemScope ? { items: { some: itemScope } } : {}) },
+      include: {
+        items: { ...(itemScope ? { where: itemScope } : {}), orderBy: { id: 'asc' } },
+        tickets: { ...(device?.stationId ? { where: { stationId: device.stationId } } : {}), include: { station: { select: { name: true } } } },
+        ...(includeFinancials
+          ? {
+              payments: { select: { id: true, amount: true, tendered: true, change: true, method: true, status: true, externalReference: true, splitId: true, businessDate: true, createdAt: true } },
+              refunds: { orderBy: { createdAt: 'asc' as const } },
+              billSplits: true,
+            }
+          : {}),
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+    });
+    if (includeFinancials) return rows;
+    return rows.map(row => ({ ...row, payments: [], refunds: [], billSplits: [] }));
   }
   @Post('orders') async accept(@Req() req: Request, @Body() body: unknown) { return ops.accept(await context(req), key(req), parse(orderSchema, body)); }
   @Post('orders/:id/cancel') async cancelOrder(@Req() req: Request, @Param('id') id: string, @Body() body: unknown) { return ops.cancelOrder(await context(req), key(req), uuid(id), parse(orderCancelSchema, body)); }
@@ -285,7 +316,11 @@ class ApiController {
     return { id, revoked: true };
   }
   @Post('orders/:id/cash') async cash(@Req() req: Request, @Param('id') id: string, @Body() body: unknown) { return ops.cash(await context(req), key(req), uuid(id), parse(cashSchema, body)); }
-  @Get('orders/:id/payments') async paymentHistory(@Req() req: Request, @Param('id') id: string) { return payments.history(await context(req), uuid(id)); }
+  @Get('orders/:id/payments') async paymentHistory(@Req() req: Request, @Param('id') id: string) {
+    const c = await context(req);
+    if (!allowed(c.role, 'cash') && !allowed(c.role, 'report')) throw new ForbiddenException('PERMISSION_DENIED');
+    return payments.history(c, uuid(id));
+  }
   @Post('orders/:id/payments') async recordPayment(@Req() req: Request, @Param('id') id: string, @Body() body: unknown) { return payments.record(await context(req), key(req), uuid(id), parse(paymentSchema, body)); }
   @Post('orders/:id/splits') async splitBill(@Req() req: Request, @Param('id') id: string, @Body() body: unknown) { return payments.split(await context(req), key(req), uuid(id), parse(billSplitSchema, body)); }
   @Post('payments/:id/verify') async verifyPayment(@Req() req: Request, @Param('id') id: string) { return payments.verify(await context(req), key(req), uuid(id)); }
@@ -376,6 +411,17 @@ class ApiController {
   @Put('admin/modifier-groups/:groupId/options/:id') async updateModifier(@Req() req: Request, @Param('groupId') groupId: string, @Param('id') id: string, @Body() body: unknown) { const input = parse(modifierSchema.extend(versionSchema.shape), body); return catalog.saveModifier(await context(req), key(req), uuid(groupId), uuid(id), input.expectedVersion, input); }
   @Post('admin/inventory/receipts') async receipt(@Req() req: Request, @Body() body: unknown) { return catalog.receipt(await context(req), key(req), parse(receiptSchema, body)); }
   @Get('admin/inventory/movements') async movementList(@Req() req: Request, @Query() query: unknown) { const c = await context(req); if (!allowed(c.role, 'inventory')) throw new ForbiddenException('PERMISSION_DENIED'); return catalog.movements(c, parse(movementListSchema, query)); }
+  @Get('admin/outbox/dead-letters') async listDeadLetters(@Req() req: Request) {
+    const c = await context(req);
+    if (!allowed(c.role, 'admin')) throw new ForbiddenException('PERMISSION_DENIED');
+    return listDeadLetterOutbox(db, { tenantId: c.tenantId, storeId: c.storeId });
+  }
+  @Post('admin/outbox/dead-letters/replay') async replayDeadLetters(@Req() req: Request, @Body() body: unknown) {
+    const c = await context(req);
+    if (!allowed(c.role, 'admin')) throw new ForbiddenException('PERMISSION_DENIED');
+    const parsed = parse(z.object({ ids: z.array(z.string().uuid()).min(1).max(100).optional() }).strict(), body ?? {});
+    return replayDeadLetterOutbox(db, { tenantId: c.tenantId, storeId: c.storeId, ids: parsed.ids });
+  }
 }
 
 @Module({ controllers: [ApiController] })

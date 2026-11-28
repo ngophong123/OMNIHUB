@@ -2,7 +2,7 @@ import { ForbiddenException, HttpException, ServiceUnavailableException, Unautho
 import { createHmac, randomBytes } from 'node:crypto';
 import { Prisma, PrismaClient } from '@prisma/client';
 import type { Role } from '@omnihub/contracts';
-import { digest, verifyPassword } from './domain';
+import { digest, verifyPasswordAsync } from './domain';
 import { apiLogger } from './observability/logger';
 import { apiMetrics } from './observability/metrics';
 import { getLogContext, updateLogContext } from './observability/request-context';
@@ -140,7 +140,7 @@ export async function login(
   const user = await client.user.findUnique({ where: { email: normalizedEmail } });
   // Run the same KDF for an unknown email to reduce username timing differences.
   const fallback = '0'.repeat(32) + ':' + '0'.repeat(128);
-  const valid = verifyPassword(password, user?.passwordHash ?? fallback);
+  const valid = await verifyPasswordAsync(password, user?.passwordHash ?? fallback);
   if (!user || !user.active || !valid) {
     if (protection) {
       let failure: Awaited<ReturnType<typeof recordAccountLoginFailure>>;

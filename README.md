@@ -17,7 +17,7 @@ OMNIHUB handles the flow from POS and QR orders to kitchen preparation, payment,
 
 PostgreSQL stores transactional state. The API uses `Serializable` transactions, append-only ledgers, and a transactional outbox. Redis handles rate limits and realtime fan-out across API replicas. Tenant- and store-scoped access uses `(tenantId, storeId)`; the server selects socket rooms.
 
-The current suites cover `85` unit tests, `36` PostgreSQL integration tests, `9` Redis tests, and `10` Playwright E2E workflows. GitHub Actions also runs CodeQL and dependency audits.
+The current suites cover `93` unit tests, `41` PostgreSQL integration tests, `9` Redis tests, and `12` Playwright E2E workflows. GitHub Actions also runs CodeQL and dependency audits.
 
 ## How it works
 
@@ -45,7 +45,7 @@ Checkout uses integer VND amounts, and cash payments lock the open-shift row wit
 
 - **Frontend:** Next.js `16.4.6` (App Router), React `19.2`, TypeScript `5.9`, `socket.io-client` `4.8`
 - **Backend:** NestJS `12.2` (Express `5.1`), Socket.IO `4.8` + `@socket.io/redis-adapter` `8.3`, Zod `4.6`, Helmet `8.1`, `prom-client` `15.1`
-- **Data & Testing:** PostgreSQL `17` (Docker Compose/CI), Prisma `6.19` (`36` models, `13` migrations), Redis `7` (`ioredis` `5.8`), Vitest `4.1`, Playwright `1.56`
+- **Data & Testing:** PostgreSQL `17` (Docker Compose/CI), Prisma `6.19` (`36` models, `14` migrations), Redis `7` (`ioredis` `5.8`), Vitest `4.1`, Playwright `1.56`
 
 ## Architecture
 
@@ -90,10 +90,10 @@ After startup, check `http://127.0.0.1:4000/health` (`200`), `http://127.0.0.1:4
 Run these checks locally:
 
 - `pnpm typecheck`, `pnpm lint`, `pnpm build`, `pnpm security:hygiene`, `pnpm audit --prod --audit-level high`
-- `pnpm test`: `85` unit tests across `9` files (domain math, auth/commands, error redaction, rate-limit Lua, structured logging, Prometheus metrics, `P2034` retries)
-- `pnpm test:integration`: `36` PostgreSQL integration tests across `4` files (stock races, idempotency, splits, refunds, cash shifts, `SKIP LOCKED` outbox, `/metrics`, device revocation)
+- `pnpm test`: `93` unit tests across `11` files (domain math, async `scrypt`, auth/commands, error redaction, rate-limit Lua, structured logging, Prometheus metrics, Outbox DLQ, `P2034` retries)
+- `pnpm test:integration`: `41` PostgreSQL integration tests across `5` files (stock races, idempotency, splits, partial-payment refunds, cash shifts, RBAC/IDOR, `SKIP LOCKED` outbox DLQ/replay, `/metrics`, device revocation)
 - `pnpm test:redis`: `9` Redis integration tests across `3` files (multi-replica rate limits, Socket.IO Redis adapter fan-out, instant revocation, Redis 7 ACLs)
-- `pnpm test:e2e:ci`: `10` Playwright Chromium end-to-end workflows against built `api`, `worker`, `web`, PostgreSQL 17, and Redis 7
+- `pnpm test:e2e:ci`: `12` Playwright Chromium end-to-end workflows against built `api`, `worker`, `web`, PostgreSQL 17, and Redis 7
 
 ## Known Limitations
 

@@ -4,6 +4,7 @@ import { hashPassword } from '../apps/api/src/domain';
 
 const db = new PrismaClient();
 async function seed() {
+  if (process.env.NODE_ENV === 'production') throw new Error('Demo seed is forbidden when NODE_ENV=production.');
   if (process.env.SEED_DEMO !== 'true' || !process.env.DEMO_PASSWORD || process.env.DEMO_PASSWORD.length < 12) throw new Error('Set SEED_DEMO=true and a DEMO_PASSWORD of at least 12 characters. Local fixtures only.');
   const tenantId = '11111111-1111-4111-8111-111111111111'; const storeId = '22222222-2222-4222-8222-222222222222';
   if (await db.tenant.findUnique({ where: { id: tenantId } })) { console.log('Demo tenant already exists; seed makes no changes.'); return; }

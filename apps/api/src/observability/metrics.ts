@@ -7,7 +7,7 @@ import {
   collectDefaultMetrics,
 } from 'prom-client';
 import { accessLogPath } from '../deployment-security';
-import { apiLogger } from './logger';
+import { apiLogger, workerLogger, type StructuredLogger } from './logger';
 
 export const DEFAULT_OUTBOX_BACKLOG_CACHE_TTL_MS = 5_000;
 export const DEFAULT_HTTP_DURATION_BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10] as const;
@@ -27,6 +27,10 @@ const KNOWN_ERROR_CODES = new Set([
   'METRICS_ACCESS_DENIED',
   'INVALID_INPUT',
   'INVALID_JSON',
+  'INVALID_JSON_BODY',
+  'RESOURCE_NOT_FOUND',
+  'CONCURRENCY_CONFLICT',
+  'INVALID_REFERENCE_OR_INPUT',
   'PAYLOAD_TOO_LARGE',
   'UNAUTHORIZED',
   'FORBIDDEN',
@@ -80,13 +84,13 @@ const DISCONNECT_REASON_MAP: Readonly<Record<string, string>> = {
   'parse error': 'parse_error',
 };
 
-let defaultMetricsInitialized = false;
+const initializedDefaultMetricServices = new Set<string>();
 
 export type OutboxBacklogReader = {
   outbox: {
-    count(args: { where: { deliveredAt: null } }): Promise<number>;
+    count(args: { where: { deliveredAt: null; deadLetteredAt?: null } }): Promise<number>;
     findFirst(args: {
-      where: { deliveredAt: null };
+      where: { deliveredAt: null; deadLetteredAt?: null };
       orderBy: { createdAt: 'asc' };
       select: { createdAt: true };
     }): Promise<{ createdAt: Date } | null>;
@@ -97,6 +101,7 @@ export type MetricsRegistryOptions = {
   service?: string;
   collectDefaultMetrics?: boolean;
   outboxBacklogCacheTtlMs?: number;
+  logger?: StructuredLogger;
 };
 
 export function normalizeHttpMethod(method?: string): string {
@@ -167,12 +172,14 @@ export type MetricsCollector = ReturnType<typeof createMetricsRegistry>;
  */
 export function createMetricsRegistry(options: MetricsRegistryOptions = {}) {
   const registry = new Registry();
+  const serviceKey = options.service ?? 'default';
+  const metricsLogger = options.logger ?? (options.service === 'omnihub-worker' ? workerLogger : apiLogger);
   if (options.service) {
     registry.setDefaultLabels({ service: options.service });
   }
-  if (options.collectDefaultMetrics && !defaultMetricsInitialized) {
-    // Guard Node GC / event-loop PerformanceObservers so default metrics never attach duplicate global observers.
-    defaultMetricsInitialized = true;
+  if (options.collectDefaultMetrics && !initializedDefaultMetricServices.has(serviceKey)) {
+    // Guard Node GC / event-loop PerformanceObservers per service so API and Worker each export default metrics once.
+    initializedDefaultMetricServices.add(serviceKey);
     collectDefaultMetrics({ register: registry });
   }
 
@@ -420,6 +427,15 @@ export function createMetricsRegistry(options: MetricsRegistryOptions = {}) {
         outboxEventsTotal.inc({ outcome: 'invalid_quarantined' }, newlyQuarantined);
       }
     },
+    recordOutboxDeadLettered(count = 1): void {
+      if (closed || count <= 0) return;
+      outboxQuarantinedEventsTotal.inc(count);
+      outboxEventsTotal.inc({ outcome: 'dead_lettered' }, count);
+    },
+    recordOutboxReplayed(count = 1): void {
+      if (closed || count <= 0) return;
+      outboxEventsTotal.inc({ outcome: 'replayed' }, count);
+    },
     recordOutboxBatchDuration(outcome: 'ok' | 'degraded' | 'budget_exceeded' | 'error', durationSeconds: number): void {
       if (closed) return;
       const duration = Number.isFinite(durationSeconds) && durationSeconds >= 0 ? durationSeconds : 0;
@@ -471,9 +487,9 @@ export function createMetricsRegistry(options: MetricsRegistryOptions = {}) {
       backlogRefreshInFlight = (async () => {
         try {
           const [pending, oldest] = await Promise.all([
-            db.outbox.count({ where: { deliveredAt: null } }),
+            db.outbox.count({ where: { deliveredAt: null, deadLetteredAt: null } }),
             db.outbox.findFirst({
-              where: { deliveredAt: null },
+              where: { deliveredAt: null, deadLetteredAt: null },
               orderBy: { createdAt: 'asc' },
               select: { createdAt: true },
             }),
@@ -488,7 +504,7 @@ export function createMetricsRegistry(options: MetricsRegistryOptions = {}) {
         } catch (err) {
           if (!closed) {
             dbErrorsTotal.inc({ code: 'db_unavailable' }, 1);
-            apiLogger.ops('warn', 'METRICS_OUTBOX_REFRESH_FAILED', {
+            metricsLogger.ops('warn', 'METRICS_OUTBOX_REFRESH_FAILED', {
               component: 'metrics',
               errorType: err instanceof Error ? err.name : typeof err,
             });
@@ -516,9 +532,11 @@ export function createMetricsRegistry(options: MetricsRegistryOptions = {}) {
 export const apiMetrics = createMetricsRegistry({
   service: 'omnihub-api',
   collectDefaultMetrics: !process.env.VITEST,
+  logger: apiLogger,
 });
 
 export const workerMetrics = createMetricsRegistry({
   service: 'omnihub-worker',
   collectDefaultMetrics: !process.env.VITEST,
+  logger: workerLogger,
 });

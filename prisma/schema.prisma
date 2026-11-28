@@ -104,6 +104,7 @@ model Session {
   user      User     @relation(fields: [userId], references: [id])
 
   @@index([expiresAt])
+  @@index([tenantId, storeId, userId, expiresAt])
 }
 
 model KitchenDevice {
@@ -368,6 +369,7 @@ model Movement {
   receipt       StockReceipt? @relation(fields: [tenantId, storeId, receiptId], references: [tenantId, storeId, id])
 
   @@index([tenantId, storeId, ingredientId, createdAt])
+  @@index([tenantId, storeId, createdAt])
 }
 
 model Payment {
@@ -423,6 +425,8 @@ model Refund {
   @@unique([tenantId, storeId, commandKey])
   @@unique([tenantId, storeId, id])
   @@index([tenantId, storeId, orderId, createdAt])
+  @@index([tenantId, storeId, paymentId, status])
+  @@index([tenantId, storeId, status, businessDate])
 }
 
 model RefundDecision {
@@ -519,6 +523,7 @@ model CashMovement {
   @@unique([tenantId, storeId, commandKey])
   @@unique([tenantId, storeId, refundId])
   @@index([tenantId, storeId, shiftId, createdAt])
+  @@index([tenantId, storeId, paymentId, kind])
 }
 
 model CommandReceipt {
@@ -547,19 +552,25 @@ model Audit {
   store         Store    @relation(fields: [tenantId, storeId], references: [tenantId, id])
 
   @@index([tenantId, storeId, createdAt])
+  @@index([tenantId, storeId, entityId, createdAt])
 }
 
 model Outbox {
-  id            String    @id @default(uuid()) @db.Uuid
-  tenantId      String    @db.Uuid
-  storeId       String    @db.Uuid
-  type          String
-  aggregateId   String    @db.Uuid
-  version       Int
-  correlationId String
-  createdAt     DateTime  @default(now())
-  deliveredAt   DateTime?
-  store         Store     @relation(fields: [tenantId, storeId], references: [tenantId, id])
+  id             String    @id @default(uuid()) @db.Uuid
+  tenantId       String    @db.Uuid
+  storeId        String    @db.Uuid
+  type           String
+  aggregateId    String    @db.Uuid
+  version        Int
+  correlationId  String
+  createdAt      DateTime  @default(now())
+  deliveredAt    DateTime?
+  attempts       Int       @default(0)
+  maxAttempts    Int       @default(5)
+  nextAttemptAt  DateTime  @default(now())
+  lastError      String?
+  deadLetteredAt DateTime?
+  store          Store     @relation(fields: [tenantId, storeId], references: [tenantId, id])
 
   @@index([deliveredAt, createdAt])
 }

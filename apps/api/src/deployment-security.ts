@@ -4,6 +4,7 @@ import { isIP } from 'node:net';
 export function validateDeployment(env: NodeJS.ProcessEnv = process.env): void {
   if (env.NODE_ENV !== 'production') return;
   const fail = (name: string): never => { throw new Error(`UNSAFE_DEPLOYMENT_${name}`); };
+  if (env.SEED_DEMO === 'true') fail('SEED_DEMO');
   const url = (name: string) => { try { return new URL(env[name] ?? ''); } catch { return fail(name); } };
   const origin = url('WEB_ORIGIN');
   if (origin.protocol !== 'https:' || origin.origin !== env.WEB_ORIGIN || origin.username || origin.password) fail('WEB_ORIGIN');

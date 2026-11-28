@@ -9,7 +9,7 @@ export const entitySchema = z.object({ name: nameSchema, active: z.boolean() }).
 export const ingredientSchema = entitySchema.extend({ unit: z.enum(['g', 'ml', 'piece']), lowStockThreshold: z.string().regex(/^\d+(\.\d{1,3})?$/).refine(v => Number(v) <= 1_000_000_000) }).strict();
 export const productSchema = entitySchema.extend({ description: z.string().trim().max(1000), imageUrl: z.string().url().max(1000).nullable().optional().refine(v => !v || new URL(v).protocol === 'https:', 'HTTPS_REQUIRED'), price: z.number().int().min(0).max(1_000_000_000), stationId: z.string().uuid(), categoryId: z.string().uuid().nullable(), manualAvailable: z.boolean(), recipe: recipeSchema.refine(v => v.length > 0) }).strict();
 export const variantSchema = entitySchema.extend({ price: z.number().int().min(0).max(1_000_000_000), recipeMultiplier: quantitySchema.refine(v => Number(v) <= 1000) }).strict();
-export const groupSchema = entitySchema.extend({ minSelections: z.number().int().min(0).max(20), maxSelections: z.number().int().min(1).max(20) }).strict();
+export const groupSchema = entitySchema.extend({ minSelections: z.number().int().min(0).max(20), maxSelections: z.number().int().min(1).max(20) }).strict().refine(group => group.minSelections <= group.maxSelections, 'INVALID_SELECTION_RANGE');
 export const modifierSchema = entitySchema.extend({ priceDelta: z.number().int().min(0).max(1_000_000_000), recipe: recipeSchema.refine(v => v.length > 0) }).strict();
 export const receiptSchema = z.object({ reference: z.string().trim().min(3).max(80), supplier: nameSchema, lines: recipeSchema.refine(v => v.length > 0) }).strict();
 export const listSchema = z.object({

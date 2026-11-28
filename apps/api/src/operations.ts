@@ -87,6 +87,9 @@ export class Operations extends CommandBus {
     const permission: Permission = body.action === 'START' || body.action === 'READY' ? 'kitchen' : body.action === 'HANDOFF' ? 'handoff' : 'cancelPending';
     const events: Record<ItemCommand['action'], EventType> = { START: 'kitchen.item.started', READY: 'kitchen.item.ready', HANDOFF: 'kitchen.item.handed_off', CANCEL: 'order.item.cancelled' };
     return this.command(ctx, key, events[body.action], { itemId, ...body }, async (tx, current) => {
+      if (current.role === 'KITCHEN' && !options?.kitchenDeviceId) {
+        throw new ForbiddenException('KITCHEN_DEVICE_REQUIRED');
+      }
       let authorizedStationId: string | null = null;
       if (options?.kitchenDeviceId) {
         const devices = await tx.$queryRaw<{ stationId: string | null }[]>`
@@ -111,6 +114,10 @@ export class Operations extends CommandBus {
       if (order.version !== body.expectedVersion || order.status !== 'ACCEPTED' || order.paymentStatus !== 'UNPAID') throw new ConflictException('STALE_OR_TERMINAL_ORDER');
       const activePayments = await tx.payment.count({ where: { ...scope(ctx), orderId: order.id, status: { in: ['PENDING','SETTLED'] } } });
       if (activePayments > 0) throw new ConflictException('ORDER_PAYMENT_IN_PROGRESS');
+      if (body.action === 'CANCEL') {
+        const billSplits = await tx.billSplit.count({ where: { ...scope(ctx), orderId: order.id } });
+        if (billSplits > 0) throw new ConflictException('ORDER_HAS_BILL_SPLITS');
+      }
       const next = transition(item.status, body.action);
       if (!next) throw new ConflictException('INVALID_TRANSITION');
       if (body.action === 'CANCEL' && item.status !== 'PENDING') requirePermission(current, 'cancelStarted');
@@ -147,6 +154,8 @@ export class Operations extends CommandBus {
       if (order.status !== 'ACCEPTED' || order.paymentStatus !== 'UNPAID' || order.version !== input.expectedVersion) throw new ConflictException('ORDER_NOT_CANCELLABLE');
       const activePayments = await tx.payment.count({ where: { ...scope(ctx), orderId, status: { in: ['PENDING','SETTLED'] } } });
       if (activePayments > 0) throw new ConflictException('ORDER_PAYMENT_IN_PROGRESS');
+      const billSplits = await tx.billSplit.count({ where: { ...scope(ctx), orderId } });
+      if (billSplits > 0) throw new ConflictException('ORDER_HAS_BILL_SPLITS');
       const started = order.items.some(item => item.status === 'PREPARING' || item.status === 'READY' || item.status === 'HANDED_OFF');
       if (started && !['OWNER','MANAGER'].includes(current.role)) throw new ForbiddenException('CANCEL_STARTED_REQUIRES_MANAGER');
       const now = new Date();

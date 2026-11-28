@@ -4,7 +4,13 @@
 }
 https://localhost:8443 {
   tls internal
-  header Strict-Transport-Security "max-age=31536000"
+  header {
+    Strict-Transport-Security "max-age=31536000"
+    X-Frame-Options "DENY"
+    X-Content-Type-Options "nosniff"
+    Referrer-Policy "no-referrer"
+    Permissions-Policy "camera=(), microphone=(), geolocation=()"
+  }
   respond /metrics* 403
   reverse_proxy web:3000 {
     header_up X-Forwarded-For {remote_host}
@@ -13,7 +19,11 @@ https://localhost:8443 {
 }
 https://localhost:8444 {
   tls internal
-  header Strict-Transport-Security "max-age=31536000"
+  header {
+    Strict-Transport-Security "max-age=31536000"
+    X-Content-Type-Options "nosniff"
+    Referrer-Policy "no-referrer"
+  }
   respond /metrics* 403
   reverse_proxy api:4000 {
     header_up X-Forwarded-For {remote_host}
