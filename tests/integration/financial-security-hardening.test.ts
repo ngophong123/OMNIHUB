@@ -4,15 +4,22 @@ import type http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { PrismaClient } from '@prisma/client';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import Redis from '../../apps/api/node_modules/ioredis';
 import { Operations } from '../../apps/api/src/operations';
 import { CatalogOperations } from '../../apps/api/src/catalog-operations';
 import { CashShifts } from '../../apps/api/src/cash-shifts';
 import { Payments } from '../../apps/api/src/payments';
 import { PilotAdmin } from '../../apps/api/src/pilot-admin';
-import { digest, hashPasswordAsync } from '../../apps/api/src/domain';
-import { listDeadLetterOutbox, processOutboxBatch, replayDeadLetterOutbox } from '../../apps/api/src/outbox';
+import { cashExpected, digest, hashPasswordAsync } from '../../apps/api/src/domain';
+import {
+  createOutboxWorkerLoop,
+  listDeadLetterOutbox,
+  OUTBOX_CHANNEL,
+  processOutboxBatch,
+  replayDeadLetterOutbox,
+} from '../../apps/api/src/outbox';
 import { setRateLimitRedisHealthProbe } from '../../apps/api/src/rate-limit';
-import { setRealtimeRedisHealthProbe } from '../../apps/api/src/realtime';
+import { createEventDeduplicator, setRealtimeRedisHealthProbe } from '../../apps/api/src/realtime';
 import type { Context } from '../../apps/api/src/auth';
 
 const TEST_ORIGIN = 'http://localhost:3000';
@@ -104,6 +111,41 @@ async function createStoreFixture() {
   });
 
   return { tenantId, storeId, password, users, ...data };
+}
+
+async function addStoreMember(
+  store: { tenantId: string; storeId: string; password: string },
+  role: RoleName,
+): Promise<{ id: string; email: string; token: string; ctx: Context }> {
+  const userId = randomUUID();
+  const email = `${role.toLowerCase()}-extra-${userId.slice(0, 8)}@test.invalid`;
+  const token = randomUUID().replaceAll('-', '') + randomUUID().replaceAll('-', '');
+  const tokenHash = digest(token);
+  const expiresAt = new Date(Date.now() + 3600_000);
+  const passwordHash = await hashPasswordAsync(store.password);
+  await db.$transaction(async tx => {
+    await tx.user.create({ data: { id: userId, email, passwordHash } });
+    await tx.membership.create({
+      data: { userId, tenantId: store.tenantId, storeId: store.storeId, role },
+    });
+    await tx.session.create({
+      data: { tenantId: store.tenantId, storeId: store.storeId, userId, tokenHash, expiresAt },
+    });
+  });
+  return {
+    id: userId,
+    email,
+    token,
+    ctx: {
+      tenantId: store.tenantId,
+      storeId: store.storeId,
+      userId,
+      role,
+      tokenHash,
+      expiresAt,
+      correlationId: randomUUID(),
+    },
+  };
 }
 
 async function createHandedOffOrder(ctx: Context, productId: string, quantity = 1) {
@@ -263,7 +305,24 @@ describe('P0/P1 Financial integrity, RBAC/IDOR, DB constraints, readiness, and O
       status: 'ACCEPTED',
       paymentStatus: 'REFUNDED',
     });
-  });
+    expect(await db.payment.findUniqueOrThrow({ where: { id: partialPay.id } })).toMatchObject({
+      status: 'SETTLED',
+      amount: 15_000,
+    });
+    const shiftMovementsAfterFullRefund = await db.cashMovement.findMany({
+      where: { shiftId: shift.id, kind: 'REFUND' },
+      orderBy: { createdAt: 'asc' },
+    });
+    expect(shiftMovementsAfterFullRefund.map(m => m.amount)).toEqual([5_000, 8_000, 2_000]);
+    expect(cashExpected(50_000, 15_000, shiftMovementsAfterFullRefund)).toBe(50_000);
+    // Attempting any additional refund once total refunded reaches captured amount (15,000) is rejected
+    await expect(
+      paymentOps.requestRefund(cashier.ctx, randomUUID(), partialPay.id, {
+        amount: 1_000,
+        reason: 'Over-refund after full captured ceiling',
+      }),
+    ).rejects.toThrow('REFUND_EXCEEDS_PAYMENT');
+  }, 20_000);
 
   it('enforces shift ownership, closed-shift, cross-store, balance, invalid payment state, and cash movement refund authorization', async () => {
     const storeA = await createStoreFixture();
@@ -377,7 +436,20 @@ describe('P0/P1 Financial integrity, RBAC/IDOR, DB constraints, readiness, and O
         shiftId: shiftA.id,
       }),
     ).rejects.toThrow('SHIFT_NOT_OPEN');
-  });
+    // Verify PostgreSQL state remained completely untouched after SHIFT_NOT_OPEN rejection
+    expect(await db.refund.findUniqueOrThrow({ where: { id: refund.id } })).toMatchObject({
+      status: 'REQUESTED',
+      approvedBy: null,
+      approvedAt: null,
+    });
+    expect(await db.refundDecision.count({ where: { refundId: refund.id } })).toBe(0);
+    expect(await db.cashMovement.count({ where: { refundId: refund.id } })).toBe(0);
+    expect(await db.cashShift.findUniqueOrThrow({ where: { id: shiftA.id } })).toMatchObject({
+      status: 'CLOSED',
+      countedAmount: 5_000,
+      version: shiftBeforeClose.version + 1,
+    });
+  }, 20_000);
 
   it('enforces BillSplit integrity, CashShift DB constraints/triggers, and required PostgreSQL indexes', async () => {
     const store = await createStoreFixture();
@@ -565,7 +637,7 @@ describe('P0/P1 Financial integrity, RBAC/IDOR, DB constraints, readiness, and O
     });
     expect(badInput.status).toBe(400);
     expect(shift.id).toBeTruthy();
-  });
+  }, 20_000);
 
   it('persists Outbox retries, transitions exhausted rows to DLQ, and replays them via admin API', async () => {
     const storeA = await createStoreFixture();
@@ -645,4 +717,325 @@ describe('P0/P1 Financial integrity, RBAC/IDOR, DB constraints, readiness, and O
       ids: [],
     });
   });
+
+  it('prevents double approval and duplicate cash movements when two independent managers approve the same refund concurrently', async () => {
+    const store = await createStoreFixture();
+    const managerA = store.users.MANAGER;
+    const managerB = await addStoreMember(store, 'MANAGER');
+    const cashier = store.users.CASHIER;
+
+    const shift = await cashShifts.open(cashier.ctx, randomUUID(), {
+      registerId: store.register.id,
+      openingAmount: 50_000,
+    });
+    const order = await createHandedOffOrder(store.users.OWNER.ctx, store.product.id);
+    const payment = await paymentOps.record(cashier.ctx, randomUUID(), order.id, {
+      method: 'CASH',
+      amount: 35_000,
+      tendered: 35_000,
+    });
+    const pendingRefund = await paymentOps.requestRefund(cashier.ctx, randomUUID(), payment.id, {
+      amount: 10_000,
+      reason: 'Concurrent manager approval test',
+    });
+
+    const results = await Promise.allSettled([
+      paymentOps.decideRefund(managerA.ctx, randomUUID(), pendingRefund.id, {
+        decision: 'APPROVED',
+        reason: 'Manager A concurrent approval',
+        shiftId: shift.id,
+      }),
+      paymentOps.decideRefund(managerB.ctx, randomUUID(), pendingRefund.id, {
+        decision: 'APPROVED',
+        reason: 'Manager B concurrent approval',
+        shiftId: shift.id,
+      }),
+    ]);
+
+    const fulfilled = results.filter((r): r is PromiseFulfilledResult<{ id: string; version: number }> => r.status === 'fulfilled');
+    const rejected = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(String((rejected[0]!.reason as Error).message)).toMatch(/REFUND_ALREADY_DECIDED|CONCURRENT_CHANGE_RETRY_SAME_KEY/);
+
+    const winnerId = results[0]!.status === 'fulfilled' ? managerA.id : managerB.id;
+    const refundRow = await db.refund.findUniqueOrThrow({ where: { id: pendingRefund.id } });
+    expect(refundRow).toMatchObject({
+      status: 'APPROVED',
+      approvedBy: winnerId,
+    });
+    expect(refundRow.approvedAt).not.toBeNull();
+
+    const decisions = await db.refundDecision.findMany({ where: { refundId: pendingRefund.id } });
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toMatchObject({ actorId: winnerId, decision: 'APPROVED' });
+
+    const refundMovements = await db.cashMovement.findMany({ where: { refundId: pendingRefund.id } });
+    expect(refundMovements).toHaveLength(1);
+    expect(refundMovements[0]).toMatchObject({
+      shiftId: shift.id,
+      actorId: winnerId,
+      kind: 'REFUND',
+      amount: 10_000,
+    });
+
+    // Drawer balance deducted exactly once: 50,000 opening + 35,000 cash sale - 10,000 refund = 75,000
+    const allShiftMovements = await db.cashMovement.findMany({ where: { shiftId: shift.id } });
+    expect(cashExpected(50_000, 35_000, allShiftMovements)).toBe(75_000);
+
+    const decisionAudits = await db.audit.findMany({
+      where: { tenantId: store.tenantId, storeId: store.storeId, entityId: pendingRefund.id, action: 'refund.decided' },
+    });
+    expect(decisionAudits).toHaveLength(1);
+    expect(decisionAudits[0]!.actorId).toBe(winnerId);
+
+    const decisionOutbox = await db.outbox.findMany({
+      where: { tenantId: store.tenantId, storeId: store.storeId, aggregateId: pendingRefund.id, type: 'refund.decided' },
+    });
+    expect(decisionOutbox).toHaveLength(1);
+  }, 20_000);
+
+  it('prevents over-refund when two independent staff accounts concurrently request refunds on the same payment', async () => {
+    const store = await createStoreFixture();
+    const cashierA = store.users.CASHIER;
+    const cashierB = await addStoreMember(store, 'CASHIER');
+
+    await cashShifts.open(cashierA.ctx, randomUUID(), {
+      registerId: store.register.id,
+      openingAmount: 20_000,
+    });
+    const order = await createHandedOffOrder(store.users.OWNER.ctx, store.product.id);
+    const payment = await paymentOps.record(cashierA.ctx, randomUUID(), order.id, {
+      method: 'CASH',
+      amount: 10_000,
+      tendered: 10_000,
+    });
+
+    // Two distinct cashiers with distinct idempotency keys concurrently request 7,000 each against 10,000 payment
+    const concurrent = await Promise.allSettled([
+      paymentOps.requestRefund(cashierA.ctx, randomUUID(), payment.id, {
+        amount: 7_000,
+        reason: 'Cashier A concurrent refund request',
+      }),
+      paymentOps.requestRefund(cashierB.ctx, randomUUID(), payment.id, {
+        amount: 7_000,
+        reason: 'Cashier B concurrent refund request',
+      }),
+    ]);
+
+    expect(concurrent.filter(r => r.status === 'fulfilled')).toHaveLength(1);
+    const rejected = concurrent.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
+    expect(rejected).toHaveLength(1);
+    expect(String((rejected[0]!.reason as Error).message)).toMatch(/REFUND_EXCEEDS_PAYMENT|CONCURRENT_CHANGE_RETRY_SAME_KEY/);
+
+    const winnerCashierId = concurrent[0]!.status === 'fulfilled' ? cashierA.id : cashierB.id;
+    const loserCashier = concurrent[0]!.status === 'fulfilled' ? cashierB : cashierA;
+
+    const refundsInDb = await db.refund.findMany({ where: { paymentId: payment.id } });
+    expect(refundsInDb).toHaveLength(1);
+    expect(refundsInDb[0]).toMatchObject({
+      amount: 7_000,
+      status: 'REQUESTED',
+      requestedBy: winnerCashierId,
+    });
+
+    // Remaining refundable balance is strictly 3,000: 3,001 must fail, 3,000 must succeed
+    await expect(
+      paymentOps.requestRefund(loserCashier.ctx, randomUUID(), payment.id, {
+        amount: 3_001,
+        reason: 'Exceeds remaining 3,000',
+      }),
+    ).rejects.toThrow('REFUND_EXCEEDS_PAYMENT');
+
+    await paymentOps.requestRefund(loserCashier.ctx, randomUUID(), payment.id, {
+      amount: 3_000,
+      reason: 'Exact remaining 3,000',
+    });
+
+    const finalRefunds = await db.refund.findMany({
+      where: { paymentId: payment.id },
+      orderBy: { createdAt: 'asc' },
+    });
+    expect(finalRefunds).toHaveLength(2);
+    expect(finalRefunds.reduce((sum, r) => sum + r.amount, 0)).toBe(10_000);
+  }, 20_000);
+
+  it('resumes pending and retryable Outbox events across a real worker stop/restart without duplicate business side effects', async () => {
+    const store = await createStoreFixture();
+    const baseMs = Date.now() - 5_000;
+    const ev1 = await db.outbox.create({
+      data: {
+        tenantId: store.tenantId,
+        storeId: store.storeId,
+        type: 'order.accepted',
+        aggregateId: randomUUID(),
+        version: 1,
+        correlationId: randomUUID(),
+        createdAt: new Date(baseMs),
+        nextAttemptAt: new Date(baseMs),
+        maxAttempts: 3,
+      },
+    });
+    const ev2 = await db.outbox.create({
+      data: {
+        tenantId: store.tenantId,
+        storeId: store.storeId,
+        type: 'order.accepted',
+        aggregateId: randomUUID(),
+        version: 1,
+        correlationId: randomUUID(),
+        createdAt: new Date(baseMs + 100),
+        nextAttemptAt: new Date(baseMs + 100),
+        maxAttempts: 3,
+      },
+    });
+    const ev3 = await db.outbox.create({
+      data: {
+        tenantId: store.tenantId,
+        storeId: store.storeId,
+        type: 'order.accepted',
+        aggregateId: randomUUID(),
+        version: 1,
+        correlationId: randomUUID(),
+        createdAt: new Date(baseMs + 200),
+        nextAttemptAt: new Date(baseMs + 200),
+        maxAttempts: 3,
+      },
+    });
+
+    const redisUrl = process.env.REDIS_URL ?? 'redis://localhost:6379';
+    const pubClient = new Redis(redisUrl, { lazyConnect: true, enableOfflineQueue: false, maxRetriesPerRequest: 1, retryStrategy: () => null });
+    const subClient = new Redis(redisUrl, { lazyConnect: true, enableOfflineQueue: false, maxRetriesPerRequest: 1, retryStrategy: () => null });
+    pubClient.on('error', () => undefined);
+    subClient.on('error', () => undefined);
+
+    const deduper = createEventDeduplicator();
+    const rawReceived: string[] = [];
+    const appliedCountByEvent = new Map<string, number>();
+    const payloadsByEvent = new Map<string, string>();
+    const targetIds = new Set([ev1.id, ev2.id, ev3.id]);
+
+    try {
+      await Promise.all([pubClient.connect(), subClient.connect()]);
+      expect(await pubClient.ping()).toBe('PONG');
+      await subClient.subscribe(OUTBOX_CHANNEL);
+
+      subClient.on('message', (_channel, message) => {
+        try {
+          const parsed = JSON.parse(message) as { eventId?: string; tenantId?: string };
+          if (parsed.tenantId !== store.tenantId || !parsed.eventId || !targetIds.has(parsed.eventId)) return;
+          rawReceived.push(parsed.eventId);
+          payloadsByEvent.set(parsed.eventId, message);
+          if (deduper.has(parsed.eventId)) return;
+          deduper.mark(parsed.eventId);
+          appliedCountByEvent.set(parsed.eventId, (appliedCountByEvent.get(parsed.eventId) ?? 0) + 1);
+        } catch {
+          // Ignore unrelated channel messages
+        }
+      });
+
+      // Worker 1: delivers ev1 via real Redis, hits a transient Redis fault on ev2 (scheduling retry in DB),
+      // and stops cleanly before processing ev3.
+      let ev2FailedOnce = false;
+      let worker1StopTriggered: Promise<void> | null = null;
+      const worker1 = createOutboxWorkerLoop({
+        db,
+        redis: {
+          publish: async (channel, payload) => {
+            const parsed = JSON.parse(payload) as { eventId?: string };
+            if (parsed.eventId === ev2.id && !ev2FailedOnce) {
+              ev2FailedOnce = true;
+              worker1StopTriggered = worker1.stop(5_000);
+              throw new Error('REDIS_TRANSIENT_BEFORE_RESTART');
+            }
+            return pubClient.publish(channel, payload);
+          },
+        },
+        batchSize: 10,
+        pollIntervalMs: 30,
+        baseBackoffMs: 50,
+        maxBackoffMs: 100,
+      });
+
+      const run1 = worker1.run();
+      const stopDeadline = Date.now() + 10_000;
+      while (!ev2FailedOnce && Date.now() < stopDeadline) {
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      expect(ev2FailedOnce).toBe(true);
+      await worker1StopTriggered;
+      await run1;
+
+      // Verify PostgreSQL persisted exact mid-restart state while worker is offline
+      const ev1Mid = await db.outbox.findUniqueOrThrow({ where: { id: ev1.id } });
+      const ev2Mid = await db.outbox.findUniqueOrThrow({ where: { id: ev2.id } });
+      const ev3Mid = await db.outbox.findUniqueOrThrow({ where: { id: ev3.id } });
+      expect(ev1Mid.deliveredAt).not.toBeNull();
+      expect(ev2Mid.deliveredAt).toBeNull();
+      expect(ev2Mid.deadLetteredAt).toBeNull();
+      expect(ev2Mid.attempts).toBe(1);
+      expect(ev2Mid.lastError).toContain('REDIS_TRANSIENT_BEFORE_RESTART');
+      expect(ev3Mid.deliveredAt).toBeNull();
+      expect(ev3Mid.deadLetteredAt).toBeNull();
+      expect(ev3Mid.attempts).toBe(0);
+
+      // Worker 2 (fresh instance simulating process restart): resumes pending ev3 and retryable ev2 once due
+      const worker2 = createOutboxWorkerLoop({
+        db,
+        redis: { publish: (channel, payload) => pubClient.publish(channel, payload) },
+        batchSize: 10,
+        pollIntervalMs: 30,
+        baseBackoffMs: 50,
+        maxBackoffMs: 100,
+      });
+      const run2 = worker2.run();
+      const recoverDeadline = Date.now() + 10_000;
+      while (Date.now() < recoverDeadline) {
+        const remaining = await db.outbox.count({
+          where: { id: { in: [ev1.id, ev2.id, ev3.id] }, deliveredAt: null },
+        });
+        if (remaining === 0 && appliedCountByEvent.size === 3) break;
+        await new Promise(resolve => setTimeout(resolve, 30));
+      }
+      await worker2.stop(5_000);
+      await run2;
+
+      // Verify final PostgreSQL state: all 3 delivered, ev1 untouched since before restart
+      const [ev1End, ev2End, ev3End] = await Promise.all([
+        db.outbox.findUniqueOrThrow({ where: { id: ev1.id } }),
+        db.outbox.findUniqueOrThrow({ where: { id: ev2.id } }),
+        db.outbox.findUniqueOrThrow({ where: { id: ev3.id } }),
+      ]);
+      expect(ev1End.deliveredAt?.getTime()).toBe(ev1Mid.deliveredAt?.getTime());
+      expect(ev2End.deliveredAt).not.toBeNull();
+      expect(ev2End.attempts).toBe(1);
+      expect(ev3End.deliveredAt).not.toBeNull();
+      expect(ev3End.attempts).toBe(0);
+
+      // Consumer observed all 3 events over real Redis pub/sub and applied each exactly once
+      expect(appliedCountByEvent.get(ev1.id)).toBe(1);
+      expect(appliedCountByEvent.get(ev2.id)).toBe(1);
+      expect(appliedCountByEvent.get(ev3.id)).toBe(1);
+
+      // Under at-least-once delivery (e.g., crash after publish before DB commit), consumer deduplication suppresses duplicates
+      const ev1Payload = payloadsByEvent.get(ev1.id)!;
+      expect(ev1Payload).toBeTruthy();
+      await pubClient.publish(OUTBOX_CHANNEL, ev1Payload);
+      await new Promise(resolve => setTimeout(resolve, 100));
+      expect(rawReceived.filter(id => id === ev1.id).length).toBeGreaterThanOrEqual(2);
+      expect(appliedCountByEvent.get(ev1.id)).toBe(1);
+
+      // Replaying already-delivered Outbox rows is a no-op and produces zero additional deliveries
+      expect(
+        await replayDeadLetterOutbox(db, {
+          tenantId: store.tenantId,
+          storeId: store.storeId,
+          ids: [ev1.id, ev2.id, ev3.id],
+        }),
+      ).toEqual({ replayed: 0, ids: [] });
+    } finally {
+      await subClient.quit().catch(() => subClient.disconnect());
+      await pubClient.quit().catch(() => pubClient.disconnect());
+    }
+  }, 20_000);
 });
