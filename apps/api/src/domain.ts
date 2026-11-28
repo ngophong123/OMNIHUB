@@ -1,14 +1,37 @@
-import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, scrypt, scryptSync, timingSafeEqual } from 'node:crypto';
 import type { Role } from '@omnihub/contracts';
+
+const SCRYPT_OPTIONS = { N: 16384, r: 8, p: 1 } as const;
+const SCRYPT_KEY_LENGTH = 64;
+
+function scryptAsync(password: string, salt: string): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    scrypt(password, salt, SCRYPT_KEY_LENGTH, SCRYPT_OPTIONS, (err, derivedKey) => {
+      if (err) reject(err);
+      else resolve(derivedKey);
+    });
+  });
+}
 
 export function hashPassword(password: string): string {
   const salt = randomBytes(16).toString('hex');
-  return `${salt}:${scryptSync(password, salt, 64, { N: 16384, r: 8, p: 1 }).toString('hex')}`;
+  return `${salt}:${scryptSync(password, salt, SCRYPT_KEY_LENGTH, SCRYPT_OPTIONS).toString('hex')}`;
 }
 export function verifyPassword(password: string, encoded: string): boolean {
   const [salt, hash] = encoded.split(':');
   if (!salt || !hash || !/^[a-f0-9]{128}$/.test(hash)) return false;
-  return timingSafeEqual(Buffer.from(hash, 'hex'), scryptSync(password, salt, 64, { N: 16384, r: 8, p: 1 }));
+  return timingSafeEqual(Buffer.from(hash, 'hex'), scryptSync(password, salt, SCRYPT_KEY_LENGTH, SCRYPT_OPTIONS));
+}
+export async function hashPasswordAsync(password: string): Promise<string> {
+  const salt = randomBytes(16).toString('hex');
+  const derived = await scryptAsync(password, salt);
+  return `${salt}:${derived.toString('hex')}`;
+}
+export async function verifyPasswordAsync(password: string, encoded: string): Promise<boolean> {
+  const [salt, hash] = encoded.split(':');
+  if (!salt || !hash || !/^[a-f0-9]{128}$/.test(hash)) return false;
+  const derived = await scryptAsync(password, salt);
+  return timingSafeEqual(Buffer.from(hash, 'hex'), derived);
 }
 export const digest = (value: string): string => createHash('sha256').update(value).digest('hex');
 export type Permission = 'read' | 'pos' | 'kitchen' | 'handoff' | 'cancelPending' | 'cancelStarted' | 'cash' | 'cashShift' | 'cashApprove' | 'inventory' | 'report' | 'catalog' | 'admin';

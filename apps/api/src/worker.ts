@@ -68,8 +68,10 @@ let stopping = false;
 async function shutdown(): Promise<void> {
   if (stopping) return;
   stopping = true;
+  const deadline = setTimeout(() => process.exit(1), 25_000);
+  deadline.unref();
   try {
-    await loop.stop(10_000);
+    await loop.stop(20_000);
     if (metricsServer) {
       await new Promise<void>(resolve => metricsServer?.close(() => resolve()));
     }
@@ -90,6 +92,7 @@ async function shutdown(): Promise<void> {
     metricsRateLimitStore?.shutdown();
     workerMetrics.close();
     await workerLogger.close();
+    clearTimeout(deadline);
   }
 }
 

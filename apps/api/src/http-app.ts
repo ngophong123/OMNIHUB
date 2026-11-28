@@ -59,7 +59,7 @@ export async function createConfiguredHttpApp(options: HttpAppOptions = {}): Pro
   app.enableCors({
     origin,
     credentials: true,
-    allowedHeaders: ['Content-Type', 'Idempotency-Key', 'Authorization', 'X-Kitchen-Device', 'X-QR-Token'],
+    allowedHeaders: ['Content-Type', 'Idempotency-Key', 'Authorization', 'X-Kitchen-Device', 'X-QR-Token', 'X-Correlation-ID'],
   });
   options.configureBeforeFilters?.(app);
   if (enableMetrics) {

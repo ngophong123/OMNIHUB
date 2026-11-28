@@ -15,6 +15,7 @@ export const DEFAULT_TX_TIMEOUT_MS = 15_000;
 export const DEFAULT_BASE_BACKOFF_MS = 500;
 export const DEFAULT_MAX_BACKOFF_MS = 15_000;
 export const DEFAULT_POLL_INTERVAL_MS = 1_000;
+export const DEFAULT_MAX_ATTEMPTS = 5;
 const MAX_QUARANTINE_IDS = 1_000;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -27,6 +28,8 @@ export type OutboxRow = {
   version: number;
   correlationId: string;
   createdAt: Date;
+  attempts?: number;
+  maxAttempts?: number;
 };
 
 export type OutboxPublisher = {
@@ -42,6 +45,9 @@ export type OutboxBatchOptions = {
   publishTimeoutMs?: number;
   batchTimeBudgetMs?: number;
   transactionTimeoutMs?: number;
+  maxAttempts?: number;
+  retryBaseBackoffMs?: number;
+  retryMaxBackoffMs?: number;
   now?: () => number;
   quarantinedIds?: Set<string>;
   tenantIds?: readonly string[];
@@ -53,6 +59,8 @@ export type OutboxBatchResult = {
   claimed: number;
   delivered: number;
   quarantined: number;
+  retried?: number;
+  deadLettered?: number;
   budgetExceeded?: boolean;
   error?: Error;
 };
@@ -62,6 +70,16 @@ class PublishTimeoutError extends Error {
     super(reason === 'batch_budget' ? 'OUTBOX_BATCH_BUDGET_EXCEEDED' : 'OUTBOX_PUBLISH_TIMEOUT');
     this.name = 'PublishTimeoutError';
   }
+}
+
+function sanitizeOutboxError(err: unknown): string {
+  const raw = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+  return raw
+    .replace(/[a-f0-9]{64}/gi, '[REDACTED]')
+    .replace(/Bearer\s+\S+/gi, 'Bearer [REDACTED]')
+    .replace(/[\r\n\t]+/g, ' ')
+    .trim()
+    .slice(0, 200) || 'OUTBOX_PUBLISH_FAILED';
 }
 
 /** Resolves per-event publish timeout, bounded batch time budget, and Prisma tx deadline with commit headroom. */
@@ -99,7 +117,7 @@ export function resolveOutboxTiming(options: {
   return { publishTimeoutMs, batchTimeBudgetMs, transactionTimeoutMs };
 }
 
-/** Computes bounded exponential backoff with jitter across consecutive transient worker failures. */
+/** Computes bounded exponential backoff with jitter across consecutive transient failures. */
 export function computeBackoffMs(
   consecutiveFailures: number,
   baseMs = DEFAULT_BASE_BACKOFF_MS,
@@ -142,10 +160,10 @@ async function publishWithTimeout(
 }
 
 /**
- * Atomically claims undelivered Outbox records using PostgreSQL FOR UPDATE SKIP LOCKED,
- * validates event schemas, publishes to Redis within a bounded batch time budget, and
- * commits delivered rows before the Prisma transaction deadline so unprocessed events
- * remain pending for subsequent batches under at-least-once delivery semantics.
+ * Atomically claims ready undelivered Outbox records using PostgreSQL FOR UPDATE SKIP LOCKED,
+ * validates event schemas, publishes to Redis within a bounded batch time budget, schedules
+ * per-event exponential retry backoff on transient errors, and transitions exhausted or
+ * schema-invalid events into the durable Dead Letter Queue (deadLetteredAt).
  */
 export async function processOutboxBatch(options: OutboxBatchOptions): Promise<OutboxBatchResult> {
   const {
@@ -156,6 +174,9 @@ export async function processOutboxBatch(options: OutboxBatchOptions): Promise<O
     publishTimeoutMs,
     batchTimeBudgetMs,
     transactionTimeoutMs,
+    maxAttempts: defaultMaxAttempts = DEFAULT_MAX_ATTEMPTS,
+    retryBaseBackoffMs = 0,
+    retryMaxBackoffMs = DEFAULT_MAX_BACKOFF_MS,
     now = Date.now,
     quarantinedIds = new Set<string>(),
     tenantIds,
@@ -179,18 +200,25 @@ export async function processOutboxBatch(options: OutboxBatchOptions): Promise<O
         : Prisma.empty;
 
       const batch = await tx.$queryRaw<OutboxRow[]>(Prisma.sql`
-        SELECT id, "tenantId", "storeId", type, "aggregateId", version, "correlationId", "createdAt"
+        SELECT id, "tenantId", "storeId", type, "aggregateId", version, "correlationId", "createdAt", attempts, "maxAttempts"
         FROM "Outbox"
         WHERE "deliveredAt" IS NULL
+          AND "deadLetteredAt" IS NULL
+          AND "nextAttemptAt" <= now()
         ${tenantScopeSql}
         ${exclusionSql}
-        ORDER BY "createdAt" ASC, id ASC
+        ORDER BY "nextAttemptAt" ASC, "createdAt" ASC, id ASC
         LIMIT ${batchSize}::int
         FOR UPDATE SKIP LOCKED
       `);
 
       const deliveredIds: string[] = [];
+      const invalidDeadLetterIds: string[] = [];
+      const retryUpdates: { id: string; attempts: number; nextAttemptAt: Date; lastError: string }[] = [];
+      const deadLetterUpdates: { id: string; attempts: number; lastError: string }[] = [];
       let quarantined = 0;
+      let retried = 0;
+      let deadLettered = 0;
       let budgetExceeded = false;
       let error: Error | undefined;
 
@@ -200,7 +228,7 @@ export async function processOutboxBatch(options: OutboxBatchOptions): Promise<O
         const remainingBudgetMs = batchDeadlineMs - now();
         if (remainingBudgetMs <= 0) {
           budgetExceeded = true;
-          if (deliveredIds.length === 0 && quarantined === 0) {
+          if (deliveredIds.length === 0 && quarantined === 0 && deadLettered === 0) {
             error = new PublishTimeoutError('batch_budget');
           }
           break;
@@ -219,6 +247,7 @@ export async function processOutboxBatch(options: OutboxBatchOptions): Promise<O
         const parsed = eventSchema.safeParse(candidate);
         if (!parsed.success) {
           quarantined++;
+          invalidDeadLetterIds.push(row.id);
           quarantineId(quarantinedIds, row.id);
           metrics.recordOutboxQuarantined(quarantinedIds.size, 1);
           workerLogger.ops('error', 'OUTBOX_EVENT_INVALID', {
@@ -253,10 +282,51 @@ export async function processOutboxBatch(options: OutboxBatchOptions): Promise<O
           metrics.recordOutboxFailed(1);
           if (err instanceof PublishTimeoutError && err.reason === 'batch_budget') {
             budgetExceeded = true;
-            if (deliveredIds.length === 0 && quarantined === 0) {
+            if (deliveredIds.length === 0 && quarantined === 0 && deadLettered === 0) {
               error = err;
             }
             break;
+          }
+          const nextAttempts = (row.attempts ?? 0) + 1;
+          const maxAllowed = Math.max(1, row.maxAttempts ?? defaultMaxAttempts);
+          const errorSummary = sanitizeOutboxError(err);
+          const errorType = err instanceof Error ? err.name : typeof err;
+
+          if (nextAttempts >= maxAllowed) {
+            deadLettered++;
+            deadLetterUpdates.push({ id: row.id, attempts: nextAttempts, lastError: errorSummary });
+            quarantineId(quarantinedIds, row.id);
+            metrics.recordOutboxDeadLettered(1);
+            workerLogger.ops('error', 'OUTBOX_DEAD_LETTERED', {
+              component: 'outbox-worker',
+              eventId: row.id,
+              eventType: parsed.data.type,
+              attempts: nextAttempts,
+              maxAttempts: maxAllowed,
+              errorType,
+              ...(row.correlationId ? { correlationId: row.correlationId } : {}),
+            });
+          } else {
+            retried++;
+            const delayMs = retryBaseBackoffMs > 0
+              ? computeBackoffMs(nextAttempts, retryBaseBackoffMs, retryMaxBackoffMs)
+              : 0;
+            retryUpdates.push({
+              id: row.id,
+              attempts: nextAttempts,
+              nextAttemptAt: new Date(now() + delayMs),
+              lastError: errorSummary,
+            });
+            workerLogger.ops('warn', 'OUTBOX_EVENT_RETRY_SCHEDULED', {
+              component: 'outbox-worker',
+              eventId: row.id,
+              eventType: parsed.data.type,
+              attempts: nextAttempts,
+              maxAttempts: maxAllowed,
+              retryDelayMs: delayMs,
+              errorType,
+              ...(row.correlationId ? { correlationId: row.correlationId } : {}),
+            });
           }
           error = err instanceof Error ? err : new Error('OUTBOX_PUBLISH_FAILED');
           break;
@@ -270,10 +340,46 @@ export async function processOutboxBatch(options: OutboxBatchOptions): Promise<O
         });
       }
 
+      if (typeof (tx as { $executeRaw?: unknown }).$executeRaw === 'function') {
+        if (invalidDeadLetterIds.length > 0) {
+          await tx.$executeRaw(Prisma.sql`
+            UPDATE "Outbox"
+            SET "deadLetteredAt" = now(),
+                "lastError" = 'OUTBOX_EVENT_INVALID',
+                "attempts" = "attempts" + 1
+            WHERE id IN (${Prisma.join(invalidDeadLetterIds.map(id => Prisma.sql`${id}::uuid`))})
+              AND "deliveredAt" IS NULL
+          `);
+        }
+        for (const item of deadLetterUpdates) {
+          await tx.$executeRaw(Prisma.sql`
+            UPDATE "Outbox"
+            SET "attempts" = ${item.attempts}::int,
+                "deadLetteredAt" = now(),
+                "lastError" = ${item.lastError}
+            WHERE id = ${item.id}::uuid
+              AND "deliveredAt" IS NULL
+          `);
+        }
+        for (const item of retryUpdates) {
+          await tx.$executeRaw(Prisma.sql`
+            UPDATE "Outbox"
+            SET "attempts" = ${item.attempts}::int,
+                "nextAttemptAt" = ${item.nextAttemptAt},
+                "lastError" = ${item.lastError}
+            WHERE id = ${item.id}::uuid
+              AND "deliveredAt" IS NULL
+              AND "deadLetteredAt" IS NULL
+          `);
+        }
+      }
+
       return {
         claimed: batch.length,
         delivered: deliveredIds.length,
         quarantined,
+        ...(retried > 0 ? { retried } : {}),
+        ...(deadLettered > 0 ? { deadLettered } : {}),
         ...(budgetExceeded ? { budgetExceeded: true } : {}),
         ...(error ? { error } : {}),
       };
@@ -295,6 +401,94 @@ export async function processOutboxBatch(options: OutboxBatchOptions): Promise<O
   }
 }
 
+export type DeadLetterFilter = {
+  tenantId?: string;
+  storeId?: string;
+  ids?: readonly string[];
+  limit?: number;
+};
+
+/** Lists dead-lettered outbox events scoped by tenant/store for operator visibility. */
+export async function listDeadLetterOutbox(db: PrismaClient, filter: DeadLetterFilter = {}) {
+  const limit = Math.min(200, Math.max(1, filter.limit ?? 100));
+  return db.outbox.findMany({
+    where: {
+      deliveredAt: null,
+      deadLetteredAt: { not: null },
+      ...(filter.tenantId ? { tenantId: filter.tenantId } : {}),
+      ...(filter.storeId ? { storeId: filter.storeId } : {}),
+      ...(filter.ids?.length ? { id: { in: [...filter.ids] } } : {}),
+    },
+    orderBy: { deadLetteredAt: 'desc' },
+    take: limit,
+    select: {
+      id: true,
+      tenantId: true,
+      storeId: true,
+      type: true,
+      aggregateId: true,
+      version: true,
+      attempts: true,
+      maxAttempts: true,
+      lastError: true,
+      createdAt: true,
+      deadLetteredAt: true,
+    },
+  });
+}
+
+/**
+ * Safely replays dead-lettered outbox rows back to the pending queue by resetting
+ * deadLetteredAt, attempts, nextAttemptAt, and lastError. Never touches delivered rows.
+ */
+export async function replayDeadLetterOutbox(
+  db: PrismaClient,
+  options: DeadLetterFilter & { metrics?: MetricsCollector; quarantinedIds?: Set<string> } = {},
+): Promise<{ replayed: number; ids: string[] }> {
+  const limit = Math.min(200, Math.max(1, options.limit ?? 100));
+  const metrics = options.metrics ?? workerMetrics;
+  const result = await db.$transaction(async tx => {
+    const candidates = await tx.outbox.findMany({
+      where: {
+        deliveredAt: null,
+        deadLetteredAt: { not: null },
+        ...(options.tenantId ? { tenantId: options.tenantId } : {}),
+        ...(options.storeId ? { storeId: options.storeId } : {}),
+        ...(options.ids?.length ? { id: { in: [...options.ids] } } : {}),
+      },
+      orderBy: { createdAt: 'asc' },
+      take: limit,
+      select: { id: true },
+    });
+    const ids = candidates.map(row => row.id);
+    if (ids.length === 0) return { replayed: 0, ids: [] as string[] };
+    const updated = await tx.outbox.updateMany({
+      where: { id: { in: ids }, deliveredAt: null, deadLetteredAt: { not: null } },
+      data: {
+        deadLetteredAt: null,
+        attempts: 0,
+        nextAttemptAt: new Date(),
+        lastError: null,
+      },
+    });
+    return { replayed: updated.count, ids };
+  });
+
+  if (result.replayed > 0) {
+    if (options.quarantinedIds) {
+      for (const id of result.ids) options.quarantinedIds.delete(id);
+    }
+    metrics.recordOutboxReplayed(result.replayed);
+    workerLogger.ops('info', 'OUTBOX_DEAD_LETTER_REPLAYED', {
+      component: 'outbox-worker',
+      replayed: result.replayed,
+      ...(options.tenantId ? { tenantId: options.tenantId } : {}),
+      ...(options.storeId ? { storeId: options.storeId } : {}),
+    });
+  }
+  return result;
+}
+
 export type WorkerLoopOptions = {
   db: PrismaClient;
   redis: OutboxPublisher;
@@ -305,6 +499,7 @@ export type WorkerLoopOptions = {
   publishTimeoutMs?: number;
   batchTimeBudgetMs?: number;
   transactionTimeoutMs?: number;
+  maxAttempts?: number;
   now?: () => number;
   heartbeatFile?: string;
   metrics?: MetricsCollector;
@@ -325,6 +520,7 @@ export function createOutboxWorkerLoop(options: WorkerLoopOptions) {
     publishTimeoutMs,
     batchTimeBudgetMs,
     transactionTimeoutMs,
+    maxAttempts,
     now,
     heartbeatFile = process.env.WORKER_HEARTBEAT_FILE,
     metrics = workerMetrics,
@@ -372,6 +568,9 @@ export function createOutboxWorkerLoop(options: WorkerLoopOptions) {
           publishTimeoutMs,
           batchTimeBudgetMs,
           transactionTimeoutMs,
+          maxAttempts,
+          retryBaseBackoffMs: baseBackoffMs,
+          retryMaxBackoffMs: maxBackoffMs,
           now,
           quarantinedIds,
           shouldContinue: () => running,
